@@ -1,0 +1,13 @@
+SADIE II Database
+=================
+
+The HRIR/SOFA datasets in HRTF/D1_HRIR_SOFA/ are derived from the SADIE II
+Database, distributed under the Apache License, Version 2.0.
+
+Citation:
+
+  AudioLab, University of York, & Kearney, G. C. (2024). SADIE II Database
+  [Data set]. In Applied Sciences (2-1, Vol. 8, Number 11). AudioLab,
+  University of York. https://doi.org/10.5281/zenodo.10886409
+
+License: https://www.apache.org/licenses/LICENSE-2.0
