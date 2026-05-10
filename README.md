@@ -107,6 +107,9 @@ with anisotropic velocity shear coefficients (k_β = 0.65, k_β² = 0.15) that
 widen the transition band in proportion to playback speed, keeping the stopband
 clean during fast pitch sweeps.
 
+Full derivation and design notes:
+[audio_anisotropic_filter_v2.pdf](docs/audio_anisotropic_filter_v2.pdf).
+
 SIMD kernels are compiled for SSE2, AVX, AVX2, and AVX-512 with fully unrolled
 accumulator loops — runtime dispatch picks the widest available path.
 
