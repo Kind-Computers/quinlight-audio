@@ -5,6 +5,8 @@ related formats. It plays modules, can remaster their source samples with
 optional external AI backends (AudioSR, LavaSR, FLowHigh, AP-BWE), and lets you
 A/B the result live during playback.
 
+![Filament Audio playing "Beyond the Network" with all four AI engines remastered](docs/Screenshot_1.png)
+
 ## Release Scope
 
 - Supported public target: `x86_64-unknown-linux-gnu`
