@@ -136,10 +136,29 @@ via GitHub Pages so every browser plays them inline. Click to listen.
 | tiny_tunes | MOD | [listen](https://kind-computers.github.io/filament-audio/mods/rendered/tiny_tunes.mp3) | **[listen](https://kind-computers.github.io/filament-audio/mods/remastered/tiny_tunes-Filament-Audio-Remastered-48Khz.mp3)** |
 | znm-wopeace | IT | [listen](https://kind-computers.github.io/filament-audio/mods/rendered/znm-wopeace.mp3) | **[listen](https://kind-computers.github.io/filament-audio/mods/remastered/znm-wopeace-Filament-Audio-Remastered-48Khz.mp3)** |
 
-Want the full 96 kHz originals? Download
+### 96 kHz AAC originals
+
+Same 20 clips at the engine's native 96 kHz / AAC 256 kbps, also served via
+GitHub Pages. Many browser AAC decoders accept 96 kHz files but resample to
+the system output rate at playback time — what you hear may not be the full
+96 kHz, but the bytes your browser fetched are.
+
+| Module | Before | After |
+| --- | --- | --- |
+| 2ND_PM | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/2ND_PM.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/2ND_PM-Filament-Audio-Remastered-96Khz.m4a)** |
+| 4mat_-_eternity | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/4mat_-_eternity.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/4mat_-_eternity-Filament-Audio-Remastered-96Khz.m4a)** |
+| beyond_the_network | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/beyond_the_network.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/beyond_the_network-Filament-Audio-Remastered-96Khz.m4a)** |
+| Caroline | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/Caroline.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/Caroline-Filament-Audio-Remastered-96Khz.m4a)** |
+| GroovyUntightFunk | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/GroovyUntightFunk.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/GroovyUntightFunk-Filament-Audio-Remastered-96Khz.m4a)** |
+| jt_mind | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/jt_mind.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/jt_mind-Filament-Audio-Remastered-96Khz.m4a)** |
+| jt_pools | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/jt_pools.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/jt_pools-Filament-Audio-Remastered-96Khz.m4a)** |
+| sweetdre | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/sweetdre.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/sweetdre-Filament-Audio-Remastered-96Khz.m4a)** |
+| tiny_tunes | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/tiny_tunes.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/tiny_tunes-Filament-Audio-Remastered-96Khz.m4a)** |
+| znm-wopeace | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/znm-wopeace.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/znm-wopeace-Filament-Audio-Remastered-96Khz.m4a)** |
+
+Prefer the bundled download? Grab
 [filament-audio-96khz-bundle.zip](https://github.com/Kind-Computers/filament-audio/releases/download/audio-bundle-v1/filament-audio-96khz-bundle.zip)
-(275 MB — all 20 clips at 96 kHz AAC / 256 kbps, organized as
-`rendered/` and `remastered/`).
+(275 MB — same 20 clips organized as `rendered/` and `remastered/`).
 
 ## Build
 
