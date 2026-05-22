@@ -614,7 +614,7 @@ extern "C" void aniso64_dot_stereo_avx512(const double * __restrict__ kernel, co
 
 // 64-tap anisotropic sinc interpolation with AVX2 SIMD acceleration.
 // Enhanced β-shear with 2nd-order acceleration tracking.
-// See: "Anisotropic Audio Filters" (Filament paper, March 2026).
+// See: "Anisotropic Audio Filters" (Quinlight paper, March 2026).
 template<class Traits>
 struct Aniso64Interpolation
 {

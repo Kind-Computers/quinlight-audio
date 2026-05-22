@@ -162,7 +162,7 @@
 #define ENABLE_TESTS
 #define MPT_ENABLE_PLAYBACK_TRACE
 #else
-// MODPLUG_NO_FILESAVE removed — Filament needs SaveS3M/SaveIT/SaveXM/SaveMod
+// MODPLUG_NO_FILESAVE removed — Quinlight needs SaveS3M/SaveIT/SaveXM/SaveMod
 #endif
 #if defined(MPT_BUILD_ANALZYED) || defined(MPT_BUILD_DEBUG) || defined(MPT_BUILD_CHECKED) || defined(ENABLE_TESTS)
 // enable asserts

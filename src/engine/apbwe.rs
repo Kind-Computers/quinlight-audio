@@ -116,7 +116,7 @@ if _fail > 0:
 
 /// Directory where the AP-BWE source checkout lives. Sibling of the shared venv.
 pub(crate) fn apbwe_repo_dir() -> PathBuf {
-    super::filament_data_dir().join("apbwe")
+    super::quinlight_data_dir().join("apbwe")
 }
 
 fn has_any_48k_checkpoint(ckpt_dir: &Path) -> bool {
@@ -144,7 +144,7 @@ impl ApBweEngine {
         let ckpt_dir = apbwe_dir.join("checkpoints");
         if !has_any_48k_checkpoint(&ckpt_dir) {
             eprintln!(
-                "filament: AP-BWE repo at {} has no g_*to48k checkpoint under checkpoints/",
+                "quinlight: AP-BWE repo at {} has no g_*to48k checkpoint under checkpoints/",
                 apbwe_dir.display()
             );
             return None;
@@ -154,7 +154,7 @@ impl ApBweEngine {
         if !venv_has_package("torch") {
             return None;
         }
-        let script_path = write_venv_script("filament_apbwe.py", WRAPPER_SCRIPT).ok()?;
+        let script_path = write_venv_script("quinlight_apbwe.py", WRAPPER_SCRIPT).ok()?;
         Some(Box::new(ApBweEngine {
             script_path,
             apbwe_dir,

@@ -146,10 +146,10 @@ impl BackgroundState {
             splashes.swap(i, j);
         }
 
-        // Build default scroller interleaving "FILAMENT AUDIO" info with shuffled messages
+        // Build default scroller interleaving "QUINLIGHT AUDIO" info with shuffled messages
         let mut scroller_parts: Vec<String> = Vec::new();
         let info_parts = [
-            "FILAMENT AUDIO",
+            "QUINLIGHT AUDIO",
             PRESENTED_BY_KIND_COMPUTERS,
             "Greetings to all sceners!",
         ];
@@ -542,7 +542,7 @@ impl<Message> canvas::Program<Message> for BackgroundState {
                 );
             }
 
-            // ── Filament glow behind the record (subtle) ──
+            // ── Quinlight glow behind the record (subtle) ──
             let nova_size = 200u32;
             let rgba = icon::create_icon_rgba(nova_size);
             let dim = 0.15_f32;
@@ -1039,8 +1039,8 @@ enum RemasterPrimaryAction {
     Disabled,
 }
 
-const FILAMENT_ENGINE_NAME: &str = "Filament Audio";
-const FILAMENT_ORIGINAL_TAG: &str = "Filament Audio (Original)";
+const QUINLIGHT_ENGINE_NAME: &str = "Quinlight Audio";
+const QUINLIGHT_ORIGINAL_TAG: &str = "Quinlight Audio (Original)";
 const CLEANUP_MODES: &[CleanupMode] = &CleanupMode::ALL;
 const CLEANUP_ENGINES: &[CleanupEngineVersion] = &CleanupEngineVersion::ALL;
 
@@ -1119,7 +1119,7 @@ fn sample_mode_name_for_slot(slot: &SampleSlot, mode: &SampleMode) -> String {
     match mode {
         SampleMode::Engine(name) => name.clone(),
         SampleMode::Reference48k => "Reference 48k (SINC)".into(),
-        SampleMode::Original if slot.filament_original_fallback => FILAMENT_ORIGINAL_TAG.into(),
+        SampleMode::Original if slot.quinlight_original_fallback => QUINLIGHT_ORIGINAL_TAG.into(),
         SampleMode::Original => "original audio".into(),
     }
 }
@@ -1128,7 +1128,7 @@ fn sample_mode_button_label(slot: &SampleSlot) -> String {
     match &slot.mode {
         SampleMode::Engine(name) => name.clone(),
         SampleMode::Reference48k => "Ref 48k".into(),
-        SampleMode::Original if slot.filament_original_fallback => FILAMENT_ORIGINAL_TAG.into(),
+        SampleMode::Original if slot.quinlight_original_fallback => QUINLIGHT_ORIGINAL_TAG.into(),
         SampleMode::Original => "Original".to_string(),
     }
 }
@@ -1139,8 +1139,8 @@ fn sample_mode_button_color(slot: &SampleSlot) -> iced::Color {
         SampleMode::Engine(_) => theme::ACCENT_GREEN,
         // Pure SINC reference → neutral panel-label (not a "signal", a control).
         SampleMode::Reference48k => theme::PANEL_LABEL,
-        // Filament fell back to the un-upscaled sample → neutral.
-        SampleMode::Original if slot.filament_original_fallback => theme::PANEL_LABEL,
+        // Quinlight fell back to the un-upscaled sample → neutral.
+        SampleMode::Original if slot.quinlight_original_fallback => theme::PANEL_LABEL,
         // Raw original sample → amber (attention: you're hearing the un-upscaled signal).
         SampleMode::Original => theme::ACCENT_AMBER,
     }
@@ -1208,10 +1208,7 @@ fn engine_checkbox_tooltip(name: &str, enabled: bool) -> String {
 }
 
 fn install_missing_button_tooltip(names: &[&str]) -> String {
-    format!(
-        "Show install instructions for {}.",
-        names.join(", ")
-    )
+    format!("Show install instructions for {}.", names.join(", "))
 }
 
 fn blind_test_play_tooltip(label: &str) -> String {
@@ -1225,7 +1222,7 @@ fn blind_test_guess_tooltip(label: &str) -> String {
 fn remaster_interrupt_confirm_tooltip(action: &RemasterInterruptAction) -> String {
     match action {
         RemasterInterruptAction::Close(_) => {
-            "Cancel the current remaster and exit Filament.".into()
+            "Cancel the current remaster and exit Quinlight.".into()
         }
         RemasterInterruptAction::LoadFile(path) => {
             let name = path
@@ -1259,11 +1256,11 @@ struct SampleSlot {
     original_rate: i32,
     original_channels: i32,
     original_length_frames: i64,
-    #[allow(dead_code)] // Read only in tests (expected_filament_mix)
+    #[allow(dead_code)] // Read only in tests (expected_quinlight_mix)
     loop_info: crate::openmpt::SampleLoopInfo,
     engine_results: Vec<EngineResult>,
-    filament_result: Option<EngineResult>,
-    filament_original_fallback: bool,
+    quinlight_result: Option<EngineResult>,
+    quinlight_original_fallback: bool,
     mode: SampleMode,
     failed: bool,
     original_effects: Vec<crate::remaster::SavedEffectParam>,
@@ -1280,12 +1277,12 @@ struct SampleSlot {
 
 impl SampleSlot {
     fn has_engine_results(&self) -> bool {
-        self.filament_result.is_some() || !self.engine_results.is_empty()
+        self.quinlight_result.is_some() || !self.engine_results.is_empty()
     }
 
     fn available_modes(&self) -> Vec<SampleMode> {
         let mut modes = Vec::new();
-        if let Some(sr) = &self.filament_result {
+        if let Some(sr) = &self.quinlight_result {
             modes.push(SampleMode::Engine(sr.name.clone()));
         }
         modes.extend(
@@ -1309,14 +1306,14 @@ impl SampleSlot {
     }
 
     fn engine_result(&self, name: &str) -> Option<&EngineResult> {
-        if name.starts_with(FILAMENT_ENGINE_NAME) {
-            return self.filament_result.as_ref();
+        if name.starts_with(QUINLIGHT_ENGINE_NAME) {
+            return self.quinlight_result.as_ref();
         }
         self.engine_results.iter().find(|er| er.name == name)
     }
 
     fn preferred_blind_test_result(&self) -> Option<&EngineResult> {
-        self.filament_result
+        self.quinlight_result
             .as_ref()
             .or_else(|| self.engine_results.first())
     }
@@ -1369,7 +1366,7 @@ impl SampleSlot {
         if self.original_effects.is_empty() {
             self.original_effects = saved_effects;
         }
-        self.filament_original_fallback = false;
+        self.quinlight_original_fallback = false;
         let next = EngineResult {
             name: result.engine_name.clone(),
             data: result.data.clone(),
@@ -1393,7 +1390,7 @@ impl SampleSlot {
             });
         }
         self.failed = false;
-        Some(if self.filament_result.is_none() {
+        Some(if self.quinlight_result.is_none() {
             SampleMode::Engine(result.engine_name.clone())
         } else {
             self.mode.clone()
@@ -1413,13 +1410,13 @@ impl SampleSlot {
             self.original_effects = saved_effects;
         }
         if crate::remaster::is_no_consensus_result(&result.engine_name) {
-            self.filament_result = None;
-            self.filament_original_fallback = true;
+            self.quinlight_result = None;
+            self.quinlight_original_fallback = true;
             self.failed = false;
             return Some(SampleMode::Original);
         }
-        self.filament_original_fallback = false;
-        self.filament_result = Some(EngineResult {
+        self.quinlight_original_fallback = false;
+        self.quinlight_result = Some(EngineResult {
             name: result.engine_name.clone(),
             data: result.data.clone(),
             length_frames: result.length_frames,
@@ -1626,7 +1623,7 @@ const INTERPOLATION_CHOICES: &[InterpolationChoice] = &[
 
 fn render_save_name(stem: &str, extension: &str, render_rate_hz: u32) -> String {
     let rate = crate::batch::format_rate_khz(render_rate_hz);
-    format!("{stem}-Filament-Audio-Remastered-{rate}.{extension}")
+    format!("{stem}-Quinlight-Audio-Remastered-{rate}.{extension}")
 }
 
 fn default_render_rate(device_rate: u32) -> u32 {
@@ -1641,7 +1638,7 @@ fn default_render_save_name(orig_path: &Path, ext: &str, device_rate: u32) -> St
     )
 }
 
-pub struct Filament {
+pub struct Quinlight {
     player: Arc<Player>,
     player_state: PlayerState,
     module_info: Option<ModuleInfo>,
@@ -1692,7 +1689,7 @@ pub struct Filament {
     drain_tick_counter: u8,
     // Ctrl-C shutdown flag from signal handler
     shutdown_flag: Arc<AtomicBool>,
-    // Per-engine enable flags for GUI-only Filament engine selection.
+    // Per-engine enable flags for GUI-only Quinlight engine selection.
     enable_audiosr: bool,
     enable_lavasr: bool,
     enable_flowhigh: bool,
@@ -1759,7 +1756,7 @@ pub struct Filament {
     background: BackgroundState,
 }
 
-impl Filament {
+impl Quinlight {
     pub fn new(
         upscale_mode: UpscaleMode,
         detect_handle: std::thread::JoinHandle<RemasterEngine>,
@@ -1785,7 +1782,7 @@ impl Filament {
         };
 
         (
-            Filament {
+            Quinlight {
                 player: Arc::new(player),
                 player_state: PlayerState::default(),
                 module_info: None,
@@ -1863,11 +1860,11 @@ impl Filament {
         match &self.module_info {
             Some(info) if !info.title.is_empty() => {
                 format!(
-                    "Filament Audio \u{2014} {PRESENTED_BY_KIND_COMPUTERS}: {}",
+                    "Quinlight Audio \u{2014} {PRESENTED_BY_KIND_COMPUTERS}: {}",
                     info.title
                 )
             }
-            _ => format!("Filament Audio \u{2014} {PRESENTED_BY_KIND_COMPUTERS}"),
+            _ => format!("Quinlight Audio \u{2014} {PRESENTED_BY_KIND_COMPUTERS}"),
         }
     }
 
@@ -2594,8 +2591,8 @@ impl Filament {
                         original_length_frames: o.source_length_frames,
                         loop_info: o.loop_info,
                         engine_results: Vec::new(),
-                        filament_result: None,
-                        filament_original_fallback: false,
+                        quinlight_result: None,
+                        quinlight_original_fallback: false,
                         mode: SampleMode::Original,
                         failed: false,
                         original_effects: Vec::new(),
@@ -2730,9 +2727,7 @@ impl Filament {
                 self.install_dialog_title = None;
             }
             Message::CopyInstallCommand => {
-                return iced::clipboard::write(
-                    crate::remaster::INSTALL_COMMAND.to_string(),
-                );
+                return iced::clipboard::write(crate::remaster::INSTALL_COMMAND.to_string());
             }
             Message::CopyRemasterError => {
                 if let RemasterStatus::Failed(e) = &self.remaster_status {
@@ -4373,11 +4368,11 @@ impl Filament {
         }
 
         let status_text: Element<'_, Message> = match &self.remaster_status {
-            RemasterStatus::Unavailable => text("No Filament AI engines installed")
+            RemasterStatus::Unavailable => text("No Quinlight AI engines installed")
                 .size(12)
                 .color(theme::PANEL_LABEL)
                 .into(),
-            RemasterStatus::Ready => text("Ready to remaster with Filament")
+            RemasterStatus::Ready => text("Ready to remaster with Quinlight")
                 .size(12)
                 .color(theme::ACCENT_GREEN)
                 .into(),
@@ -4663,7 +4658,7 @@ impl Filament {
         let (title, body, confirm_label) = match action {
             RemasterInterruptAction::Close(_) => (
                 "Remaster In Progress".to_string(),
-                "Cancel the current remaster and exit Filament?".to_string(),
+                "Cancel the current remaster and exit Quinlight?".to_string(),
                 "Cancel Remaster & Exit".to_string(),
             ),
             RemasterInterruptAction::LoadFile(path) => {
@@ -4803,7 +4798,7 @@ impl Filament {
         let title = self
             .install_dialog_title
             .clone()
-            .unwrap_or_else(|| "No Filament Engines Installed".to_string());
+            .unwrap_or_else(|| "No Quinlight Engines Installed".to_string());
 
         let dialog = container(
             column![
@@ -4834,7 +4829,7 @@ impl Filament {
                     "Copy the installer command to the clipboard.",
                 ),
                 text(smoke_status).size(11).color(theme::PANEL_LABEL),
-                text("Restart Filament after the installer finishes to refresh engine detection.")
+                text("Restart Quinlight after the installer finishes to refresh engine detection.")
                     .size(11)
                     .color(theme::PANEL_LABEL),
                 widgets::with_tooltip(
@@ -4889,7 +4884,7 @@ impl Filament {
         let default_dir = dirs::audio_dir()
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("Filament Audio");
+            .join("Quinlight Audio");
         let _ = std::fs::create_dir_all(&default_dir);
         let stereo_sep = self.stereo_separation;
         let interpolation = self.interpolation.to_filter_length();
@@ -4915,7 +4910,7 @@ impl Filament {
                 .as_ref()
                 .map(|i| i.artist.clone())
                 .unwrap_or_default(),
-            album: "Filament Audio".into(),
+            album: "Quinlight Audio".into(),
         };
         let ext_owned = ext.to_string();
         let filters: &[&str] = if is_aac { &["m4a"] } else { &["flac"] };
@@ -5146,7 +5141,7 @@ impl Filament {
     }
 
     pub fn theme(&self) -> Theme {
-        theme::filament_theme()
+        theme::quinlight_theme()
     }
 }
 
@@ -5188,8 +5183,8 @@ mod tests {
             original_length_frames: 4096,
             loop_info: crate::openmpt::SampleLoopInfo::none(),
             engine_results: Vec::new(),
-            filament_result: None,
-            filament_original_fallback: false,
+            quinlight_result: None,
+            quinlight_original_fallback: false,
             mode: SampleMode::Original,
             failed: false,
             original_effects: Vec::new(),
@@ -5282,24 +5277,24 @@ mod tests {
         }
     }
 
-    fn filament_app() -> Filament {
+    fn quinlight_app() -> Quinlight {
         let detect_handle = std::thread::spawn(RemasterEngine::empty);
         let flag = Arc::new(AtomicBool::new(false));
-        let (app, _task) = Filament::new(UpscaleMode::CpuOnly, detect_handle, flag, None);
+        let (app, _task) = Quinlight::new(UpscaleMode::CpuOnly, detect_handle, flag, None);
         app
     }
 
-    fn filament_app_with_engine() -> Filament {
+    fn quinlight_app_with_engine() -> Quinlight {
         let detect_handle = std::thread::spawn(|| {
             RemasterEngine::from_test_engines(vec![Box::new(GuiDummyEngine)])
         });
         let flag = Arc::new(AtomicBool::new(false));
-        let (app, _task) = Filament::new(UpscaleMode::CpuOnly, detect_handle, flag, None);
+        let (app, _task) = Quinlight::new(UpscaleMode::CpuOnly, detect_handle, flag, None);
         app
     }
 
     fn fixture_prepared_load_handle(
-        app: &Filament,
+        app: &Quinlight,
         loaded_path: PathBuf,
     ) -> (PreparedModuleLoadHandle, Vec<u8>) {
         let file_data = std::fs::read("mods/2ND_PM.S3M").expect("fixture should exist");
@@ -5326,8 +5321,8 @@ mod tests {
     }
 
     #[test]
-    fn filament_app_defaults_to_aniso64_interpolation() {
-        let app = filament_app();
+    fn quinlight_app_defaults_to_aniso64_interpolation() {
+        let app = quinlight_app();
         assert_eq!(app.interpolation, InterpolationChoice::Aniso64);
     }
 
@@ -5335,19 +5330,19 @@ mod tests {
     fn render_save_name_uses_render_rate() {
         assert_eq!(
             render_save_name("2ND_PM", "flac", 96_000),
-            "2ND_PM-Filament-Audio-Remastered-96Khz.flac"
+            "2ND_PM-Quinlight-Audio-Remastered-96Khz.flac"
         );
         assert_eq!(
             render_save_name("2ND_PM", "m4a", 48_000),
-            "2ND_PM-Filament-Audio-Remastered-48Khz.m4a"
+            "2ND_PM-Quinlight-Audio-Remastered-48Khz.m4a"
         );
         assert_eq!(
             render_save_name("2ND_PM", "flac", 192_000),
-            "2ND_PM-Filament-Audio-Remastered-192Khz.flac"
+            "2ND_PM-Quinlight-Audio-Remastered-192Khz.flac"
         );
         assert_eq!(
             render_save_name("2ND_PM", "flac", 44_100),
-            "2ND_PM-Filament-Audio-Remastered-44.1Khz.flac"
+            "2ND_PM-Quinlight-Audio-Remastered-44.1Khz.flac"
         );
     }
 
@@ -5356,7 +5351,7 @@ mod tests {
         let path = Path::new("/tmp/2ND_PM.S3M");
         assert_eq!(
             default_render_save_name(path, "flac", 96_000),
-            "2ND_PM-Filament-Audio-Remastered-96Khz.flac"
+            "2ND_PM-Quinlight-Audio-Remastered-96Khz.flac"
         );
     }
 
@@ -5416,8 +5411,8 @@ mod tests {
             original_length_frames: 4096,
             loop_info: crate::openmpt::SampleLoopInfo::none(),
             engine_results: Vec::new(),
-            filament_result: None,
-            filament_original_fallback: false,
+            quinlight_result: None,
+            quinlight_original_fallback: false,
             mode: SampleMode::Original,
             failed: false,
             original_effects: Vec::new(),
@@ -5430,8 +5425,8 @@ mod tests {
         (module, slot, expected_param)
     }
 
-    fn expected_filament_mix(slot: &SampleSlot) -> crate::remaster::FilamentMix {
-        let reference = crate::remaster::build_filament_reference_48k_with_loop_info(
+    fn expected_quinlight_mix(slot: &SampleSlot) -> crate::remaster::QuinlightMix {
+        let reference = crate::remaster::build_quinlight_reference_48k_with_loop_info(
             &slot.original,
             slot.original_rate as u32,
             slot.original_channels as usize,
@@ -5453,7 +5448,7 @@ mod tests {
             .collect();
         let looped = slot.loop_info.normal.mode != crate::openmpt::SampleLoopMode::None
             || slot.loop_info.sustain.mode != crate::openmpt::SampleLoopMode::None;
-        crate::remaster::select_filament_mix(
+        crate::remaster::select_quinlight_mix(
             &reference,
             slot.original_channels,
             slot.original_rate as u32,
@@ -5463,8 +5458,8 @@ mod tests {
         )
     }
 
-    fn expected_filament_result(slot: &SampleSlot) -> SampleResult {
-        let mix = expected_filament_mix(slot);
+    fn expected_quinlight_result(slot: &SampleSlot) -> SampleResult {
+        let mix = expected_quinlight_mix(slot);
         SampleResult {
             index: slot.index,
             data: mix.data,
@@ -5649,7 +5644,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_mode_labels_distinguish_manual_original_from_filament_fallback() {
+    fn sample_mode_labels_distinguish_manual_original_from_quinlight_fallback() {
         let mut slot = sample_slot();
         assert_eq!(sample_mode_button_label(&slot), "Original");
         assert_eq!(
@@ -5658,11 +5653,11 @@ mod tests {
         );
         assert_eq!(sample_mode_button_color(&slot), theme::ACCENT_AMBER);
 
-        slot.filament_original_fallback = true;
-        assert_eq!(sample_mode_button_label(&slot), FILAMENT_ORIGINAL_TAG);
+        slot.quinlight_original_fallback = true;
+        assert_eq!(sample_mode_button_label(&slot), QUINLIGHT_ORIGINAL_TAG);
         assert_eq!(
             sample_mode_name_for_slot(&slot, &SampleMode::Original),
-            FILAMENT_ORIGINAL_TAG
+            QUINLIGHT_ORIGINAL_TAG
         );
         assert_eq!(sample_mode_button_color(&slot), theme::PANEL_LABEL);
     }
@@ -5670,8 +5665,8 @@ mod tests {
     #[test]
     fn reference_48k_sits_between_engines_and_original_in_cycle_order() {
         let mut slot = sample_slot();
-        slot.filament_result = Some(EngineResult {
-            name: FILAMENT_ENGINE_NAME.into(),
+        slot.quinlight_result = Some(EngineResult {
+            name: QUINLIGHT_ENGINE_NAME.into(),
             data: slot.original.clone(),
             length_frames: slot.original_length_frames,
             channels: slot.original_channels,
@@ -5690,7 +5685,7 @@ mod tests {
         assert_eq!(
             slot.available_modes(),
             vec![
-                SampleMode::Engine(FILAMENT_ENGINE_NAME.into()),
+                SampleMode::Engine(QUINLIGHT_ENGINE_NAME.into()),
                 SampleMode::Engine("AudioSR".into()),
                 SampleMode::Reference48k,
                 SampleMode::Original,
@@ -5712,7 +5707,7 @@ mod tests {
         slot.mode = SampleMode::Original;
         assert_eq!(
             slot.next_mode(),
-            SampleMode::Engine(FILAMENT_ENGINE_NAME.into())
+            SampleMode::Engine(QUINLIGHT_ENGINE_NAME.into())
         );
     }
 
@@ -5726,7 +5721,7 @@ mod tests {
 
     #[test]
     fn cleanup_mode_and_engine_update_independently() {
-        let mut app = filament_app();
+        let mut app = quinlight_app();
 
         assert_eq!(app.cleanup_settings.mode, CleanupMode::Off);
         assert_eq!(
@@ -5751,7 +5746,7 @@ mod tests {
 
     #[test]
     fn remaster_primary_action_switches_to_cancel_states_while_active() {
-        let mut app = filament_app_with_engine();
+        let mut app = quinlight_app_with_engine();
 
         app.remaster_status = RemasterStatus::Processing {
             current: 1,
@@ -5769,7 +5764,7 @@ mod tests {
 
     #[test]
     fn direct_cancel_drops_receivers_and_restores_idle_state() {
-        let mut app = filament_app_with_engine();
+        let mut app = quinlight_app_with_engine();
         let mut slot = sample_slot();
         slot.apply_candidate_result(
             &engine_result("AudioSR", slot.original.clone()),
@@ -5824,7 +5819,7 @@ mod tests {
 
     #[test]
     fn shutdown_tick_requests_real_window_id_lookup() {
-        let mut app = filament_app();
+        let mut app = quinlight_app();
 
         app.shutdown_flag.store(true, Ordering::Relaxed);
 
@@ -5835,7 +5830,7 @@ mod tests {
 
     #[test]
     fn resolved_oldest_window_starts_close_sequence_when_idle() {
-        let mut app = filament_app();
+        let mut app = quinlight_app();
         let window_id = iced::window::Id::unique();
 
         app.shutdown_close_resolution_pending = true;
@@ -5849,7 +5844,7 @@ mod tests {
 
     #[test]
     fn close_request_during_remaster_opens_interrupt_dialog() {
-        let mut app = filament_app_with_engine();
+        let mut app = quinlight_app_with_engine();
         app.remaster_status = RemasterStatus::Processing {
             current: 1,
             total: 3,
@@ -5869,7 +5864,7 @@ mod tests {
 
     #[test]
     fn confirming_close_during_remaster_cancels_then_starts_close_sequence() {
-        let mut app = filament_app_with_engine();
+        let mut app = quinlight_app_with_engine();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let window_id = iced::window::Id::unique();
         app.remaster_status = RemasterStatus::Processing {
@@ -5897,7 +5892,7 @@ mod tests {
 
     #[test]
     fn file_selection_during_remaster_cancels_then_loads_selected_file() {
-        let mut app = filament_app_with_engine();
+        let mut app = quinlight_app_with_engine();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let path = PathBuf::from("/tmp/cancel-load.mod");
         app.remaster_status = RemasterStatus::Processing {
@@ -5930,7 +5925,7 @@ mod tests {
 
     #[test]
     fn archive_backed_module_load_uses_in_memory_bytes_for_groove_render() {
-        let mut app = filament_app();
+        let mut app = quinlight_app();
         let virtual_path = PathBuf::from("/definitely/not/a/real/archive-entry.mod");
         let (handle, file_data) = fixture_prepared_load_handle(&app, virtual_path.clone());
 
@@ -5956,7 +5951,7 @@ mod tests {
 
     #[test]
     fn stale_groove_data_ready_is_ignored() {
-        let mut app = filament_app();
+        let mut app = quinlight_app();
         app.active_module_load_request = 7;
         app.groove_data = vec![0.25, 0.5];
 
@@ -5977,7 +5972,7 @@ mod tests {
 
     #[test]
     fn reset_loaded_module_state_clears_spectrogram_and_groove_data() {
-        let mut app = filament_app();
+        let mut app = quinlight_app();
         let waveform: Vec<f64> = (0..2048)
             .flat_map(|i| {
                 let sample = (i as f64 * 330.0 * 2.0 * std::f64::consts::PI / 48_000.0).sin() * 0.8;
@@ -6010,7 +6005,7 @@ mod tests {
     }
 
     #[test]
-    fn candidates_stream_independently_and_final_promotes_filament() {
+    fn candidates_stream_independently_and_final_promotes_quinlight() {
         let mut slot = sample_slot();
         let original = slot.original.clone();
         let lava: Vec<f64> = original
@@ -6025,24 +6020,24 @@ mod tests {
             .expect("Candidate should select the LavaSR mode");
 
         assert!(matches!(candidate_mode, SampleMode::Engine(ref name) if name == "LavaSR"));
-        assert!(slot.filament_result.is_none());
+        assert!(slot.quinlight_result.is_none());
 
         slot.apply_candidate_result(&engine_result("AudioSR", audio.clone()), Vec::new());
-        let expected_final = expected_filament_result(&slot);
+        let expected_final = expected_quinlight_result(&slot);
         let final_mode = slot
             .apply_final_result(&expected_final, Vec::new())
-            .expect("Final should select the Filament mode");
+            .expect("Final should select the Quinlight mode");
 
         let modes = slot.available_modes();
 
         assert!(
-            matches!(modes.first(), Some(SampleMode::Engine(n)) if n.starts_with(FILAMENT_ENGINE_NAME))
+            matches!(modes.first(), Some(SampleMode::Engine(n)) if n.starts_with(QUINLIGHT_ENGINE_NAME))
         );
         assert!(
-            matches!(final_mode, SampleMode::Engine(ref n) if n.starts_with(FILAMENT_ENGINE_NAME))
+            matches!(final_mode, SampleMode::Engine(ref n) if n.starts_with(QUINLIGHT_ENGINE_NAME))
         );
         assert_eq!(
-            slot.filament_result.as_ref().map(|er| er.data.clone()),
+            slot.quinlight_result.as_ref().map(|er| er.data.clone()),
             Some(expected_final.data)
         );
         assert_eq!(
@@ -6068,10 +6063,10 @@ mod tests {
         slot.apply_candidate_result(&engine_result("LavaSR", b.clone()), Vec::new());
         slot.apply_candidate_result(&engine_result("FLowHigh", c.clone()), Vec::new());
 
-        let expected = expected_filament_result(&slot);
+        let expected = expected_quinlight_result(&slot);
         let final_mode = slot
             .apply_final_result(&expected, Vec::new())
-            .expect("Final should select the Filament mode");
+            .expect("Final should select the Quinlight mode");
 
         assert_eq!(slot.engine_results.len(), 3);
         assert_eq!(
@@ -6094,11 +6089,11 @@ mod tests {
                 .contains(&SampleMode::Engine("FLowHigh".to_string()))
         );
         assert_eq!(
-            slot.filament_result.as_ref().map(|er| er.data.clone()),
+            slot.quinlight_result.as_ref().map(|er| er.data.clone()),
             Some(expected.data)
         );
         assert!(
-            matches!(final_mode, SampleMode::Engine(ref n) if n.starts_with(FILAMENT_ENGINE_NAME))
+            matches!(final_mode, SampleMode::Engine(ref n) if n.starts_with(QUINLIGHT_ENGINE_NAME))
         );
         assert_eq!(
             sample_mode_name_for_slot(&slot, &final_mode),
@@ -6125,10 +6120,10 @@ mod tests {
         slot.apply_candidate_result(&engine_result("AudioSR", audio_v1), Vec::new());
         slot.apply_candidate_result(&engine_result("LavaSR", lava.clone()), Vec::new());
         slot.apply_candidate_result(&engine_result("AudioSR", audio_v2.clone()), Vec::new());
-        let expected_final = expected_filament_result(&slot);
+        let expected_final = expected_quinlight_result(&slot);
         let final_mode = slot
             .apply_final_result(&expected_final, Vec::new())
-            .expect("Final should select the Filament mode");
+            .expect("Final should select the Quinlight mode");
 
         assert_eq!(
             slot.engine_result("AudioSR").map(|er| er.data.clone()),
@@ -6139,10 +6134,10 @@ mod tests {
             Some(lava)
         );
         assert!(
-            matches!(final_mode, SampleMode::Engine(ref n) if n.starts_with(FILAMENT_ENGINE_NAME))
+            matches!(final_mode, SampleMode::Engine(ref n) if n.starts_with(QUINLIGHT_ENGINE_NAME))
         );
         assert_eq!(
-            slot.filament_result.as_ref().map(|er| er.data.clone()),
+            slot.quinlight_result.as_ref().map(|er| er.data.clone()),
             Some(expected_final.data)
         );
         assert_eq!(
@@ -6152,7 +6147,7 @@ mod tests {
     }
 
     #[test]
-    fn blind_test_prefers_derived_filament_when_present() {
+    fn blind_test_prefers_derived_quinlight_when_present() {
         let mut slot = sample_slot();
         let original = slot.original.clone();
         slot.apply_candidate_result(&engine_result("AudioSR", original.clone()), Vec::new());
@@ -6167,14 +6162,14 @@ mod tests {
             ),
             Vec::new(),
         );
-        let expected_final = expected_filament_result(&slot);
+        let expected_final = expected_quinlight_result(&slot);
         slot.apply_final_result(&expected_final, Vec::new());
 
-        let expected = slot.filament_result.as_ref().map(|er| er.data.clone());
+        let expected = slot.quinlight_result.as_ref().map(|er| er.data.clone());
 
         assert!(
             slot.preferred_blind_test_result()
-                .map(|er| er.name.starts_with(FILAMENT_ENGINE_NAME))
+                .map(|er| er.name.starts_with(QUINLIGHT_ENGINE_NAME))
                 .unwrap_or(false)
         );
         assert_eq!(slot.blind_test_data(), expected);
@@ -6228,10 +6223,10 @@ mod tests {
             "First streamed preview should scale XM offsets once",
         );
 
-        let final_result = slot_result(&slot, "Filament Audio (A)", slot.original.clone());
+        let final_result = slot_result(&slot, "Quinlight Audio (A)", slot.original.clone());
         let final_mode = slot
             .apply_final_result(&final_result, Vec::new())
-            .expect("Final should activate the Filament mode");
+            .expect("Final should activate the Quinlight mode");
         apply_sample_mode_to_slot_t(&mut module, &mut slot, final_mode)
             .expect("Final mode should reapply from the original effect snapshot");
         assert_eq!(
@@ -6263,7 +6258,7 @@ mod tests {
             length_frames: slot.original_length_frames,
             channels: slot.original_channels,
             sample_rate_hz: slot.original_rate,
-            engine_name: FILAMENT_ENGINE_NAME.to_string(),
+            engine_name: QUINLIGHT_ENGINE_NAME.to_string(),
             discovered_loops: None,
         };
         let final_mode = slot
@@ -6273,10 +6268,10 @@ mod tests {
             .expect("Original mode should restore the original sample");
 
         assert_eq!(slot.mode, SampleMode::Original);
-        assert_eq!(sample_mode_button_label(&slot), FILAMENT_ORIGINAL_TAG);
+        assert_eq!(sample_mode_button_label(&slot), QUINLIGHT_ORIGINAL_TAG);
         assert_eq!(
             sample_mode_tooltip(&slot),
-            "Cycle sample 2 from Filament Audio (Original) to AudioSR."
+            "Cycle sample 2 from Quinlight Audio (Original) to AudioSR."
         );
         assert_eq!(module.sample_rate(slot.index), slot.original_rate);
         assert_eq!(
@@ -6363,7 +6358,7 @@ mod tests {
             length_frames: slot.original_length_frames,
             channels: slot.original_channels,
             sample_rate_hz: slot.original_rate,
-            engine_name: FILAMENT_ENGINE_NAME.to_string(),
+            engine_name: QUINLIGHT_ENGINE_NAME.to_string(),
             discovered_loops: None,
         };
         let final_mode = slot
@@ -6371,8 +6366,8 @@ mod tests {
             .expect("Final should restore the original mode");
 
         assert!(matches!(final_mode, SampleMode::Original));
-        assert!(slot.filament_result.is_none());
-        assert_eq!(sample_mode_button_label(&slot), FILAMENT_ORIGINAL_TAG);
+        assert!(slot.quinlight_result.is_none());
+        assert_eq!(sample_mode_button_label(&slot), QUINLIGHT_ORIGINAL_TAG);
         assert_eq!(
             slot.preferred_blind_test_result()
                 .map(|er| er.name.as_str()),

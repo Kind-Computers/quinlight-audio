@@ -6081,7 +6081,7 @@ void CSoundFile::DoFreqSlide(ModChannel &chn, PitchT &period, PitchT amount, boo
 	} else if(!m_SongFlags[SONG_LINEARSLIDES] && m_playBehaviour[kPeriodsAreHertz])
 	{
 		// IT Amiga slides
-		// C5Speed compensation for Filament sample-rate replacement:
+		// C5Speed compensation for Quinlight sample-rate replacement:
 		// The Amiga formula uses freq*amount, so when C5Speed (and thus freq)
 		// increases from upscaling, the same amount produces a proportionally
 		// larger pitch effect.  Scale amount down by the C5Speed ratio to match
@@ -6604,7 +6604,7 @@ double CSoundFile::GetFreqFromPeriod(PitchT period, FreqT c5speed, PitchT nPerio
 		}
 	} else if(UseFinetuneAndTranspose())
 	{
-		// Filament: MOD rate scaling moved to GetChannelIncrement() where we
+		// Quinlight: MOD rate scaling moved to GetChannelIncrement() where we
 		// have access to the sample's actual nC5SpeedOriginal (per-sample finetune).
 		return (3546895.0 * 4.0) / period;
 	} else if(GetType() == MOD_TYPE_669)

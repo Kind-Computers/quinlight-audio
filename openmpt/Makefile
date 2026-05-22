@@ -1533,7 +1533,7 @@ SOUNDLIB_CXX_SOURCES += \
  $(sort $(wildcard soundlib/plugins/dmo/*.cpp)) \
  $(sort $(wildcard sounddsp/*.cpp)) \
 
-# Per-ISA compilation flags for 64-tap anisotropic SIMD kernels (Filament)
+# Per-ISA compilation flags for 64-tap anisotropic SIMD kernels (Quinlight)
 # SSE2: baseline x86-64, no special flags needed
 # AVX:  256-bit without FMA (vmulpd + vaddpd)
 # AVX2: 256-bit with FMA (vfmadd)

@@ -189,12 +189,12 @@ LIBOPENMPT_API uint32_t openmpt_get_library_version(void);
  */
 LIBOPENMPT_API uint32_t openmpt_get_core_version(void);
 
-/*! \brief Filament-private diagnostic helper returning sizeof(nativefloat)
+/*! \brief Quinlight-private diagnostic helper returning sizeof(nativefloat)
  *
- * This is not a general libopenmpt API guarantee. Filament uses it in tests
+ * This is not a general libopenmpt API guarantee. Quinlight uses it in tests
  * to verify the vendored build is actually using double as its native float.
  */
-LIBOPENMPT_API uint32_t openmpt_filament_get_nativefloat_size(void);
+LIBOPENMPT_API uint32_t openmpt_quinlight_get_nativefloat_size(void);
 
 /*! Return a verbose library version string from openmpt_get_string(). \deprecated Please use `"library_version"` directly. */
 #define OPENMPT_STRING_LIBRARY_VERSION  LIBOPENMPT_DEPRECATED_STRING( "library_version" )
@@ -1766,7 +1766,7 @@ LIBOPENMPT_API int openmpt_module_get_linear_slides( openmpt_module * mod );
  */
 LIBOPENMPT_API int openmpt_module_set_linear_slides( openmpt_module * mod, int enabled );
 
-/*! \brief Filament AGC profiles */
+/*! \brief Quinlight AGC profiles */
 #define OPENMPT_MODULE_AGC_PROFILE_STOCK  0
 #define OPENMPT_MODULE_AGC_PROFILE_GENTLE 1
 
@@ -1850,7 +1850,7 @@ LIBOPENMPT_API const char * openmpt_module_get_best_save_format_extension( openm
  */
 LIBOPENMPT_API int64_t openmpt_module_save_render_snapshot_to_memory( openmpt_module * mod, void * buffer, int64_t buffer_size );
 
-/*! \brief Filament runtime sample format constants */
+/*! \brief Quinlight runtime sample format constants */
 #define OPENMPT_MODULE_SAMPLE_FORMAT_INT8    0
 #define OPENMPT_MODULE_SAMPLE_FORMAT_INT16   1
 #define OPENMPT_MODULE_SAMPLE_FORMAT_FLOAT32 2

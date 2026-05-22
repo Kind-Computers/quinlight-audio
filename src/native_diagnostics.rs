@@ -22,9 +22,9 @@ mod imp {
         sigaltstack, sigemptyset, sighandler_t, stack_t,
     };
 
-    const DIAGNOSTICS_ENV: &str = "FILAMENT_AUDIO_NATIVE_DIAGNOSTICS";
-    const TEST_SIGNAL_ENV: &str = "FILAMENT_AUDIO_TEST_FATAL_SIGNAL";
-    const HELPER_ENV: &str = "FILAMENT_AUDIO_NATIVE_SYMBOLIZER_HELPER";
+    const DIAGNOSTICS_ENV: &str = "QUINLIGHT_AUDIO_NATIVE_DIAGNOSTICS";
+    const TEST_SIGNAL_ENV: &str = "QUINLIGHT_AUDIO_TEST_FATAL_SIGNAL";
+    const HELPER_ENV: &str = "QUINLIGHT_AUDIO_NATIVE_SYMBOLIZER_HELPER";
     const ALTSTACK_SIZE: usize = libc::SIGSTKSZ as usize + 64 * 1024;
     const MAX_BACKTRACE_FRAMES: usize = 128;
     const MAX_SYMBOL_MAP_PATH_BYTES: usize = 1024;
@@ -139,7 +139,7 @@ mod imp {
             Ok(value) => match parse_mode(Some(&value)) {
                 Ok(mode) => mode,
                 Err(err) => {
-                    eprintln!("filament: {err}");
+                    eprintln!("quinlight: {err}");
                     DiagnosticsMode::Off
                 }
             },
@@ -153,7 +153,7 @@ mod imp {
         }
 
         if let Err(err) = run_symbolizer_helper() {
-            eprintln!("filament: native symbolizer helper failed: {err}");
+            eprintln!("quinlight: native symbolizer helper failed: {err}");
         }
 
         true
@@ -165,13 +165,13 @@ mod imp {
         }
 
         if let Err(err) = start_symbolizer_helper() {
-            eprintln!("filament: failed to start native symbolizer helper: {err}");
+            eprintln!("quinlight: failed to start native symbolizer helper: {err}");
         }
         if let Err(err) = install_symbol_map() {
-            eprintln!("filament: failed to prepare native symbol map: {err}");
+            eprintln!("quinlight: failed to prepare native symbol map: {err}");
         }
         if let Err(err) = unsafe { install_handler() } {
-            eprintln!("filament: failed to install native crash diagnostics: {err}");
+            eprintln!("quinlight: failed to install native crash diagnostics: {err}");
         }
     }
 
@@ -186,18 +186,18 @@ mod imp {
 
         match parse_test_signal(&value) {
             Ok(TestSignal::Abrt) => {
-                eprintln!("filament: triggering SIGABRT for native diagnostics validation");
+                eprintln!("quinlight: triggering SIGABRT for native diagnostics validation");
                 unsafe {
                     libc::raise(SIGABRT);
                 }
             }
             Ok(TestSignal::Segv) => {
-                eprintln!("filament: triggering SIGSEGV for native diagnostics validation");
+                eprintln!("quinlight: triggering SIGSEGV for native diagnostics validation");
                 unsafe {
                     libc::raise(SIGSEGV);
                 }
             }
-            Err(err) => eprintln!("filament: {err}"),
+            Err(err) => eprintln!("quinlight: {err}"),
         }
     }
 
@@ -382,7 +382,7 @@ mod imp {
         info: *mut libc::siginfo_t,
         _ucontext: *mut c_void,
     ) {
-        write_bytes(b"\nfilament: native crash diagnostics caught ");
+        write_bytes(b"\nquinlight: native crash diagnostics caught ");
         write_signal_name(signum);
         write_bytes(b" (signal ");
         write_signed_decimal(signum as isize);
@@ -403,13 +403,13 @@ mod imp {
         let mut frames = [ptr::null_mut::<c_void>(); MAX_BACKTRACE_FRAMES];
         let frame_count = unsafe { libc::backtrace(frames.as_mut_ptr(), frames.len() as c_int) };
         if frame_count > 0 {
-            write_bytes(b"filament: native backtrace follows\n");
+            write_bytes(b"quinlight: native backtrace follows\n");
             unsafe {
                 libc::backtrace_symbols_fd(frames.as_ptr(), frame_count, STDERR_FILENO);
             }
             write_symbolizer_payload(signum, fault_addr, &frames[..frame_count as usize]);
         } else {
-            write_bytes(b"filament: native backtrace unavailable\n");
+            write_bytes(b"quinlight: native backtrace unavailable\n");
         }
 
         reset_signal(signum);
@@ -502,7 +502,7 @@ mod imp {
                     relative_addr,
                 }) => {
                     if !saw_frames {
-                        eprintln!("filament: symbolized native backtrace follows");
+                        eprintln!("quinlight: symbolized native backtrace follows");
                         saw_frames = true;
                     }
                     eprintln!("#{index:02} {absolute_addr} {module_path}");
@@ -517,7 +517,7 @@ mod imp {
                     absolute_addr,
                 }) => {
                     if !saw_frames {
-                        eprintln!("filament: symbolized native backtrace follows");
+                        eprintln!("quinlight: symbolized native backtrace follows");
                         saw_frames = true;
                     }
                     eprintln!("#{index:02} {absolute_addr} <no module mapping>");
@@ -530,7 +530,7 @@ mod imp {
             if let Some(signal_name) = signal_name {
                 if let Some(fault_addr) = fault_addr {
                     eprintln!(
-                        "filament: symbolized backtrace context: signal={signal_name}, fault_addr={fault_addr}"
+                        "quinlight: symbolized backtrace context: signal={signal_name}, fault_addr={fault_addr}"
                     );
                 }
             }
@@ -738,11 +738,11 @@ mod imp {
         #[test]
         fn parse_helper_frame_record() {
             assert_eq!(
-                parse_helper_record("frame\t3\t0x7f00\t/tmp/filament\t0xabc"),
+                parse_helper_record("frame\t3\t0x7f00\t/tmp/quinlight\t0xabc"),
                 Some(HelperRecord::Frame {
                     index: 3,
                     absolute_addr: "0x7f00",
-                    module_path: "/tmp/filament",
+                    module_path: "/tmp/quinlight",
                     relative_addr: "0xabc",
                 })
             );

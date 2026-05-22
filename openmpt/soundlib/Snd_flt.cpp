@@ -180,7 +180,7 @@ int CSoundFile::SetupChannelFilter(ModChannel &chn, bool bReset, int envModifier
 		break;
 	}
 
-	// Filament: always compute second Butterworth biquad stage for 24 dB/oct total rolloff.
+	// Quinlight: always compute second Butterworth biquad stage for 24 dB/oct total rolloff.
 	// Stage 1 (above) preserves the original IT resonance character.
 	// Stage 2 adds a Butterworth post-filter to steepen the stopband.
 	{

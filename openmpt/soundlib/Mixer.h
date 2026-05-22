@@ -16,14 +16,14 @@
 
 OPENMPT_NAMESPACE_BEGIN
 
-// Filament: use native float mixer for full float32 pipeline.
+// Quinlight: use native float mixer for full float32 pipeline.
 // #define MPT_INTMIXER
 
 #ifdef MPT_INTMIXER
 using mixsample_t = MixSampleIntTraits::sample_type;
 enum { MIXING_FILTER_PRECISION = MixSampleIntTraits::filter_precision_bits };  // Fixed point resonant filter bits
 #else
-using mixsample_t = double;  // Filament: 64-bit mixing for maximum precision
+using mixsample_t = double;  // Quinlight: 64-bit mixing for maximum precision
 enum { MIXING_FILTER_PRECISION = 24 };  // Nominal value for metadata headers
 #endif
 enum { MIXING_ATTENUATION = MixSampleIntTraits::mix_headroom_bits };

@@ -216,12 +216,12 @@ impl FlowHighEngine {
                     .code()
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "signal".into());
-                eprintln!("filament: 'import flowhigh' failed (exit {exit}): {reason}");
+                eprintln!("quinlight: 'import flowhigh' failed (exit {exit}): {reason}");
                 return None;
             }
             Err(_) => return None,
         }
-        let script_path = write_venv_script("filament_flowhigh.py", WRAPPER_SCRIPT).ok()?;
+        let script_path = write_venv_script("quinlight_flowhigh.py", WRAPPER_SCRIPT).ok()?;
         let version = venv_package_version("flowhigh").unwrap_or_else(|| "unknown".into());
         Some(Box::new(FlowHighEngine {
             script_path,

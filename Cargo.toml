@@ -1,11 +1,11 @@
 [package]
-name = "filament-audio"
+name = "quinlight-audio"
 version = "0.1.0"
 edition = "2024"
 authors = ["Kind Computers, LLC"]
 description = "Tracker music player and remastering tool presented by Kind Computers"
 homepage = "https://www.kindpcs.com"
-repository = "https://github.com/Kind-Computers/filament-audio"
+repository = "https://github.com/Kind-Computers/quinlight-audio"
 license = "MIT"
 keywords = ["audio", "tracker", "mod", "remaster", "neural"]
 categories = ["multimedia::audio"]

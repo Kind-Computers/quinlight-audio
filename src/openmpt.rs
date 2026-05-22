@@ -118,7 +118,7 @@ unsafe extern "C" {
     fn openmpt_module_get_metadata(module: *mut OpenmptModule, key: *const c_char)
     -> *const c_char;
     #[cfg(test)]
-    fn openmpt_filament_get_nativefloat_size() -> u32;
+    fn openmpt_quinlight_get_nativefloat_size() -> u32;
     fn openmpt_module_get_duration_seconds(module: *mut OpenmptModule) -> f64;
     #[cfg(test)]
     fn openmpt_module_error_get_last(module: *mut OpenmptModule) -> c_int;
@@ -164,7 +164,7 @@ unsafe extern "C" {
         channel: i32,
     ) -> c_double;
 
-    // Filament sample data extensions
+    // Quinlight sample data extensions
     fn openmpt_module_get_sample_rate(module: *mut OpenmptModule, index: i32) -> i32;
     fn openmpt_module_get_sample_length_frames(module: *mut OpenmptModule, index: i32) -> i64;
     fn openmpt_module_get_sample_channels(module: *mut OpenmptModule, index: i32) -> i32;
@@ -286,37 +286,37 @@ unsafe extern "C" {
     fn openmpt_module_get_current_tempo2(module: *mut OpenmptModule) -> f64;
     fn openmpt_module_get_current_speed(module: *mut OpenmptModule) -> i32;
     fn openmpt_module_get_channel_name(module: *mut OpenmptModule, index: i32) -> *const c_char;
-    fn openmpt_module_filament_test_get_note_from_period(
+    fn openmpt_module_quinlight_test_get_note_from_period(
         module: *mut OpenmptModule,
         period: f64,
         fine_tune: c_int,
         c5speed: f64,
     ) -> f64;
-    fn openmpt_module_filament_test_get_period_from_note(
+    fn openmpt_module_quinlight_test_get_period_from_note(
         module: *mut OpenmptModule,
         note: u32,
         fine_tune: c_int,
         c5speed: f64,
     ) -> f64;
-    fn openmpt_module_filament_get_freq_from_period(
+    fn openmpt_module_quinlight_get_freq_from_period(
         module: *mut OpenmptModule,
         period: f64,
         c5speed: f64,
     ) -> f64;
-    fn openmpt_filament_test_apply_linear_pitch_slide(
+    fn openmpt_quinlight_test_apply_linear_pitch_slide(
         target: f64,
         total_amount: c_int,
         periods_are_frequencies: c_int,
     ) -> f64;
-    fn openmpt_module_filament_test_get_current_channel_period(
+    fn openmpt_module_quinlight_test_get_current_channel_period(
         module: *mut OpenmptModule,
         channel: c_int,
     ) -> f64;
-    fn openmpt_module_filament_test_get_current_channel_frequency(
+    fn openmpt_module_quinlight_test_get_current_channel_frequency(
         module: *mut OpenmptModule,
         channel: c_int,
     ) -> f64;
-    fn openmpt_module_filament_test_get_current_channel_increment(
+    fn openmpt_module_quinlight_test_get_current_channel_increment(
         module: *mut OpenmptModule,
         channel: c_int,
     ) -> f64;
@@ -343,53 +343,53 @@ unsafe extern "C" {
 
 #[cfg(test)]
 unsafe extern "C" {
-    fn openmpt_filament_test_apply_continuous_linear_pitch_slide(
+    fn openmpt_quinlight_test_apply_continuous_linear_pitch_slide(
         target: c_double,
         total_amount: c_int,
         periods_are_frequencies: c_int,
     ) -> c_double;
-    fn openmpt_filament_test_apply_it_linear_pitch_slide_reference(
+    fn openmpt_quinlight_test_apply_it_linear_pitch_slide_reference(
         target: c_double,
         total_amount: c_int,
         periods_are_frequencies: c_int,
     ) -> c_double;
-    fn openmpt_filament_test_pitch_envelope_factor(
+    fn openmpt_quinlight_test_pitch_envelope_factor(
         envval: c_int,
         periods_are_frequencies: c_int,
     ) -> c_double;
-    fn openmpt_filament_test_pitch_envelope_reference_factor(
+    fn openmpt_quinlight_test_pitch_envelope_reference_factor(
         envval: c_int,
         periods_are_frequencies: c_int,
     ) -> c_double;
-    fn openmpt_filament_test_it_arpeggio_factor(
+    fn openmpt_quinlight_test_it_arpeggio_factor(
         semitones: u32,
         periods_are_frequencies: c_int,
     ) -> c_double;
-    fn openmpt_filament_test_it_arpeggio_reference_factor(
+    fn openmpt_quinlight_test_it_arpeggio_reference_factor(
         semitones: u32,
         periods_are_frequencies: c_int,
     ) -> c_double;
-    fn openmpt_filament_test_it_autovibrato_factor(
+    fn openmpt_quinlight_test_it_autovibrato_factor(
         vdelta: c_int,
         periods_are_frequencies: c_int,
     ) -> c_double;
-    fn openmpt_filament_test_it_autovibrato_reference_factor(
+    fn openmpt_quinlight_test_it_autovibrato_reference_factor(
         vdelta: c_int,
         periods_are_frequencies: c_int,
     ) -> c_double;
-    fn openmpt_filament_test_linear_autovibrato_factor(
+    fn openmpt_quinlight_test_linear_autovibrato_factor(
         n: c_int,
         periods_are_frequencies: c_int,
     ) -> c_double;
-    fn openmpt_filament_test_linear_autovibrato_reference_factor(
+    fn openmpt_quinlight_test_linear_autovibrato_reference_factor(
         n: c_int,
         periods_are_frequencies: c_int,
     ) -> c_double;
-    fn openmpt_filament_test_microtuning_factor(finetune: c_int) -> c_double;
-    fn openmpt_filament_test_hertz_from_note(note: u32, c5speed: c_double) -> c_double;
-    fn openmpt_filament_test_reference_hertz_from_note(note: u32, c5speed: c_double) -> c_double;
-    fn openmpt_filament_test_xm_linear_freq_from_period(period: u32) -> c_double;
-    fn openmpt_filament_test_reference_xm_linear_freq_from_period(period: u32) -> c_double;
+    fn openmpt_quinlight_test_microtuning_factor(finetune: c_int) -> c_double;
+    fn openmpt_quinlight_test_hertz_from_note(note: u32, c5speed: c_double) -> c_double;
+    fn openmpt_quinlight_test_reference_hertz_from_note(note: u32, c5speed: c_double) -> c_double;
+    fn openmpt_quinlight_test_xm_linear_freq_from_period(period: u32) -> c_double;
+    fn openmpt_quinlight_test_reference_xm_linear_freq_from_period(period: u32) -> c_double;
 }
 
 /// Helper: copy a libopenmpt string to a Rust String and free the original
@@ -405,7 +405,7 @@ unsafe fn openmpt_string_to_rust(ptr: *const c_char) -> Option<String> {
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn nativefloat_size_bytes() -> usize {
-    unsafe { openmpt_filament_get_nativefloat_size() as usize }
+    unsafe { openmpt_quinlight_get_nativefloat_size() as usize }
 }
 
 #[derive(Debug, Clone)]
@@ -854,7 +854,7 @@ impl Module {
         unsafe { openmpt_module_set_agc_profile(self.ptr, profile) != 0 }
     }
 
-    pub fn apply_filament_processing_settings(
+    pub fn apply_quinlight_processing_settings(
         &mut self,
         stereo_separation: i32,
         interpolation_filter: i32,
@@ -1008,7 +1008,7 @@ impl Module {
         }
     }
 
-    // Sample data access (filament extensions)
+    // Sample data access (quinlight extensions)
 
     pub fn num_samples(&self) -> i32 {
         unsafe { openmpt_module_get_num_samples(self.ptr) }
@@ -1252,30 +1252,30 @@ impl Module {
 
     pub(crate) fn note_from_period(&self, period: f64, fine_tune: i32, c5speed: f64) -> f64 {
         unsafe {
-            openmpt_module_filament_test_get_note_from_period(self.ptr, period, fine_tune, c5speed)
+            openmpt_module_quinlight_test_get_note_from_period(self.ptr, period, fine_tune, c5speed)
         }
     }
 
     pub(crate) fn period_from_note(&self, note: u32, fine_tune: i32, c5speed: f64) -> f64 {
         unsafe {
-            openmpt_module_filament_test_get_period_from_note(self.ptr, note, fine_tune, c5speed)
+            openmpt_module_quinlight_test_get_period_from_note(self.ptr, note, fine_tune, c5speed)
         }
     }
 
     pub(crate) fn frequency_from_period(&self, period: f64, c5speed: f64) -> f64 {
-        unsafe { openmpt_module_filament_get_freq_from_period(self.ptr, period, c5speed) }
+        unsafe { openmpt_module_quinlight_get_freq_from_period(self.ptr, period, c5speed) }
     }
 
     pub(crate) fn current_channel_period(&self, channel: i32) -> f64 {
-        unsafe { openmpt_module_filament_test_get_current_channel_period(self.ptr, channel) }
+        unsafe { openmpt_module_quinlight_test_get_current_channel_period(self.ptr, channel) }
     }
 
     pub(crate) fn current_channel_frequency(&self, channel: i32) -> f64 {
-        unsafe { openmpt_module_filament_test_get_current_channel_frequency(self.ptr, channel) }
+        unsafe { openmpt_module_quinlight_test_get_current_channel_frequency(self.ptr, channel) }
     }
 
     pub(crate) fn current_channel_increment(&self, channel: i32) -> f64 {
-        unsafe { openmpt_module_filament_test_get_current_channel_increment(self.ptr, channel) }
+        unsafe { openmpt_module_quinlight_test_get_current_channel_increment(self.ptr, channel) }
     }
 
     #[cfg(test)]
@@ -1315,7 +1315,7 @@ impl Module {
         periods_are_frequencies: bool,
     ) -> f64 {
         unsafe {
-            openmpt_filament_test_apply_linear_pitch_slide(
+            openmpt_quinlight_test_apply_linear_pitch_slide(
                 target,
                 total_amount,
                 periods_are_frequencies as c_int,
@@ -1330,7 +1330,7 @@ impl Module {
         periods_are_frequencies: bool,
     ) -> f64 {
         unsafe {
-            openmpt_filament_test_apply_continuous_linear_pitch_slide(
+            openmpt_quinlight_test_apply_continuous_linear_pitch_slide(
                 target,
                 total_amount,
                 periods_are_frequencies as c_int,
@@ -1345,7 +1345,7 @@ impl Module {
         periods_are_frequencies: bool,
     ) -> f64 {
         unsafe {
-            openmpt_filament_test_apply_it_linear_pitch_slide_reference(
+            openmpt_quinlight_test_apply_it_linear_pitch_slide_reference(
                 target,
                 total_amount,
                 periods_are_frequencies as c_int,
@@ -1356,7 +1356,7 @@ impl Module {
     #[cfg(test)]
     pub(crate) fn test_pitch_envelope_factor(envval: i32, periods_are_frequencies: bool) -> f64 {
         unsafe {
-            openmpt_filament_test_pitch_envelope_factor(envval, periods_are_frequencies as c_int)
+            openmpt_quinlight_test_pitch_envelope_factor(envval, periods_are_frequencies as c_int)
         }
     }
 
@@ -1366,7 +1366,7 @@ impl Module {
         periods_are_frequencies: bool,
     ) -> f64 {
         unsafe {
-            openmpt_filament_test_pitch_envelope_reference_factor(
+            openmpt_quinlight_test_pitch_envelope_reference_factor(
                 envval,
                 periods_are_frequencies as c_int,
             )
@@ -1376,7 +1376,7 @@ impl Module {
     #[cfg(test)]
     pub(crate) fn test_it_arpeggio_factor(semitones: u32, periods_are_frequencies: bool) -> f64 {
         unsafe {
-            openmpt_filament_test_it_arpeggio_factor(semitones, periods_are_frequencies as c_int)
+            openmpt_quinlight_test_it_arpeggio_factor(semitones, periods_are_frequencies as c_int)
         }
     }
 
@@ -1386,7 +1386,7 @@ impl Module {
         periods_are_frequencies: bool,
     ) -> f64 {
         unsafe {
-            openmpt_filament_test_it_arpeggio_reference_factor(
+            openmpt_quinlight_test_it_arpeggio_reference_factor(
                 semitones,
                 periods_are_frequencies as c_int,
             )
@@ -1396,7 +1396,7 @@ impl Module {
     #[cfg(test)]
     pub(crate) fn test_it_autovibrato_factor(vdelta: i32, periods_are_frequencies: bool) -> f64 {
         unsafe {
-            openmpt_filament_test_it_autovibrato_factor(vdelta, periods_are_frequencies as c_int)
+            openmpt_quinlight_test_it_autovibrato_factor(vdelta, periods_are_frequencies as c_int)
         }
     }
 
@@ -1406,7 +1406,7 @@ impl Module {
         periods_are_frequencies: bool,
     ) -> f64 {
         unsafe {
-            openmpt_filament_test_it_autovibrato_reference_factor(
+            openmpt_quinlight_test_it_autovibrato_reference_factor(
                 vdelta,
                 periods_are_frequencies as c_int,
             )
@@ -1416,7 +1416,7 @@ impl Module {
     #[cfg(test)]
     pub(crate) fn test_linear_autovibrato_factor(n: i32, periods_are_frequencies: bool) -> f64 {
         unsafe {
-            openmpt_filament_test_linear_autovibrato_factor(n, periods_are_frequencies as c_int)
+            openmpt_quinlight_test_linear_autovibrato_factor(n, periods_are_frequencies as c_int)
         }
     }
 
@@ -1426,7 +1426,7 @@ impl Module {
         periods_are_frequencies: bool,
     ) -> f64 {
         unsafe {
-            openmpt_filament_test_linear_autovibrato_reference_factor(
+            openmpt_quinlight_test_linear_autovibrato_reference_factor(
                 n,
                 periods_are_frequencies as c_int,
             )
@@ -1435,27 +1435,27 @@ impl Module {
 
     #[cfg(test)]
     pub(crate) fn test_microtuning_factor(finetune: i32) -> f64 {
-        unsafe { openmpt_filament_test_microtuning_factor(finetune) }
+        unsafe { openmpt_quinlight_test_microtuning_factor(finetune) }
     }
 
     #[cfg(test)]
     pub(crate) fn test_hertz_from_note(note: u32, c5speed: f64) -> f64 {
-        unsafe { openmpt_filament_test_hertz_from_note(note, c5speed) }
+        unsafe { openmpt_quinlight_test_hertz_from_note(note, c5speed) }
     }
 
     #[cfg(test)]
     pub(crate) fn test_reference_hertz_from_note(note: u32, c5speed: f64) -> f64 {
-        unsafe { openmpt_filament_test_reference_hertz_from_note(note, c5speed) }
+        unsafe { openmpt_quinlight_test_reference_hertz_from_note(note, c5speed) }
     }
 
     #[cfg(test)]
     pub(crate) fn test_xm_linear_freq_from_period(period: u32) -> f64 {
-        unsafe { openmpt_filament_test_xm_linear_freq_from_period(period) }
+        unsafe { openmpt_quinlight_test_xm_linear_freq_from_period(period) }
     }
 
     #[cfg(test)]
     pub(crate) fn test_reference_xm_linear_freq_from_period(period: u32) -> f64 {
-        unsafe { openmpt_filament_test_reference_xm_linear_freq_from_period(period) }
+        unsafe { openmpt_quinlight_test_reference_xm_linear_freq_from_period(period) }
     }
 }
 

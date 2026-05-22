@@ -50,8 +50,8 @@ impl CleanupEngineVersion {
 impl fmt::Display for CleanupEngineVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::V1 => write!(f, "Filament Audio V1"),
-            Self::V21 => write!(f, "Filament Audio V2.1"),
+            Self::V1 => write!(f, "Quinlight Audio V1"),
+            Self::V21 => write!(f, "Quinlight Audio V2.1"),
         }
     }
 }

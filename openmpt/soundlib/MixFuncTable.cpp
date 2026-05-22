@@ -79,8 +79,8 @@ const MixFuncInterface Functions[8 * 32] =
 	BuildMixFuncTable(PolyphaseInterpolation), // Kaiser SRC
 	BuildMixFuncTable(FIRFilterInterpolation), // FIR SRC
 	BuildMixFuncTable(AmigaBlepInterpolation), // Amiga emulation
-	BuildMixFuncTable(Aniso64Interpolation),   // 64-tap anisotropic sinc (Filament)
-	BuildMixFuncTable(CatmullRomInterpolation), // Centripetal Catmull-Rom with β-shear (Filament)
+	BuildMixFuncTable(Aniso64Interpolation),   // 64-tap anisotropic sinc (Quinlight)
+	BuildMixFuncTable(CatmullRomInterpolation), // Centripetal Catmull-Rom with β-shear (Quinlight)
 };
 
 #undef BuildMixFuncTableRamp

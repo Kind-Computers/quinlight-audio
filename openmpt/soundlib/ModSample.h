@@ -41,7 +41,7 @@ struct ModSample
 		double *pSampleDouble;				// Pointer to float64 sample data
 	} pData;
 	FreqT nC5Speed;							// Frequency of middle-C, in Hz (for IT/S3M/MPTM)
-	FreqT nC5SpeedOriginal = 0;				// Original C5Speed before Filament resampling (0 = unmodified)
+	FreqT nC5SpeedOriginal = 0;				// Original C5Speed before Quinlight resampling (0 = unmodified)
 	SmpLength nLoopStartOriginal = 0, nLoopEndOriginal = 0;
 	SmpLength nSustainStartOriginal = 0, nSustainEndOriginal = 0;
 	uint16 nPan;							// Default sample panning (if pan flag is set), 0...256
@@ -50,8 +50,8 @@ struct ModSample
 	SampleFlags uFlags;						// Sample flags (see ChannelFlags enum)
 	int8   RelativeTone;					// Relative note to middle c (for MOD/XM)
 	int8   nFineTune;						// Finetune period (for MOD/XM), -128...127, unit is 1/128th of a semitone
-	int8   RelativeToneOriginal = 0;		// Original XM relative tone before Filament resampling
-	int8   nFineTuneOriginal = 0;			// Original XM finetune before Filament resampling
+	int8   RelativeToneOriginal = 0;		// Original XM relative tone before Quinlight resampling
+	int8   nFineTuneOriginal = 0;			// Original XM finetune before Quinlight resampling
 	VibratoType nVibType;					// Auto vibrato type
 	uint8  nVibSweep;						// Auto vibrato sweep (i.e. how long it takes until the vibrato effect reaches its full depth)
 	uint8  nVibDepth;						// Auto vibrato depth
@@ -242,17 +242,17 @@ struct ModSample
 	void TransposeToFrequency();
 	static std::pair<int8, int8> FrequencyToTranspose(uint32 freq);
 	void FrequencyToTranspose();
-	constexpr bool HasFilamentRateChange() const noexcept
+	constexpr bool HasQuinlightRateChange() const noexcept
 	{
 		return nC5SpeedOriginal != 0 && nC5Speed != 0 && nC5SpeedOriginal != nC5Speed;
 	}
 	MPT_FORCEINLINE FreqT GetPlaybackC5Speed(MODTYPE type) const noexcept
 	{
-		return (type == MOD_TYPE_XM && HasFilamentRateChange()) ? nC5SpeedOriginal : nC5Speed;
+		return (type == MOD_TYPE_XM && HasQuinlightRateChange()) ? nC5SpeedOriginal : nC5Speed;
 	}
 	MPT_FORCEINLINE std::pair<int8, int8> GetPlaybackTransposeFineTune(MODTYPE type) const
 	{
-		if(type == MOD_TYPE_XM && HasFilamentRateChange())
+		if(type == MOD_TYPE_XM && HasQuinlightRateChange())
 			return {RelativeToneOriginal, nFineTuneOriginal};
 		return {RelativeTone, nFineTune};
 	}

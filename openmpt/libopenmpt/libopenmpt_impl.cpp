@@ -2363,7 +2363,7 @@ OpenMPT::SmpLength scale_sample_frame_count_round( OpenMPT::SmpLength frames, ui
 
 } // namespace
 
-// --- Filament sample data access extensions ---
+// --- Quinlight sample data access extensions ---
 
 std::int32_t module_impl::get_sample_rate( std::int32_t index ) const {
 	// C API uses 0-based indices, internal uses 1-based
@@ -3074,6 +3074,6 @@ std::int32_t module_impl::get_current_channel_sample( std::int32_t channel ) con
 	return -1;
 }
 
-// --- End filament extensions ---
+// --- End quinlight extensions ---
 
 } // namespace openmpt

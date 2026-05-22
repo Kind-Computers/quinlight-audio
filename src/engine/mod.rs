@@ -460,16 +460,16 @@ pub(crate) fn apply_pytorch_env(cmd: &mut Command, device: &str, cpu_thread_budg
     cmd.env("OMP_DYNAMIC", "FALSE");
 }
 
-/// Resolve `~/.local/share/filament-audio/`.
-pub fn filament_data_dir() -> PathBuf {
+/// Resolve `~/.local/share/quinlight-audio/`.
+pub fn quinlight_data_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-        .join("filament-audio")
+        .join("quinlight-audio")
 }
 
 /// Path to our shared venv location.
 pub fn venv_dir() -> PathBuf {
-    filament_data_dir().join("venv")
+    quinlight_data_dir().join("venv")
 }
 
 /// Path to the venv's python3 binary.
@@ -486,7 +486,7 @@ pub(crate) fn venv_can_import(package: &str) -> bool {
     let python = venv_python();
     if !python.exists() {
         eprintln!(
-            "filament: venv python not found at {} (cannot probe '{package}')",
+            "quinlight: venv python not found at {} (cannot probe '{package}')",
             python.display()
         );
         return false;
@@ -500,7 +500,7 @@ pub(crate) fn venv_can_import(package: &str) -> bool {
     {
         Ok(output) => output,
         Err(e) => {
-            eprintln!("filament: failed to spawn venv python for 'import {package}': {e}");
+            eprintln!("quinlight: failed to spawn venv python for 'import {package}': {e}");
             return false;
         }
     };
@@ -520,7 +520,7 @@ pub(crate) fn venv_can_import(package: &str) -> bool {
         .code()
         .map(|c| c.to_string())
         .unwrap_or_else(|| "signal".into());
-    eprintln!("filament: 'import {package}' failed (exit {exit}): {reason}");
+    eprintln!("quinlight: 'import {package}' failed (exit {exit}): {reason}");
     false
 }
 

@@ -36,10 +36,10 @@ jobs:
       - name: Fetch and extract 96 kHz AAC bundle under 96khz/
         run: |
           curl -fsSL \
-            "https://github.com/${{ github.repository }}/releases/download/audio-bundle-v1/filament-audio-96khz-bundle.zip" \
+            "https://github.com/${{ github.repository }}/releases/download/audio-bundle-v1/quinlight-audio-96khz-bundle.zip" \
             -o /tmp/bundle.zip
           unzip -q /tmp/bundle.zip -d /tmp/bundle-extract
-          mv /tmp/bundle-extract/filament-audio-96khz _site/96khz
+          mv /tmp/bundle-extract/quinlight-audio-96khz _site/96khz
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

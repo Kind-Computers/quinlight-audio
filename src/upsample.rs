@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Kind Computers, LLC.
 
-//! Standalone FLAC → FLAC AI upsampling via Filament's spectral-consensus pipeline.
+//! Standalone FLAC → FLAC AI upsampling via Quinlight's spectral-consensus pipeline.
 //!
 //! The `upsample` CLI subcommand builds a `SampleJob` per FLAC input (treating
 //! each as a non-looped one-shot buffer), runs them through all detected
 //! engines using the same `RemasterEngine::remaster_samples()` pipeline the
-//! tracker `convert` flow uses, and writes the Filament consensus result as a
+//! tracker `convert` flow uses, and writes the Quinlight consensus result as a
 //! 24-bit FLAC at 48 kHz per input (24-bit because 32-bit FLAC is still
 //! considered experimental and is poorly supported by common players). The
 //! per-sample cache (keyed on PCM SHA-256) is transparently shared with the
@@ -417,12 +417,12 @@ pub fn run_upsample_batch(
     let total_jobs = jobs.len();
     if total_jobs == plans.len() {
         eprintln!(
-            "filament: upsampling {} file(s) — models load once per engine per batch chunk",
+            "quinlight: upsampling {} file(s) — models load once per engine per batch chunk",
             plans.len(),
         );
     } else {
         eprintln!(
-            "filament: upsampling {} file(s) via {} chunk-jobs — models load once per engine per batch chunk",
+            "quinlight: upsampling {} file(s) via {} chunk-jobs — models load once per engine per batch chunk",
             plans.len(),
             total_jobs,
         );
@@ -666,9 +666,9 @@ fn upsample_output_in_dir(input: &Path, dir: &Path) -> PathBuf {
     let stem = input
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "filament-output".into());
+        .unwrap_or_else(|| "quinlight-output".into());
     dir.join(format!(
-        "{stem}-Filament-Audio-Remastered-{}.flac",
+        "{stem}-Quinlight-Audio-Remastered-{}.flac",
         batch::format_rate_khz(48_000)
     ))
 }
@@ -691,7 +691,7 @@ fn read_flac_to_f64(path: &Path) -> Result<(Vec<f64>, u32, u16, u32), String> {
 
     if !(1..=2).contains(&channels) {
         return Err(format!(
-            "Unsupported channel count {channels} in {}; filament upsample accepts mono or stereo only.",
+            "Unsupported channel count {channels} in {}; quinlight upsample accepts mono or stereo only.",
             path.display(),
         ));
     }
@@ -833,9 +833,9 @@ fn default_upsample_output_path(input: &Path) -> PathBuf {
     let stem = input
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "filament-output".into());
+        .unwrap_or_else(|| "quinlight-output".into());
     parent.join(format!(
-        "{stem}-Filament-Audio-Remastered-{}.flac",
+        "{stem}-Quinlight-Audio-Remastered-{}.flac",
         batch::format_rate_khz(48_000)
     ))
 }
@@ -912,7 +912,7 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .map(|n| format!(".{}.tmp", n.to_string_lossy()))
-        .unwrap_or_else(|| ".filament.tmp".into());
+        .unwrap_or_else(|| ".quinlight.tmp".into());
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.join(file_name),
         _ => PathBuf::from(file_name),
@@ -1086,11 +1086,11 @@ mod tests {
     fn default_output_path_follows_naming_convention() {
         assert_eq!(
             default_upsample_output_path(Path::new("/tmp/track.flac")),
-            PathBuf::from("/tmp/track-Filament-Audio-Remastered-48Khz.flac"),
+            PathBuf::from("/tmp/track-Quinlight-Audio-Remastered-48Khz.flac"),
         );
         assert_eq!(
             default_upsample_output_path(Path::new("song.flac")),
-            PathBuf::from("song-Filament-Audio-Remastered-48Khz.flac"),
+            PathBuf::from("song-Quinlight-Audio-Remastered-48Khz.flac"),
         );
     }
 
@@ -1142,7 +1142,7 @@ mod tests {
         assert_eq!(
             got,
             vec![PathBuf::from(
-                "/tmp/song-Filament-Audio-Remastered-48Khz.flac"
+                "/tmp/song-Quinlight-Audio-Remastered-48Khz.flac"
             )]
         );
     }
@@ -1168,10 +1168,10 @@ mod tests {
             vec![
                 out_dir
                     .path()
-                    .join("a-Filament-Audio-Remastered-48Khz.flac"),
+                    .join("a-Quinlight-Audio-Remastered-48Khz.flac"),
                 out_dir
                     .path()
-                    .join("b-Filament-Audio-Remastered-48Khz.flac"),
+                    .join("b-Quinlight-Audio-Remastered-48Khz.flac"),
             ]
         );
     }
@@ -1199,7 +1199,7 @@ mod tests {
             UpsampleError::Fatal(msg) => {
                 assert!(msg.contains("same output path"), "{msg}");
                 assert!(
-                    msg.contains("song-Filament-Audio-Remastered-48Khz.flac"),
+                    msg.contains("song-Quinlight-Audio-Remastered-48Khz.flac"),
                     "{msg}"
                 );
             }

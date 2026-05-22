@@ -105,8 +105,7 @@ pub const INSTALL_COMMAND: &str = "./install_prerequisites.sh";
 
 /// URL to the installer script in the upstream repo, for users who installed
 /// from a binary release and don't have the source checked out.
-pub const INSTALL_SCRIPT_URL: &str =
-    "https://raw.githubusercontent.com/Kind-Computers/filament-audio/main/install_prerequisites.sh";
+pub const INSTALL_SCRIPT_URL: &str = "https://raw.githubusercontent.com/Kind-Computers/quinlight-audio/main/install_prerequisites.sh";
 
 #[derive(Debug, Clone)]
 pub enum RemasterStatus {
@@ -141,7 +140,7 @@ pub enum RemasterStatus {
 pub struct RemasterEngine {
     engines: Vec<Box<dyn UpsampleEngine>>,
     /// Installed engines the user has toggled off. Only invoked when a
-    /// primary engine scores below `FILAMENT_USABLE_SCORE_FLOOR` for a
+    /// primary engine scores below `QUINLIGHT_USABLE_SCORE_FLOOR` for a
     /// sample (see `remaster_samples` fallback wave).
     fallback_engines: Vec<Box<dyn UpsampleEngine>>,
 }
@@ -179,7 +178,7 @@ impl RemasterEngine {
 
     pub fn engine_name(&self) -> String {
         if self.is_available() {
-            FILAMENT_NAME.into()
+            QUINLIGHT_NAME.into()
         } else {
             "none".into()
         }
@@ -230,7 +229,11 @@ impl RemasterEngine {
                 missing.push(name);
             }
         }
-        if missing.is_empty() { None } else { Some(missing) }
+        if missing.is_empty() {
+            None
+        } else {
+            Some(missing)
+        }
     }
 }
 
@@ -238,7 +241,7 @@ impl RemasterEngine {
 /// point at it whether the venv is empty or only partially populated.
 pub fn install_instructions() -> String {
     format!(
-        "Run {INSTALL_COMMAND} from the Filament source repo.\n\
+        "Run {INSTALL_COMMAND} from the Quinlight source repo.\n\
          \n\
          It installs apt deps, the right torch wheel for your GPU\n\
          (CUDA / ROCm / XPU / CPU), all four AI engines\n\
@@ -261,7 +264,7 @@ impl RemasterEngine {
     /// Detect engines and partition into primary (names in `enabled`) and
     /// fallback (installed but not in `enabled`). The fallback set is run
     /// automatically for any sample where a primary engine scores below
-    /// `FILAMENT_USABLE_SCORE_FLOOR`, strengthening consensus on the samples
+    /// `QUINLIGHT_USABLE_SCORE_FLOOR`, strengthening consensus on the samples
     /// that need it without burning compute on samples where primaries pass.
     pub fn detect_with_fallback(enabled: &[String]) -> Self {
         let all = engine::detect_engines();
@@ -278,7 +281,7 @@ impl RemasterEngine {
 
     /// Remaster samples using all selected AI engines.
     /// Raw per-engine candidates stream immediately. When `progressive` is
-    /// true (GUI), a Filament `Final` is emitted as soon as 2 engines have
+    /// true (GUI), a Quinlight `Final` is emitted as soon as 2 engines have
     /// produced candidates per sample and again if a 3rd candidate refines
     /// the set. When `progressive` is false (CLI), `Final` is emitted exactly
     /// once per sample after all eligible engines complete, so the spectral
@@ -286,7 +289,7 @@ impl RemasterEngine {
     ///
     /// Two-wave architecture: the primary wave runs `self.engines` (enabled by
     /// the user). For any sample where at least one primary engine scored
-    /// below `FILAMENT_USABLE_SCORE_FLOOR`, a fallback wave runs
+    /// below `QUINLIGHT_USABLE_SCORE_FLOOR`, a fallback wave runs
     /// `self.fallback_engines` (installed but disabled) for only those
     /// samples to strengthen consensus. Samples whose primaries all passed
     /// take the fast path with no extra compute.
@@ -330,7 +333,7 @@ impl RemasterEngine {
 
         if primary_progress_total == 0 {
             let _ = progress_tx.send(RemasterStatus::Log(
-                "Filament Audio: skipped AI remastering because no selected engine supports the original sample rates"
+                "Quinlight Audio: skipped AI remastering because no selected engine supports the original sample rates"
                     .into(),
             ));
             let _ = progress_tx.send(RemasterStatus::Complete);
@@ -341,7 +344,7 @@ impl RemasterEngine {
             current: 0,
             total: primary_progress_total,
             sample_name: format!(
-                "Filament Audio: {} engines, {} eligible tasks across {} samples",
+                "Quinlight Audio: {} engines, {} eligible tasks across {} samples",
                 num_engines, primary_progress_total, total_jobs
             ),
         });
@@ -391,17 +394,17 @@ impl RemasterEngine {
                     .collect();
 
                 let _ = progress_tx.send(RemasterStatus::Log(format!(
-                    "Filament Audio: fallback wave — {} sample(s) had at least one primary engine \
+                    "Quinlight Audio: fallback wave — {} sample(s) had at least one primary engine \
                      score below {:.2}; running {} disabled engine(s)",
                     fallback_info.failing_sample_indices.len(),
-                    filament_usable_score_floor(),
+                    quinlight_usable_score_floor(),
                     self.fallback_engines.len()
                 )));
                 let _ = progress_tx.send(RemasterStatus::Processing {
                     current: progress_counter.load(std::sync::atomic::Ordering::Relaxed),
                     total: new_total,
                     sample_name: format!(
-                        "Filament Audio: fallback wave — {} engines, {} extra tasks across \
+                        "Quinlight Audio: fallback wave — {} engines, {} extra tasks across \
                          {} sample(s)",
                         self.fallback_engines.len(),
                         fallback_info.total_additional_tasks,
@@ -454,7 +457,7 @@ fn max_parallel_from_memory(memory_mb: u64, budget_per_model_mb: u64, num_engine
 /// Runs one batch wave of upsampling engines. Engines in `engines` run on
 /// `jobs` (or the subset allowed by `restrict_to_samples`, identified by
 /// `SampleJob::index`). Produced candidates flow through the shared
-/// `pending_outputs` map, so Filament consensus builds incrementally as
+/// `pending_outputs` map, so Quinlight consensus builds incrementally as
 /// candidates arrive (see `record_engine_completion`).
 ///
 /// Concurrency policy:
@@ -1017,7 +1020,7 @@ fn run_single_engine(
 
 /// True if `candidate_data` scores below the usability floor against `job`'s
 /// native-rate original. Mirrors the score path used by
-/// `select_filament_mix_internal` — keep them in sync.
+/// `select_quinlight_mix_internal` — keep them in sync.
 fn candidate_fails_gate(job: &SampleJob, candidate_channels: i32, candidate_data: &[f64]) -> bool {
     if job.channels <= 0 || candidate_channels != job.channels || candidate_data.is_empty() {
         return false;
@@ -1030,7 +1033,7 @@ fn candidate_fails_gate(job: &SampleJob, candidate_channels: i32, candidate_data
         candidate_channels as usize,
         job.looped,
     );
-    score < filament_usable_score_floor()
+    score < quinlight_usable_score_floor()
 }
 
 /// True if any candidate stored for this sample scored below the usability
@@ -1048,7 +1051,7 @@ fn sample_has_gate_failure(job: &SampleJob, candidates: &[SampleResult]) -> bool
 /// `run_engine_wave` as its `eligible_engine_counts_by_job` argument.
 struct FallbackWaveInfo {
     /// `SampleJob::index` values of samples whose primary candidates include
-    /// at least one score below `FILAMENT_USABLE_SCORE_FLOOR`.
+    /// at least one score below `QUINLIGHT_USABLE_SCORE_FLOOR`.
     failing_sample_indices: Vec<i32>,
     /// Indexed in parallel with `jobs`: number of fallback engines eligible
     /// for each job's rate. Zero for jobs that don't need fallback.
@@ -1152,43 +1155,44 @@ fn snapshot_failing_samples_and_bump_totals(
     info
 }
 
-const FILAMENT_NAME: &str = "Filament Audio";
-const FILAMENT_ORIGINAL_NAME: &str = "Original";
+const QUINLIGHT_NAME: &str = "Quinlight Audio";
+const QUINLIGHT_ORIGINAL_NAME: &str = "Original";
 
 /// Default minimum per-engine spectral-correlation score for that engine's
-/// output to contribute to Filament's consensus. Engines scoring below the
+/// output to contribute to Quinlight's consensus. Engines scoring below the
 /// floor are dropped for that sample; if fewer than 2 engines remain usable,
 /// the original sample is kept. Configurable at runtime via
-/// `set_filament_usable_score_floor` (e.g. from the `--threshold` CLI flag).
-pub const FILAMENT_DEFAULT_USABLE_SCORE_FLOOR: f64 = 0.9;
+/// `set_quinlight_usable_score_floor` (e.g. from the `--threshold` CLI flag).
+pub const QUINLIGHT_DEFAULT_USABLE_SCORE_FLOOR: f64 = 0.9;
 
 // Runtime-configurable override of the usable-score floor. Stored as the
 // bit-representation of an f64 so we can mutate it atomically without needing
-// a mutex. Defaults to `FILAMENT_DEFAULT_USABLE_SCORE_FLOOR`.
-static FILAMENT_USABLE_SCORE_FLOOR_BITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(FILAMENT_DEFAULT_USABLE_SCORE_FLOOR.to_bits());
+// a mutex. Defaults to `QUINLIGHT_DEFAULT_USABLE_SCORE_FLOOR`.
+static QUINLIGHT_USABLE_SCORE_FLOOR_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(QUINLIGHT_DEFAULT_USABLE_SCORE_FLOOR.to_bits());
 
 /// Effective usable-score floor for this process. Reads the runtime-set
-/// value (via `set_filament_usable_score_floor`) or falls back to
-/// `FILAMENT_DEFAULT_USABLE_SCORE_FLOOR`.
-pub fn filament_usable_score_floor() -> f64 {
-    f64::from_bits(FILAMENT_USABLE_SCORE_FLOOR_BITS.load(std::sync::atomic::Ordering::Relaxed))
+/// value (via `set_quinlight_usable_score_floor`) or falls back to
+/// `QUINLIGHT_DEFAULT_USABLE_SCORE_FLOOR`.
+pub fn quinlight_usable_score_floor() -> f64 {
+    f64::from_bits(QUINLIGHT_USABLE_SCORE_FLOOR_BITS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Override the usable-score floor for the rest of this process. Called from
-/// the CLI layer (e.g. `filament upsample --threshold 0.75`). The value is
+/// the CLI layer (e.g. `quinlight upsample --threshold 0.75`). The value is
 /// clamped to `[0.0, 1.0]`; callers that pass outside that range get clamped
 /// silently.
-pub fn set_filament_usable_score_floor(value: f64) {
+pub fn set_quinlight_usable_score_floor(value: f64) {
     let clamped = value.clamp(0.0, 1.0);
-    FILAMENT_USABLE_SCORE_FLOOR_BITS.store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    QUINLIGHT_USABLE_SCORE_FLOOR_BITS
+        .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Returns true if the engine name indicates the original sample was kept —
 /// either no AI engines reached consensus, or the loop quality gate rejected
 /// the AI output.
 pub fn is_no_consensus_result(engine_name: &str) -> bool {
-    engine_name == FILAMENT_NAME || engine_name.ends_with("(loop gate)")
+    engine_name == QUINLIGHT_NAME || engine_name.ends_with("(loop gate)")
 }
 
 fn engine_short_code(name: &str) -> &str {
@@ -1202,32 +1206,32 @@ fn engine_short_code(name: &str) -> &str {
     }
 }
 
-fn filament_name_with_contributors(contributors: &[FilamentContributor]) -> String {
+fn quinlight_name_with_contributors(contributors: &[QuinlightContributor]) -> String {
     let codes: Vec<&str> = contributors
         .iter()
         .map(|c| engine_short_code(&c.name))
         .collect();
     if codes.is_empty() {
-        FILAMENT_NAME.to_string()
+        QUINLIGHT_NAME.to_string()
     } else {
-        format!("{} ({})", FILAMENT_NAME, codes.join("+"))
+        format!("{} ({})", QUINLIGHT_NAME, codes.join("+"))
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct FilamentContributor {
+pub struct QuinlightContributor {
     pub name: String,
     pub weight: f64,
     pub score: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct FilamentMix {
+pub struct QuinlightMix {
     pub data: Vec<f64>,
     pub length_frames: i64,
     pub channels: i32,
     pub name: String,
-    pub contributors: Vec<FilamentContributor>,
+    pub contributors: Vec<QuinlightContributor>,
 }
 
 #[derive(Clone)]
@@ -1251,7 +1255,7 @@ fn scored_engine_cmp(a: &ScoredEngine<'_>, b: &ScoredEngine<'_>) -> std::cmp::Or
         .then_with(|| a.name.cmp(b.name))
 }
 
-struct FilamentSelectionReference<'a> {
+struct QuinlightSelectionReference<'a> {
     target_rms: f64,
     source_native: Option<&'a [f64]>,
     score_48k: Option<&'a [f64]>,
@@ -1265,14 +1269,14 @@ fn spectral_intersection_blend(
     source_reference: Option<&[f64]>,
     original_rate: u32,
     target_rms: f64,
-) -> FilamentMix {
+) -> QuinlightMix {
     let channels = reference_channels.max(1) as usize;
     let min_len = usable.iter().map(|e| e.data.len()).min().unwrap_or(0);
     let min_frames = min_len / channels;
 
     let names: Vec<&str> = usable.iter().map(|e| e.name).collect();
     eprintln!(
-        "  Filament: spectral intersection of {} engines: {}",
+        "  Quinlight: spectral intersection of {} engines: {}",
         usable.len(),
         names
             .iter()
@@ -1324,16 +1328,16 @@ fn spectral_intersection_blend(
     }
 
     let weight = 1.0 / usable.len() as f64;
-    let contributors: Vec<FilamentContributor> = usable
+    let contributors: Vec<QuinlightContributor> = usable
         .iter()
-        .map(|e| FilamentContributor {
+        .map(|e| QuinlightContributor {
             name: e.name.to_string(),
             weight,
             score: e.raw_score,
         })
         .collect();
-    let name = filament_name_with_contributors(&contributors);
-    FilamentMix {
+    let name = quinlight_name_with_contributors(&contributors);
+    QuinlightMix {
         data: output,
         length_frames: min_frames as i64,
         channels: reference_channels,
@@ -2749,7 +2753,7 @@ fn search_optimal_loop_points(
 fn log_loop_search_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("FILAMENT_AUDIO_LOG_LOOPSEARCH")
+        std::env::var("QUINLIGHT_AUDIO_LOG_LOOPSEARCH")
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
             .unwrap_or(false)
     })
@@ -4657,14 +4661,14 @@ fn resample_reference_with_loop_prep(
 }
 
 #[cfg(test)]
-pub(crate) fn build_filament_reference_48k_with_loop_info(
+pub(crate) fn build_quinlight_reference_48k_with_loop_info(
     original: &[f64],
     original_rate: u32,
     channels: usize,
     loop_info: SampleLoopInfo,
     cleanup_settings: CleanupSettings,
 ) -> Result<Vec<f64>, String> {
-    build_filament_reference_48k_with_loop_info_indexed(
+    build_quinlight_reference_48k_with_loop_info_indexed(
         original,
         original_rate,
         channels,
@@ -4675,7 +4679,7 @@ pub(crate) fn build_filament_reference_48k_with_loop_info(
 }
 
 #[cfg(test)]
-pub(crate) fn build_filament_reference_48k_with_loop_info_indexed(
+pub(crate) fn build_quinlight_reference_48k_with_loop_info_indexed(
     original: &[f64],
     original_rate: u32,
     channels: usize,
@@ -4705,7 +4709,7 @@ pub(crate) fn build_filament_reference_48k_with_loop_info_indexed(
 }
 
 #[cfg(test)]
-pub(crate) fn build_filament_reference_48k(
+pub(crate) fn build_quinlight_reference_48k(
     original: &[f64],
     original_rate: u32,
     channels: usize,
@@ -4717,7 +4721,7 @@ pub(crate) fn build_filament_reference_48k(
     } else {
         SampleLoopInfo::none()
     };
-    build_filament_reference_48k_with_loop_info(
+    build_quinlight_reference_48k_with_loop_info(
         original,
         original_rate,
         channels,
@@ -4726,14 +4730,14 @@ pub(crate) fn build_filament_reference_48k(
     )
 }
 
-fn select_filament_mix_internal(
+fn select_quinlight_mix_internal(
     reference_channels: i32,
     original_rate: u32,
-    reference: FilamentSelectionReference<'_>,
+    reference: QuinlightSelectionReference<'_>,
     engines: &[(String, Vec<f64>, i64, i32)],
     _engines_dispatched: usize,
     looped: bool,
-) -> FilamentMix {
+) -> QuinlightMix {
     let source_reference = reference
         .source_native
         .filter(|reference| !reference.is_empty());
@@ -4777,7 +4781,7 @@ fn select_filament_mix_internal(
         .collect();
     scored.sort_by(scored_engine_cmp);
 
-    let floor = filament_usable_score_floor();
+    let floor = quinlight_usable_score_floor();
 
     let usable: Vec<ScoredEngine<'_>> = scored
         .iter()
@@ -4795,7 +4799,7 @@ fn select_filament_mix_internal(
             .map(|e| format!("{} (score {:.4})", e.name, e.raw_score))
             .collect::<Vec<_>>()
             .join(", ");
-        eprintln!("  Filament: below floor {floor:.2} — {details}",);
+        eprintln!("  Quinlight: below floor {floor:.2} — {details}",);
     }
 
     // Consensus requires K >= 2 engines. A single engine has no cross-validation
@@ -4804,13 +4808,13 @@ fn select_filament_mix_internal(
         0 | 1 => {
             if usable.len() == 1 {
                 eprintln!(
-                    "  Filament: only 1 usable engine ({}, score {:.4}); \
+                    "  Quinlight: only 1 usable engine ({}, score {:.4}); \
                      consensus requires 2+, keeping original sample",
                     usable[0].name, usable[0].raw_score,
                 );
             } else {
                 eprintln!(
-                    "  Filament: no usable AI results (floor {:.2}); keeping original sample",
+                    "  Quinlight: no usable AI results (floor {:.2}); keeping original sample",
                     floor,
                 );
             }
@@ -4820,13 +4824,13 @@ fn select_filament_mix_internal(
             } else {
                 0
             };
-            FilamentMix {
+            QuinlightMix {
                 data: fallback_48k.to_vec(),
                 length_frames: reference_length_frames,
                 channels: reference_channels,
-                name: FILAMENT_NAME.to_string(),
-                contributors: vec![FilamentContributor {
-                    name: FILAMENT_ORIGINAL_NAME.to_string(),
+                name: QUINLIGHT_NAME.to_string(),
+                contributors: vec![QuinlightContributor {
+                    name: QUINLIGHT_ORIGINAL_NAME.to_string(),
                     weight: 1.0,
                     score: 1.0,
                 }],
@@ -4844,19 +4848,19 @@ fn select_filament_mix_internal(
 }
 
 #[cfg(test)]
-pub(crate) fn select_filament_mix(
+pub(crate) fn select_quinlight_mix(
     reference_48k: &[f64],
     reference_channels: i32,
     original_rate: u32,
     engines: &[(String, Vec<f64>, i64, i32)],
     _engines_dispatched: usize,
     looped: bool,
-) -> FilamentMix {
+) -> QuinlightMix {
     let target_rms = rms_or_zero(reference_48k);
-    select_filament_mix_internal(
+    select_quinlight_mix_internal(
         reference_channels,
         original_rate,
-        FilamentSelectionReference {
+        QuinlightSelectionReference {
             target_rms,
             source_native: None,
             score_48k: Some(reference_48k),
@@ -5049,7 +5053,7 @@ fn reference_48k_from_job(job: &SampleJob) -> Result<Vec<f64>, String> {
     Ok(job.reference_48k.clone())
 }
 
-fn build_filament_result(
+fn build_quinlight_result(
     job: &SampleJob,
     candidates: &[SampleResult],
     engines_dispatched: usize,
@@ -5066,10 +5070,10 @@ fn build_filament_result(
         })
         .collect();
     let reference_48k = &job.reference_48k;
-    let mix = select_filament_mix_internal(
+    let mix = select_quinlight_mix_internal(
         job.channels,
         job.rate as u32,
-        FilamentSelectionReference {
+        QuinlightSelectionReference {
             target_rms: job.target_rms,
             source_native: Some(&job.original_data),
             score_48k: if reference_48k.is_empty() {
@@ -5192,7 +5196,7 @@ fn build_filament_result(
                     // Verbose mode logs every window (not just the first
                     // rejection), producing `num_windows` lines per sample
                     // — can reach thousands on long-bodied loops. Diagnostic
-                    // only; production runs leave `FILAMENT_AUDIO_LOG_LOOPSEARCH`
+                    // only; production runs leave `QUINLIGHT_AUDIO_LOG_LOOPSEARCH`
                     // unset.
                     let verbose = log_loop_search_enabled();
                     for i in 0..num_windows {
@@ -5505,13 +5509,13 @@ fn record_engine_completion(
     }
 
     if let Some(final_candidates) = final_candidates {
-        match build_filament_result(job, &final_candidates, engines_total as usize) {
+        match build_quinlight_result(job, &final_candidates, engines_total as usize) {
             Ok(final_result) => {
                 let _ = result_tx.send(RemasterOutput::Final(final_result));
             }
             Err(e) => {
                 eprintln!(
-                    "Filament Audio finalize failed for {}: {e}",
+                    "Quinlight Audio finalize failed for {}: {e}",
                     job.display_name()
                 );
             }
@@ -5602,7 +5606,7 @@ fn maybe_finish_engine_job(
 pub struct SampleJob {
     pub index: i32,
     pub name: String,
-    /// Untouched original waveform used when Filament keeps the sample unchanged.
+    /// Untouched original waveform used when Quinlight keeps the sample unchanged.
     pub original_data: Vec<f64>,
     /// Original sample rate of the source sample.
     pub rate: i32,
@@ -5687,10 +5691,10 @@ impl SampleJob {
 pub fn cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("filament-audio/sample-cache")
+        .join("quinlight-audio/sample-cache")
 }
 
-/// Structured cache filename: `Filament-{pcm_hex}-{engine_id}-ddim{steps}.flac`
+/// Structured cache filename: `Quinlight-{pcm_hex}-{engine_id}-ddim{steps}.flac`
 fn cache_flac_path(
     dir: &Path,
     pcm_sha256: &[u8; 32],
@@ -5699,13 +5703,13 @@ fn cache_flac_path(
 ) -> PathBuf {
     let pcm = pcm_hex_prefix(pcm_sha256);
     dir.join(format!(
-        "Filament-{pcm}-{engine_cache_id}-ddim{ddim_steps}.flac"
+        "Quinlight-{pcm}-{engine_cache_id}-ddim{ddim_steps}.flac"
     ))
 }
 
 /// Old opaque-hash filename for backward-compatible reads.
 fn legacy_cache_wav_zst_path(dir: &Path, engine_cache_key: &str) -> PathBuf {
-    dir.join(format!("Filament-{engine_cache_key}.wav.zst"))
+    dir.join(format!("Quinlight-{engine_cache_key}.wav.zst"))
 }
 
 const WAV_FORMAT_PCM: u16 = 1;
@@ -5877,22 +5881,22 @@ fn cache_lookup(
     }
     let dir = cache_dir();
 
-    // Current: Filament-{pcm_hex}-{engine_id}-ddim{steps}.flac
+    // Current: Quinlight-{pcm_hex}-{engine_id}-ddim{steps}.flac
     let flac = cache_flac_path(&dir, pcm_sha256, engine_cache_id, ddim_steps);
     if let Some(result) = read_flac_cache(&flac, engine_name, index, sample_rate_hz) {
         return Some(result);
     }
 
-    // Legacy: Filament-{pcm_hex}-{engine_id}-ddim{steps}.wav.zst
+    // Legacy: Quinlight-{pcm_hex}-{engine_id}-ddim{steps}.wav.zst
     let wav_zst = dir.join(format!(
-        "Filament-{}-{engine_cache_id}-ddim{ddim_steps}.wav.zst",
+        "Quinlight-{}-{engine_cache_id}-ddim{ddim_steps}.wav.zst",
         pcm_hex_prefix(pcm_sha256)
     ));
     if let Some(result) = read_wav_zst_cache(&wav_zst, engine_name, index, sample_rate_hz) {
         return Some(result);
     }
 
-    // Very old: Filament-{opaque_hash}.wav.zst
+    // Very old: Quinlight-{opaque_hash}.wav.zst
     let legacy = legacy_cache_wav_zst_path(&dir, engine_cache_key);
     if let Some(result) = read_wav_zst_cache(&legacy, engine_name, index, sample_rate_hz) {
         return Some(result);
@@ -5996,7 +6000,7 @@ fn cache_store(
 
     let pcm = pcm_hex_prefix(pcm_sha256);
     let tmp_path = dir.join(format!(
-        "Filament-{pcm}-{engine_cache_id}-ddim{ddim_steps}.{:?}.flac.tmp",
+        "Quinlight-{pcm}-{engine_cache_id}-ddim{ddim_steps}.{:?}.flac.tmp",
         std::thread::current().id()
     ));
     let final_path = cache_flac_path(&dir, pcm_sha256, engine_cache_id, ddim_steps);
@@ -6341,7 +6345,7 @@ fn collect_cache_hashes_for_sample(
     )
     .unwrap_or_default();
 
-    // pcm_sha256 prefix — matches structured filenames like Filament-{prefix}-*.wav.zst
+    // pcm_sha256 prefix — matches structured filenames like Quinlight-{prefix}-*.wav.zst
     hashes.push(pcm_hex_prefix(&compute_pcm_sha256(&off_reference)));
 
     // Legacy hashes (old format, for deletion of old cache files)
@@ -6457,8 +6461,8 @@ pub fn delete_cache_files_for_hashes(hashes: &[String]) -> usize {
 
     // Direct-path deletions for new spec format and legacy formats
     for hash in hashes {
-        // New spec format: Filament-{engine_cache_key}.wav.zst
-        let new_path = cache.join(format!("Filament-{hash}.wav.zst"));
+        // New spec format: Quinlight-{engine_cache_key}.wav.zst
+        let new_path = cache.join(format!("Quinlight-{hash}.wav.zst"));
         if std::fs::remove_file(&new_path).is_ok() {
             deleted += 1;
         }
@@ -6471,7 +6475,7 @@ pub fn delete_cache_files_for_hashes(hashes: &[String]) -> usize {
 
     // Directory scan for legacy prefix-matched files (engine name in filename)
     let old_prefixes: Vec<String> = hashes.iter().map(|h| format!("{h}-")).collect();
-    let old_new_prefixes: Vec<String> = hashes.iter().map(|h| format!("Filament-{h}-")).collect();
+    let old_new_prefixes: Vec<String> = hashes.iter().map(|h| format!("Quinlight-{h}-")).collect();
     if let Ok(entries) = std::fs::read_dir(&cache) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -8120,7 +8124,7 @@ fn extract_single_channel_output(
         if r.best_index != middle_idx {
             let scores_str: Vec<String> = r.all_scores.iter().map(|s| format!("{s:.3}")).collect();
             eprintln!(
-                "filament: [{}] best-copy {}/{} (xcorr={:.4}, was middle={}, scores=[{}])",
+                "quinlight: [{}] best-copy {}/{} (xcorr={:.4}, was middle={}, scores=[{}])",
                 job.display_name(),
                 r.best_index,
                 layout.body_copies,
@@ -8481,7 +8485,7 @@ fn extract_repeated_channel_output(
                 let scores_str: Vec<String> =
                     r.all_scores.iter().map(|s| format!("{s:.3}")).collect();
                 eprintln!(
-                    "filament: [{}] best-copy {}/{} (xcorr={:.4}, repeated, scores=[{}])",
+                    "quinlight: [{}] best-copy {}/{} (xcorr={:.4}, repeated, scores=[{}])",
                     job.display_name(),
                     r.best_index,
                     layout.copies,
@@ -8815,11 +8819,11 @@ mod tests {
             _ddim_steps: u32,
             _cpu_thread_budget: usize,
         ) -> Result<Child, String> {
-            unreachable!("cached filament test should not spawn subprocesses")
+            unreachable!("cached quinlight test should not spawn subprocesses")
         }
 
         fn find_output_wav(&self, _output_dir: &Path, _stem: &str) -> Result<PathBuf, String> {
-            unreachable!("cached filament test should not look for output WAVs")
+            unreachable!("cached quinlight test should not look for output WAVs")
         }
     }
 
@@ -9180,7 +9184,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_filament_streams_candidates_and_emits_final_result() {
+    fn cached_quinlight_streams_candidates_and_emits_final_result() {
         let _guard = env_lock().lock().unwrap();
         let temp_home = tempfile::tempdir().expect("Should create temp home");
         let _home = HomeGuard::set(temp_home.path());
@@ -9253,7 +9257,7 @@ mod tests {
                 true,
                 false,
             )
-            .expect("Cached Filament remaster should succeed");
+            .expect("Cached Quinlight remaster should succeed");
 
         let results: Vec<RemasterOutput> = result_rx.try_iter().collect();
         let statuses: Vec<RemasterStatus> = progress_rx.try_iter().collect();
@@ -9288,8 +9292,8 @@ mod tests {
             "Final should only be emitted once all engines have completed"
         );
         assert!(
-            finals[0].engine_name.starts_with(FILAMENT_NAME),
-            "Final should be a Filament result",
+            finals[0].engine_name.starts_with(QUINLIGHT_NAME),
+            "Final should be a Quinlight result",
         );
 
         let engine_progress: Vec<(i32, i32)> = statuses
@@ -9407,7 +9411,7 @@ mod tests {
                 false,
                 false,
             )
-            .expect("CLI-mode Filament remaster should succeed");
+            .expect("CLI-mode Quinlight remaster should succeed");
 
         let results: Vec<RemasterOutput> = result_rx.try_iter().collect();
         let candidate_count = results
@@ -9455,7 +9459,7 @@ mod tests {
                 true,
                 false,
             )
-            .expect("GUI-mode Filament remaster should succeed");
+            .expect("GUI-mode Quinlight remaster should succeed");
 
         let results: Vec<RemasterOutput> = result_rx.try_iter().collect();
         let candidate_count = results
@@ -9478,7 +9482,7 @@ mod tests {
     }
 
     #[test]
-    fn build_filament_result_source_guidance_suppresses_shared_in_band_artifact() {
+    fn build_quinlight_result_source_guidance_suppresses_shared_in_band_artifact() {
         let work_dir = tempfile::tempdir().expect("Should create temp work dir");
         let job = sample_job(work_dir.path());
         let reference_48k = reference_48k_from_job(&job).expect("reference should resample");
@@ -9520,7 +9524,7 @@ mod tests {
                 discovered_loops: None,
             },
         ];
-        let unguided = select_filament_mix(
+        let unguided = select_quinlight_mix(
             &reference_48k,
             1,
             job.rate as u32,
@@ -9531,8 +9535,8 @@ mod tests {
             2,
             false,
         );
-        let guided = build_filament_result(&job, &candidates, 2)
-            .expect("guided Filament result should build");
+        let guided = build_quinlight_result(&job, &candidates, 2)
+            .expect("guided Quinlight result should build");
 
         let artifact_before =
             frequency_component_amplitude(&unguided.data, 1, 48_000, artifact_freq);
@@ -9541,12 +9545,12 @@ mod tests {
         let shared_after = frequency_component_amplitude(&guided.data, 1, 48_000, 220.0);
 
         assert!(
-            guided.engine_name.starts_with(FILAMENT_NAME),
-            "guided output should still be labeled as Filament",
+            guided.engine_name.starts_with(QUINLIGHT_NAME),
+            "guided output should still be labeled as Quinlight",
         );
         assert!(
             artifact_after < artifact_before * 0.80,
-            "source guidance should suppress shared in-band artifacts in the final Filament mix \
+            "source guidance should suppress shared in-band artifacts in the final Quinlight mix \
              (before={artifact_before:.4}, after={artifact_after:.4})",
         );
         assert!(
@@ -9557,7 +9561,7 @@ mod tests {
     }
 
     #[test]
-    fn build_filament_result_no_consensus_returns_48k_sinc_fallback() {
+    fn build_quinlight_result_no_consensus_returns_48k_sinc_fallback() {
         let work_dir = tempfile::tempdir().expect("Should create temp work dir");
         let job = sample_job(work_dir.path());
         let reference_48k = reference_48k_from_job(&job).expect("reference should resample");
@@ -9571,13 +9575,13 @@ mod tests {
             discovered_loops: None,
         };
 
-        let final_result = build_filament_result(&job, &[candidate], 1)
-            .expect("no-consensus Filament result should build");
+        let final_result = build_quinlight_result(&job, &[candidate], 1)
+            .expect("no-consensus Quinlight result should build");
 
-        // Consensus failed → name is the bare Filament tag (no engine codes),
+        // Consensus failed → name is the bare Quinlight tag (no engine codes),
         // but the payload is the 48 kHz SINC reference so the upsample CLI can
         // still write a fallback file.
-        assert_eq!(final_result.engine_name, FILAMENT_NAME);
+        assert_eq!(final_result.engine_name, QUINLIGHT_NAME);
         assert!(is_no_consensus_result(&final_result.engine_name));
         assert_eq!(final_result.sample_rate_hz, 48_000);
         assert_eq!(final_result.channels, job.channels);
@@ -9589,7 +9593,7 @@ mod tests {
     }
 
     #[test]
-    fn build_filament_result_no_consensus_falls_back_to_native_when_reference_empty() {
+    fn build_quinlight_result_no_consensus_falls_back_to_native_when_reference_empty() {
         let work_dir = tempfile::tempdir().expect("Should create temp work dir");
         let mut job = sample_job(work_dir.path());
         // Simulate an edge case where the 48 kHz SINC reference couldn't be
@@ -9607,7 +9611,7 @@ mod tests {
             discovered_loops: None,
         };
 
-        let final_result = build_filament_result(&job, &[candidate], 1)
+        let final_result = build_quinlight_result(&job, &[candidate], 1)
             .expect("no-consensus fallback should still build a result");
 
         assert!(is_no_consensus_result(&final_result.engine_name));
@@ -9618,7 +9622,7 @@ mod tests {
     }
 
     #[test]
-    fn select_filament_mix_internal_prefers_native_source_scoring_when_available() {
+    fn select_quinlight_mix_internal_prefers_native_source_scoring_when_available() {
         let source_rate = 16_000u32;
         let candidate_rate = 48_000u32;
         let source_frames = 4096usize;
@@ -9661,10 +9665,10 @@ mod tests {
             ),
         ];
 
-        let legacy = select_filament_mix_internal(
+        let legacy = select_quinlight_mix_internal(
             1,
             source_rate,
-            FilamentSelectionReference {
+            QuinlightSelectionReference {
                 target_rms: rms_or_zero(&reference_48k),
                 source_native: None,
                 score_48k: Some(&reference_48k),
@@ -9674,10 +9678,10 @@ mod tests {
             engines.len(),
             false,
         );
-        let native_guided = select_filament_mix_internal(
+        let native_guided = select_quinlight_mix_internal(
             1,
             source_rate,
-            FilamentSelectionReference {
+            QuinlightSelectionReference {
                 target_rms: rms_or_zero(&source_reference),
                 source_native: Some(&source_reference),
                 score_48k: Some(&reference_48k),
@@ -10354,7 +10358,7 @@ mod tests {
             "release tail should be preserved in the final stitched reference",
         );
 
-        let reference_48k = build_filament_reference_48k_with_loop_info(
+        let reference_48k = build_quinlight_reference_48k_with_loop_info(
             &original,
             16_000,
             1,
@@ -10884,9 +10888,9 @@ mod tests {
         let loop_end = (attack_len + loop_len) as i64;
 
         let full_sample_periodic =
-            build_filament_reference_48k(&original, input_rate, 1, true, off_settings())
+            build_quinlight_reference_48k(&original, input_rate, 1, true, off_settings())
                 .expect("legacy whole-sample loop-aware reference should build");
-        let real_loop_boundary = build_filament_reference_48k_with_loop_info(
+        let real_loop_boundary = build_quinlight_reference_48k_with_loop_info(
             &original,
             input_rate,
             1,
@@ -11309,7 +11313,7 @@ mod tests {
 
     /// Build a stereo SampleJob with a synthetic interleaved reference. The
     /// reference is interleaved [L0, R0, L1, R1, ...] just like
-    /// `build_filament_reference_48k` produces in production.
+    /// `build_quinlight_reference_48k` produces in production.
     fn stereo_job_for_best_copy_test(
         reference_48k_interleaved: Vec<f64>,
         loop_info: SampleLoopInfo,
@@ -12932,7 +12936,7 @@ mod tests {
             channels,
             loop_prep.normal_loop.start_frames as usize,
         );
-        let repaired_reference = build_filament_reference_48k_with_loop_info(
+        let repaired_reference = build_quinlight_reference_48k_with_loop_info(
             &sample.data,
             sample.rate as u32,
             channels,
@@ -13114,11 +13118,11 @@ mod tests {
             })
             .collect();
 
-        let off = build_filament_reference_48k(&looped, 8_000, 1, true, off_settings())
+        let off = build_quinlight_reference_48k(&looped, 8_000, 1, true, off_settings())
             .expect("off loop-aware reference should build");
 
         for engine_version in [CleanupEngineVersion::V1, CleanupEngineVersion::V21] {
-            let click_median = build_filament_reference_48k(
+            let click_median = build_quinlight_reference_48k(
                 &looped,
                 8_000,
                 1,
@@ -14524,8 +14528,8 @@ mod tests {
             })
             .expect("expected at least one Final");
         assert!(
-            last_final_name.starts_with("Filament Audio") && last_final_name.contains('F'),
-            "last Final should be a Filament consensus that includes FLowHigh; got {last_final_name:?}",
+            last_final_name.starts_with("Quinlight Audio") && last_final_name.contains('F'),
+            "last Final should be a Quinlight consensus that includes FLowHigh; got {last_final_name:?}",
         );
     }
 

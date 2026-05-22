@@ -1377,39 +1377,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "filament-audio"
-version = "0.1.0"
-dependencies = [
- "ac-ffmpeg",
- "bytemuck",
- "clap",
- "compress-tools",
- "criterion",
- "crossbeam-channel",
- "dirs 6.0.0",
- "ebur128",
- "fastrand",
- "flac-codec",
- "hound",
- "iced",
- "image",
- "inotify",
- "libc",
- "pulp",
- "rayon",
- "rfd",
- "rustfft",
- "sdl2",
- "serde",
- "serde_json",
- "sha2",
- "signal-hook",
- "sofar",
- "tempfile",
- "zstd",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3358,6 +3325,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "958f21e8e7ceb5a1aa7fa87fab28e7c75976e0bfe7e23ff069e0a260f894067d"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "quinlight-audio"
+version = "0.1.0"
+dependencies = [
+ "ac-ffmpeg",
+ "bytemuck",
+ "clap",
+ "compress-tools",
+ "criterion",
+ "crossbeam-channel",
+ "dirs 6.0.0",
+ "ebur128",
+ "fastrand",
+ "flac-codec",
+ "hound",
+ "iced",
+ "image",
+ "inotify",
+ "libc",
+ "pulp",
+ "rayon",
+ "rfd",
+ "rustfft",
+ "sdl2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signal-hook",
+ "sofar",
+ "tempfile",
+ "zstd",
 ]
 
 [[package]]

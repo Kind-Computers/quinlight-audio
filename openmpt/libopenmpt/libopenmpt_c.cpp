@@ -307,7 +307,7 @@ uint32_t openmpt_get_core_version(void) {
 	return 0;
 }
 
-uint32_t openmpt_filament_get_nativefloat_size(void) {
+uint32_t openmpt_quinlight_get_nativefloat_size(void) {
 	try {
 		return static_cast<uint32_t>( sizeof(OpenMPT::nativefloat) );
 	} catch ( ... ) {
@@ -1522,8 +1522,8 @@ int openmpt_module_ctl_set_text( openmpt_module * mod, const char * ctl, const c
 	return 0;
 }
 
-/* SPDX-License-Identifier: MIT  Filament additions (c) 2026 Kind Computers, LLC. */
-/* --- Filament sample data access extensions --- */
+/* SPDX-License-Identifier: MIT  Quinlight additions (c) 2026 Kind Computers, LLC. */
+/* --- Quinlight sample data access extensions --- */
 
 int32_t openmpt_module_get_sample_rate( openmpt_module * mod, int32_t index ) {
 	try {
@@ -1678,7 +1678,7 @@ int openmpt_module_refresh_channels_for_sample( openmpt_module * mod, int32_t in
 	return 0;
 }
 
-double openmpt_module_filament_test_get_note_from_period( openmpt_module * mod, double period, int32_t nFineTune, double nC5Speed ) {
+double openmpt_module_quinlight_test_get_note_from_period( openmpt_module * mod, double period, int32_t nFineTune, double nC5Speed ) {
 	try {
 		openmpt::interface::check_soundfile( mod );
 		return mod->impl->test_get_note_from_period( period, nFineTune, nC5Speed );
@@ -1688,7 +1688,7 @@ double openmpt_module_filament_test_get_note_from_period( openmpt_module * mod, 
 	return 0.0;
 }
 
-double openmpt_module_filament_test_get_period_from_note( openmpt_module * mod, uint32_t note, int32_t nFineTune, double nC5Speed ) {
+double openmpt_module_quinlight_test_get_period_from_note( openmpt_module * mod, uint32_t note, int32_t nFineTune, double nC5Speed ) {
 	try {
 		openmpt::interface::check_soundfile( mod );
 		return mod->impl->test_get_period_from_note( note, nFineTune, nC5Speed );
@@ -1698,7 +1698,7 @@ double openmpt_module_filament_test_get_period_from_note( openmpt_module * mod, 
 	return 0.0;
 }
 
-double openmpt_module_filament_get_freq_from_period( openmpt_module * mod, double period, double nC5Speed ) {
+double openmpt_module_quinlight_get_freq_from_period( openmpt_module * mod, double period, double nC5Speed ) {
 	try {
 		openmpt::interface::check_soundfile( mod );
 		return mod->impl->test_get_freq_from_period( period, nC5Speed );
@@ -1708,7 +1708,7 @@ double openmpt_module_filament_get_freq_from_period( openmpt_module * mod, doubl
 	return 0.0;
 }
 
-double openmpt_module_filament_test_get_current_channel_period( openmpt_module * mod, int32_t channel ) {
+double openmpt_module_quinlight_test_get_current_channel_period( openmpt_module * mod, int32_t channel ) {
 	try {
 		openmpt::interface::check_soundfile( mod );
 		return mod->impl->test_get_current_channel_period( channel );
@@ -1718,7 +1718,7 @@ double openmpt_module_filament_test_get_current_channel_period( openmpt_module *
 	return 0.0;
 }
 
-double openmpt_module_filament_test_get_current_channel_frequency( openmpt_module * mod, int32_t channel ) {
+double openmpt_module_quinlight_test_get_current_channel_frequency( openmpt_module * mod, int32_t channel ) {
 	try {
 		openmpt::interface::check_soundfile( mod );
 		return mod->impl->test_get_current_channel_frequency( channel );
@@ -1728,7 +1728,7 @@ double openmpt_module_filament_test_get_current_channel_frequency( openmpt_modul
 	return 0.0;
 }
 
-double openmpt_module_filament_test_get_current_channel_increment( openmpt_module * mod, int32_t channel ) {
+double openmpt_module_quinlight_test_get_current_channel_increment( openmpt_module * mod, int32_t channel ) {
 	try {
 		openmpt::interface::check_soundfile( mod );
 		return mod->impl->test_get_current_channel_increment( channel );
@@ -1988,7 +1988,7 @@ int64_t openmpt_module_save_render_snapshot_to_memory( openmpt_module * mod, voi
 	return -1;
 }
 
-/* --- End filament extensions --- */
+/* --- End quinlight extensions --- */
 
 openmpt_module_ext * openmpt_module_ext_create( openmpt_stream_callbacks stream_callbacks, void * stream, openmpt_log_func logfunc, void * loguser, openmpt_error_func errfunc, void * erruser, int * error, const char * * error_message, const openmpt_module_initial_ctl * ctls ) {
 	try {

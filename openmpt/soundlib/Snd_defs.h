@@ -376,8 +376,8 @@ enum ResamplingMode : uint8
 
 	SRCMODE_DEFAULT   = 5,  // Only used for instrument settings, not used inside the mixer
 
-	SRCMODE_ANISO64   = 6,  // 64 tap, with AA + anisotropic β-shear (Filament)
-	SRCMODE_CATMULL   = 7,  // 4 tap, centripetal Catmull-Rom with β-shear (Filament)
+	SRCMODE_ANISO64   = 6,  // 64 tap, with AA + anisotropic β-shear (Quinlight)
+	SRCMODE_CATMULL   = 7,  // 4 tap, centripetal Catmull-Rom with β-shear (Quinlight)
 
 	SRCMODE_AMIGA  = 0xFF,  // Not explicitely user-selectable
 };

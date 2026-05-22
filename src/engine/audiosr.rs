@@ -254,7 +254,7 @@ fn audiosr_path_python() -> Option<PathBuf> {
 impl AudioSrEngine {
     /// Detect AudioSR: check our venv first, then PATH.
     pub fn detect() -> Option<Box<dyn UpsampleEngine>> {
-        let script_path = write_venv_script("filament_audiosr.py", WRAPPER_SCRIPT).ok()?;
+        let script_path = write_venv_script("quinlight_audiosr.py", WRAPPER_SCRIPT).ok()?;
 
         // Check our recommended venv location
         if venv_can_import("audiosr") {

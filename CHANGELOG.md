@@ -1,9 +1,21 @@
 # Changelog
 
-All notable changes to Filament Audio are documented in this file.
+All notable changes to Quinlight Audio are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+- GitHub Sponsors link in the README and a `.github/FUNDING.yml`
+- README note that the multi-engine AI consensus algorithm is U.S. Patent Pending
+
+### Changed
+- Renamed the project from Filament Audio to Quinlight Audio
+
+### Fixed
+- Installer smoke check now detects LavaSR — it was probing the module name `lavasr`, but the package imports as `LavaSR`, so an installed LavaSR was never reported
 
 ## [0.1.0] - 2026-05-10
 
@@ -41,5 +53,5 @@ Initial public release.
 - GPU and hybrid CPU/GPU upscaling modes (NVIDIA CUDA, AMD ROCm, Intel XPU)
 
 ### Repository
-- Public source release at <https://github.com/Kind-Computers/filament-audio>
+- Public source release at <https://github.com/Kind-Computers/quinlight-audio>
 - MIT licensed; AI backends remain external (not bundled)

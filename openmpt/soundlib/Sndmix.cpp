@@ -2053,7 +2053,7 @@ std::pair<SamplePosition, double> CSoundFile::GetChannelIncrement(const ModChann
 	{
 		freq = GetFreqFromPeriod(period, chn.nC5Speed, periodFrac);
 
-		// Filament: scale MOD / XM playback frequency for resampled samples.
+		// Quinlight: scale MOD / XM playback frequency for resampled samples.
 		// XM replacement preserves the original runtime transpose / finetune so
 		// FT2 note limits, vibrato memory and tone-portamento targets behave as
 		// before the swap. The actual waveform-rate change is applied here.
@@ -2062,7 +2062,7 @@ std::pair<SamplePosition, double> CSoundFile::GetChannelIncrement(const ModChann
 		if(UseFinetuneAndTranspose()
 		   && (GetType() == MOD_TYPE_MOD || GetType() == MOD_TYPE_XM)
 		   && chn.pModSample
-		   && chn.pModSample->HasFilamentRateChange())
+		   && chn.pModSample->HasQuinlightRateChange())
 		{
 			freq = freq * chn.pModSample->nC5Speed / chn.pModSample->nC5SpeedOriginal;
 		}

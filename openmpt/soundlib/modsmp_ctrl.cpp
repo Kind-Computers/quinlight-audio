@@ -503,7 +503,7 @@ void ReplaceSample( CSoundFile &sndFile,
 			{
 				// MOD: keep period and portamento target unchanged.
 				// GetFreqFromPeriod for MOD returns AMIGA_CLOCK / period with no
-				// C5Speed dependency (Snd_fx.cpp:6605-6609), and the Filament
+				// C5Speed dependency (Snd_fx.cpp:6605-6609), and the Quinlight
 				// rate scaling in GetChannelIncrement (Sndmix.cpp:2062-2068)
 				// multiplies the frequency by nC5Speed / nC5SpeedOriginal.
 				// Scaling the period here would double-count the rate change

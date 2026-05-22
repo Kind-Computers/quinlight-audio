@@ -87,7 +87,7 @@ impl LavaSrEngine {
         if !venv_can_import("LavaSR") {
             return None;
         }
-        let script_path = write_venv_script("filament_lavasr.py", WRAPPER_SCRIPT).ok()?;
+        let script_path = write_venv_script("quinlight_lavasr.py", WRAPPER_SCRIPT).ok()?;
         let version = venv_package_version("LavaSR").unwrap_or_else(|| "unknown".into());
         Some(Box::new(LavaSrEngine {
             script_path,

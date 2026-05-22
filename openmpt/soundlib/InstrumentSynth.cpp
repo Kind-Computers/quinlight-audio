@@ -288,82 +288,82 @@ static double GetReferenceXMLinearFreqFromPeriod(const uint32 period)
 	return std::ldexp(static_cast<double>(XMLinearTable[period % 768u]), 2 - static_cast<int>(octave));
 }
 
-extern "C" double openmpt_filament_test_apply_linear_pitch_slide(double target, int totalAmount, int periodsAreFrequencies)
+extern "C" double openmpt_quinlight_test_apply_linear_pitch_slide(double target, int totalAmount, int periodsAreFrequencies)
 {
 	return ApplyLinearPitchSlide(target, totalAmount, periodsAreFrequencies != 0);
 }
 
-extern "C" double openmpt_filament_test_apply_continuous_linear_pitch_slide(double target, int totalAmount, int periodsAreFrequencies)
+extern "C" double openmpt_quinlight_test_apply_continuous_linear_pitch_slide(double target, int totalAmount, int periodsAreFrequencies)
 {
 	return ApplyContinuousLinearPitchSlide(target, totalAmount, periodsAreFrequencies != 0);
 }
 
-extern "C" double openmpt_filament_test_apply_it_linear_pitch_slide_reference(double target, int totalAmount, int periodsAreFrequencies)
+extern "C" double openmpt_quinlight_test_apply_it_linear_pitch_slide_reference(double target, int totalAmount, int periodsAreFrequencies)
 {
 	return ApplyITLinearPitchSlideReference(target, totalAmount, periodsAreFrequencies != 0);
 }
 
-extern "C" double openmpt_filament_test_pitch_envelope_factor(int envval, int periodsAreFrequencies)
+extern "C" double openmpt_quinlight_test_pitch_envelope_factor(int envval, int periodsAreFrequencies)
 {
 	return ApplyPitchEnvelopeFactor(envval, periodsAreFrequencies != 0);
 }
 
-extern "C" double openmpt_filament_test_pitch_envelope_reference_factor(int envval, int periodsAreFrequencies)
+extern "C" double openmpt_quinlight_test_pitch_envelope_reference_factor(int envval, int periodsAreFrequencies)
 {
 	return ApplyPitchEnvelopeFactorReference(envval, periodsAreFrequencies != 0);
 }
 
-extern "C" double openmpt_filament_test_it_arpeggio_factor(uint32_t semitones, int periodsAreFrequencies)
+extern "C" double openmpt_quinlight_test_it_arpeggio_factor(uint32_t semitones, int periodsAreFrequencies)
 {
 	return ApplyITArpeggioFactor(semitones, periodsAreFrequencies != 0);
 }
 
-extern "C" double openmpt_filament_test_it_arpeggio_reference_factor(uint32_t semitones, int periodsAreFrequencies)
+extern "C" double openmpt_quinlight_test_it_arpeggio_reference_factor(uint32_t semitones, int periodsAreFrequencies)
 {
 	return ApplyITArpeggioFactorReference(semitones, periodsAreFrequencies != 0);
 }
 
-extern "C" double openmpt_filament_test_it_autovibrato_factor(int vdelta, int periodsAreFrequencies)
+extern "C" double openmpt_quinlight_test_it_autovibrato_factor(int vdelta, int periodsAreFrequencies)
 {
 	return ApplyITAutoVibratoFactor(vdelta, periodsAreFrequencies != 0);
 }
 
-extern "C" double openmpt_filament_test_it_autovibrato_reference_factor(int vdelta, int periodsAreFrequencies)
+extern "C" double openmpt_quinlight_test_it_autovibrato_reference_factor(int vdelta, int periodsAreFrequencies)
 {
 	return ApplyITAutoVibratoFactorReference(vdelta, periodsAreFrequencies != 0);
 }
 
-extern "C" double openmpt_filament_test_linear_autovibrato_factor(int n, int periodsAreFrequencies)
+extern "C" double openmpt_quinlight_test_linear_autovibrato_factor(int n, int periodsAreFrequencies)
 {
 	return ApplyInterpolatedAutoVibratoFactor(n, periodsAreFrequencies != 0);
 }
 
-extern "C" double openmpt_filament_test_linear_autovibrato_reference_factor(int n, int periodsAreFrequencies)
+extern "C" double openmpt_quinlight_test_linear_autovibrato_reference_factor(int n, int periodsAreFrequencies)
 {
 	return ApplyInterpolatedAutoVibratoFactorReference(n, periodsAreFrequencies != 0);
 }
 
-extern "C" double openmpt_filament_test_microtuning_factor(int finetune)
+extern "C" double openmpt_quinlight_test_microtuning_factor(int finetune)
 {
 	return ApplyMicrotuningFactor(finetune);
 }
 
-extern "C" double openmpt_filament_test_hertz_from_note(uint32_t note, double c5speed)
+extern "C" double openmpt_quinlight_test_hertz_from_note(uint32_t note, double c5speed)
 {
 	return GetHertzFromNote(note, c5speed);
 }
 
-extern "C" double openmpt_filament_test_reference_hertz_from_note(uint32_t note, double c5speed)
+extern "C" double openmpt_quinlight_test_reference_hertz_from_note(uint32_t note, double c5speed)
 {
 	return GetReferenceHertzFromNote(note, c5speed);
 }
 
-extern "C" double openmpt_filament_test_xm_linear_freq_from_period(uint32_t period)
+extern "C" double openmpt_quinlight_test_xm_linear_freq_from_period(uint32_t period)
 {
 	return GetXMLinearFreqFromPeriod(period);
 }
 
-extern "C" double openmpt_filament_test_reference_xm_linear_freq_from_period(uint32_t period)
+extern "C" double openmpt_quinlight_test_reference_xm_linear_freq_from_period(uint32_t period)
 {
 	return GetReferenceXMLinearFreqFromPeriod(period);
 }

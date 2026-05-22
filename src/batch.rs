@@ -83,13 +83,13 @@ const AAC_MAX_RATE: u32 = 96_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConvertOutputKind {
     Original,
-    FilamentRemastered48k,
+    QuinlightRemastered48k,
 }
 
 impl ConvertOutputKind {
     fn nominal_rate(&self) -> u32 {
         match self {
-            Self::FilamentRemastered48k | Self::Original => 96_000,
+            Self::QuinlightRemastered48k | Self::Original => 96_000,
         }
     }
 
@@ -186,7 +186,7 @@ fn render_module_to_output_with_interpolation(
     let metadata = crate::render::AudioMetadata {
         title: info.title.clone(),
         artist: info.artist.clone(),
-        album: "Filament Audio".into(),
+        album: "Quinlight Audio".into(),
     };
     match format {
         "flac" => crate::render::render_live_module_to_flac(
@@ -224,9 +224,9 @@ fn converted_output_name(
 ) -> String {
     let stem = match output_kind {
         ConvertOutputKind::Original => stem.to_string(),
-        ConvertOutputKind::FilamentRemastered48k => {
+        ConvertOutputKind::QuinlightRemastered48k => {
             format!(
-                "{stem}-Filament-Audio-Remastered-{}",
+                "{stem}-Quinlight-Audio-Remastered-{}",
                 format_rate_khz(render_rate_hz)
             )
         }
@@ -271,7 +271,7 @@ fn resolve_requested_engines(
             available.join(", ")
         };
         Err(format!(
-            "Requested Filament engine(s) not available: {}. Available engines: {available_display}",
+            "Requested Quinlight engine(s) not available: {}. Available engines: {available_display}",
             missing.join(", ")
         ))
     }
@@ -299,7 +299,7 @@ pub(crate) fn detect_remaster_engine(
         Ok(engine)
     } else {
         Err(format!(
-            "Requested Filament engine(s) not available: {}",
+            "Requested Quinlight engine(s) not available: {}",
             requested_engines.join(", ")
         ))
     }
@@ -320,7 +320,7 @@ fn snapshot_effect_params_by_sample(
         .collect()
 }
 
-/// Apply Filament sample replacements directly to an already-loaded module.
+/// Apply Quinlight sample replacements directly to an already-loaded module.
 fn remaster_module_in_place(
     module: &mut Module,
     engine: &RemasterEngine,
@@ -589,7 +589,7 @@ pub fn run_convert(
     eprintln!("Found {total} module files");
 
     let requested_output_kind = if remaster {
-        ConvertOutputKind::FilamentRemastered48k
+        ConvertOutputKind::QuinlightRemastered48k
     } else {
         ConvertOutputKind::Original
     };
@@ -691,7 +691,7 @@ pub fn run_convert(
                             eprintln!(
                                 "  Note: AI consensus not reached, but mod has {} sample(s) \
                                  already at >=48 kHz and {} engines were available — \
-                                 accepting as Filament-remastered via the mixing engine",
+                                 accepting as Quinlight-remastered via the mixing engine",
                                 outcome.existing_hifi_samples, outcome.engines_available,
                             );
                         } else {
@@ -704,7 +704,7 @@ pub fn run_convert(
                         }
                     }
                     if outcome.replaced > 0 || mixing_engine_qualifies {
-                        output_kind = ConvertOutputKind::FilamentRemastered48k;
+                        output_kind = ConvertOutputKind::QuinlightRemastered48k;
                     }
                 }
                 Err(e) => {
@@ -870,23 +870,23 @@ mod tests {
 
     #[test]
     fn final_result_returns_non_empty_final_outputs() {
-        let expected = sample_result("Filament Audio (A+L)", vec![0.1, 0.2, 0.3, 0.4]);
+        let expected = sample_result("Quinlight Audio (A+L)", vec![0.1, 0.2, 0.3, 0.4]);
         let actual = final_result(RemasterOutput::Final(expected.clone()));
         assert_eq!(
             actual.as_ref().map(|result| result.engine_name.as_str()),
-            Some("Filament Audio (A+L)")
+            Some("Quinlight Audio (A+L)")
         );
         assert_eq!(actual.map(|result| result.data), Some(expected.data));
     }
 
     #[test]
-    fn bare_filament_final_keeps_original_sample_in_batch_mode() {
+    fn bare_quinlight_final_keeps_original_sample_in_batch_mode() {
         assert!(
-            !should_apply_final_result(&sample_result("Filament Audio", vec![0.1, 0.2])),
+            !should_apply_final_result(&sample_result("Quinlight Audio", vec![0.1, 0.2])),
             "no-consensus finals should leave the original sample untouched in batch mode",
         );
         assert!(
-            should_apply_final_result(&sample_result("Filament Audio (A+L)", vec![0.1, 0.2])),
+            should_apply_final_result(&sample_result("Quinlight Audio (A+L)", vec![0.1, 0.2])),
             "consensus finals should still be applied in batch mode",
         );
     }
@@ -894,7 +894,7 @@ mod tests {
     #[test]
     fn record_best_final_result_keeps_only_highest_rate_per_sample() {
         let mut finals = std::collections::HashMap::new();
-        let mut low = sample_result("Filament Audio (A)", vec![0.1, 0.2]);
+        let mut low = sample_result("Quinlight Audio (A)", vec![0.1, 0.2]);
         low.index = 9;
         low.sample_rate_hz = 44_100;
         let mut high = low.clone();
@@ -924,10 +924,10 @@ mod tests {
         // Finals land for the same sample_index — the later one has more
         // contributors and must win.
         let mut finals = std::collections::HashMap::new();
-        let mut primary_final = sample_result("Filament Audio (A+L)", vec![0.1, 0.2]);
+        let mut primary_final = sample_result("Quinlight Audio (A+L)", vec![0.1, 0.2]);
         primary_final.index = 7;
         primary_final.sample_rate_hz = 48_000;
-        let mut fallback_final = sample_result("Filament Audio (A+L+F)", vec![0.3, 0.4]);
+        let mut fallback_final = sample_result("Quinlight Audio (A+L+F)", vec![0.3, 0.4]);
         fallback_final.index = 7;
         fallback_final.sample_rate_hz = 48_000;
 
@@ -935,32 +935,32 @@ mod tests {
         record_best_final_result(&mut finals, RemasterOutput::Final(fallback_final.clone()));
 
         let stored = finals.get(&7).expect("final recorded");
-        assert_eq!(stored.engine_name, "Filament Audio (A+L+F)");
+        assert_eq!(stored.engine_name, "Quinlight Audio (A+L+F)");
         assert_eq!(stored.data, fallback_final.data);
     }
 
     #[test]
     fn converted_output_name_uses_render_rate_suffix() {
-        let k = ConvertOutputKind::FilamentRemastered48k;
+        let k = ConvertOutputKind::QuinlightRemastered48k;
         assert_eq!(
             converted_output_name("2ND_PM", "m4a", k, 96_000),
-            "2ND_PM-Filament-Audio-Remastered-96Khz.m4a"
+            "2ND_PM-Quinlight-Audio-Remastered-96Khz.m4a"
         );
         assert_eq!(
             converted_output_name("2ND_PM", "flac", k, 48_000),
-            "2ND_PM-Filament-Audio-Remastered-48Khz.flac"
+            "2ND_PM-Quinlight-Audio-Remastered-48Khz.flac"
         );
         assert_eq!(
             converted_output_name("2ND_PM", "flac", k, 192_000),
-            "2ND_PM-Filament-Audio-Remastered-192Khz.flac"
+            "2ND_PM-Quinlight-Audio-Remastered-192Khz.flac"
         );
         assert_eq!(
             converted_output_name("2ND_PM", "flac", k, 44_100),
-            "2ND_PM-Filament-Audio-Remastered-44.1Khz.flac"
+            "2ND_PM-Quinlight-Audio-Remastered-44.1Khz.flac"
         );
         assert_eq!(
             converted_output_name("2ND_PM", "flac", k, 88_200),
-            "2ND_PM-Filament-Audio-Remastered-88.2Khz.flac"
+            "2ND_PM-Quinlight-Audio-Remastered-88.2Khz.flac"
         );
         let k = ConvertOutputKind::Original;
         assert_eq!(

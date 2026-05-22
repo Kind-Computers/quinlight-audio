@@ -125,7 +125,11 @@ fn configure_module_for_render(
     agc_enabled: bool,
 ) {
     module.set_repeat_count(0); // play once
-    module.apply_filament_processing_settings(stereo_separation, interpolation_filter, agc_enabled);
+    module.apply_quinlight_processing_settings(
+        stereo_separation,
+        interpolation_filter,
+        agc_enabled,
+    );
     module.set_position_seconds(0.0);
 }
 
@@ -1144,7 +1148,7 @@ mod tests {
         let metadata = AudioMetadata {
             title: "Test".into(),
             artist: String::new(),
-            album: "Filament Audio".into(),
+            album: "Quinlight Audio".into(),
         };
         write_flac(samples.clone(), &flac_path, SAMPLE_RATE, &metadata)
             .expect("FLAC export should succeed");

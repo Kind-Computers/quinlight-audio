@@ -278,7 +278,7 @@ public:
 	void ctl_set_floatingpoint( std::string_view ctl, double value, bool throw_if_unknown = true );
 	void ctl_set_text( std::string_view ctl, std::string_view value, bool throw_if_unknown = true );
 
-	// --- Filament extensions ---
+	// --- Quinlight extensions ---
 	std::int32_t get_sample_rate( std::int32_t index ) const;
 	std::int64_t get_sample_length_frames( std::int32_t index ) const;
 	std::int32_t get_sample_channels( std::int32_t index ) const;

@@ -1,11 +1,11 @@
-# Contributing to Filament Audio
+# Contributing to Quinlight Audio
 
-Thanks for your interest in contributing. Filament Audio is the audio app in
-Kind Computers' growing `filament-*` family.
+Thanks for your interest in contributing. Quinlight Audio is the audio app in
+Kind Computers' growing `quinlight-*` family.
 
 ## Build prerequisites
 
-Filament Audio targets `x86_64-unknown-linux-gnu`. The supported public install
+Quinlight Audio targets `x86_64-unknown-linux-gnu`. The supported public install
 path is:
 
 ```bash
@@ -14,7 +14,7 @@ path is:
 
 That script installs the system packages (build toolchain, SDL2/GTK/FFmpeg
 headers, libopenmpt-dev, libarchive-dev), creates a Python venv at
-`~/.local/share/filament-audio/venv`, and installs the pinned PyTorch + AI
+`~/.local/share/quinlight-audio/venv`, and installs the pinned PyTorch + AI
 backend packages used by the optional remastering engines.
 
 Once prerequisites are in place:
@@ -30,14 +30,14 @@ venv + AI checkpoints land around 26 GB.
 ## Bug reports and feature requests
 
 Please file issues at
-<https://github.com/Kind-Computers/filament-audio/issues>. A good report
+<https://github.com/Kind-Computers/quinlight-audio/issues>. A good report
 includes:
 
-- The exact version (`filament-audio --version`)
+- The exact version (`quinlight-audio --version`)
 - The platform (`uname -a`, GPU vendor)
 - A minimal reproduction (a tracker module file is helpful when the bug is
   format-specific)
-- Logs from `RUST_LOG=info filament-audio …` if relevant
+- Logs from `RUST_LOG=info quinlight-audio …` if relevant
 
 ## AI backends are external
 

@@ -15,9 +15,9 @@ pub const CONTENT_TEXT: iced::Color = color!(0xe0, 0xe0, 0xff);
 pub const ACCENT_GREEN: iced::Color = color!(0x00, 0xe8, 0x9c);
 pub const ACCENT_AMBER: iced::Color = color!(0xff, 0xd3, 0x3c);
 
-pub fn filament_theme() -> Theme {
+pub fn quinlight_theme() -> Theme {
     Theme::custom(
-        "Filament Audio".into(),
+        "Quinlight Audio".into(),
         iced::theme::Palette {
             background: PANEL_BG,
             text: CONTENT_TEXT,

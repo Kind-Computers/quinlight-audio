@@ -152,14 +152,14 @@ mod tests {
         assert_eq!(nativefloat_size_bytes(), 8);
     }
 
-    fn configure_filament_render(
+    fn configure_quinlight_render(
         module: &mut Module,
         stereo_separation: i32,
         interpolation_filter: i32,
         agc_enabled: bool,
     ) {
         module.set_repeat_count(0);
-        module.apply_filament_processing_settings(
+        module.apply_quinlight_processing_settings(
             stereo_separation,
             interpolation_filter,
             agc_enabled,
@@ -1741,7 +1741,7 @@ mod tests {
         let data = std::fs::read(BEYOND_NETWORK_FIXTURE).expect("Failed to read IT fixture");
         let mut module = Module::from_memory(&data).expect("Failed to load IT fixture");
         module.set_repeat_count(0);
-        module.apply_filament_processing_settings(100, 8, false);
+        module.apply_quinlight_processing_settings(100, 8, false);
         let window = render_window(&mut module, 50.602_667, 58.096_000);
         assert!(
             !window.is_empty(),
@@ -1896,7 +1896,7 @@ mod tests {
         let helper_render = render::render_live_module_to_samples(&mut helper_module, 75, 8)
             .expect("Should render via the live helper");
 
-        configure_filament_render(&mut manual_module, 75, 8, DEFAULT_AGC_ENABLED);
+        configure_quinlight_render(&mut manual_module, 75, 8, DEFAULT_AGC_ENABLED);
         let manual_render = render_module_output(&mut manual_module);
 
         assert_eq!(
@@ -1975,7 +1975,7 @@ mod tests {
             .read_sample_data(sample_index)
             .expect("Should read sample 33");
 
-        let reference = remaster::build_filament_reference_48k_with_loop_info(
+        let reference = remaster::build_quinlight_reference_48k_with_loop_info(
             &original_data,
             original_rate as u32,
             sample_channels as usize,
@@ -2091,7 +2091,7 @@ mod tests {
         let original_data = probe
             .read_sample_data(sample_index)
             .expect("fixture sample should be readable");
-        let reference = remaster::build_filament_reference_48k_with_loop_info(
+        let reference = remaster::build_quinlight_reference_48k_with_loop_info(
             &original_data,
             original_rate as u32,
             sample_channels as usize,
@@ -2133,7 +2133,7 @@ mod tests {
         assert_eq!(replaced_loop.normal.end_frames, expected_loop_end);
         assert_eq!(replaced_loop.normal.mode, SampleLoopMode::PingPong);
 
-        configure_filament_render(&mut replaced_module, 50, 8, false);
+        configure_quinlight_render(&mut replaced_module, 50, 8, false);
         let rendered = render_module_output(&mut replaced_module);
         assert!(
             rendered.iter().all(|sample| sample.is_finite()),
@@ -2157,7 +2157,7 @@ mod tests {
         let original_data = probe
             .read_sample_data(sample_index)
             .expect("fixture sample should be readable");
-        let reference = remaster::build_filament_reference_48k_with_loop_info(
+        let reference = remaster::build_quinlight_reference_48k_with_loop_info(
             &original_data,
             original_rate as u32,
             sample_channels as usize,
@@ -2239,7 +2239,7 @@ mod tests {
             assert_eq!(replaced_loop.normal.mode, loop_info.normal.mode);
         }
 
-        configure_filament_render(&mut replaced_module, 50, 8, false);
+        configure_quinlight_render(&mut replaced_module, 50, 8, false);
         let rendered = render_module_output(&mut replaced_module);
         assert!(
             rendered.iter().all(|sample| sample.is_finite()),
@@ -2265,7 +2265,7 @@ mod tests {
             .read_sample_data(sample_index)
             .expect("Should read sample 33");
 
-        let reference = remaster::build_filament_reference_48k_with_loop_info(
+        let reference = remaster::build_quinlight_reference_48k_with_loop_info(
             &original_data,
             original_rate as u32,
             sample_channels as usize,
@@ -2743,7 +2743,7 @@ mod tests {
     }
 
     #[test]
-    fn test_agc_extension_roundtrip_and_filament_defaults() {
+    fn test_agc_extension_roundtrip_and_quinlight_defaults() {
         let data = std::fs::read(BASIC_FIXTURE).expect("Failed to read test module");
         let mut module = Module::from_memory(&data).expect("Failed to load test module");
 
@@ -2766,31 +2766,31 @@ mod tests {
             "AGC profile should roundtrip through the extension API",
         );
 
-        module.apply_filament_processing_settings(75, 16, DEFAULT_AGC_ENABLED);
+        module.apply_quinlight_processing_settings(75, 16, DEFAULT_AGC_ENABLED);
         assert_eq!(
             module.interpolation_filter(),
             Some(16),
-            "Filament helper should apply the requested interpolation",
+            "Quinlight helper should apply the requested interpolation",
         );
         assert_eq!(
             module.stereo_separation(),
             Some(75),
-            "Filament helper should apply the requested stereo separation",
+            "Quinlight helper should apply the requested stereo separation",
         );
         assert_eq!(
             module.volume_ramping_strength(),
             Some(DEFAULT_VOLUMERAMPING_STRENGTH),
-            "Filament helper should force the slowest volume ramping",
+            "Quinlight helper should force the slowest volume ramping",
         );
         assert_eq!(
             module.agc_profile(),
             DEFAULT_AGC_PROFILE,
-            "Filament helper should select the gentle AGC profile",
+            "Quinlight helper should select the gentle AGC profile",
         );
         assert_eq!(
             module.agc_enabled(),
             DEFAULT_AGC_ENABLED,
-            "Filament helper should enable AGC by default",
+            "Quinlight helper should enable AGC by default",
         );
     }
 
@@ -2881,7 +2881,7 @@ mod tests {
             .expect("Explicit AGC-off helper should produce audio");
 
         let mut manual_module = Module::from_memory(&data).expect("Failed to load test module");
-        configure_filament_render(&mut manual_module, 75, 8, false);
+        configure_quinlight_render(&mut manual_module, 75, 8, false);
         let manual_render = render_module_output(&mut manual_module);
 
         assert_eq!(
@@ -4269,7 +4269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filament_mix_selects_top_two_original_matches_and_weights() {
+    fn test_quinlight_mix_selects_top_two_original_matches_and_weights() {
         let reference: Vec<f64> = (0..4096)
             .map(|i| (i as f64 * 200.0 * 2.0 * std::f64::consts::PI / 48000.0).sin())
             .collect();
@@ -4290,10 +4290,10 @@ mod tests {
         ];
 
         let mix =
-            remaster::select_filament_mix(&reference, 1, 48_000, &engines, engines.len(), false);
+            remaster::select_quinlight_mix(&reference, 1, 48_000, &engines, engines.len(), false);
 
         // 2 usable engines → spectral intersection blend with equal weights
-        assert!(mix.name.starts_with("Filament Audio ("));
+        assert!(mix.name.starts_with("Quinlight Audio ("));
         assert_eq!(mix.channels, 1);
         assert_eq!(mix.contributors.len(), 2);
         assert_eq!(mix.contributors[0].name, "AudioSR");
@@ -4306,7 +4306,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filament_mix_multi_engine_matches_reference_rms_without_reference_contributor() {
+    fn test_quinlight_mix_multi_engine_matches_reference_rms_without_reference_contributor() {
         use super::engine::spectral_correlation;
 
         let n = 8192;
@@ -4338,13 +4338,13 @@ mod tests {
         ];
 
         let mix =
-            remaster::select_filament_mix(&reference, 1, 48_000, &engines, engines.len(), false);
+            remaster::select_quinlight_mix(&reference, 1, 48_000, &engines, engines.len(), false);
 
         assert!(
             score_a > 0.90 && score_b > 0.90,
             "Fixture should keep both engines usable for multi-engine consensus, got score_a={score_a:.4}, score_b={score_b:.4}"
         );
-        assert!(mix.name.starts_with("Filament Audio ("));
+        assert!(mix.name.starts_with("Quinlight Audio ("));
         assert!(
             mix.contributors
                 .iter()
@@ -4353,7 +4353,7 @@ mod tests {
         );
         assert!(
             (rms(&mix.data) - rms(&reference)).abs() < 1.0e-6,
-            "Filament should keep RMS matched to the reference-derived target"
+            "Quinlight should keep RMS matched to the reference-derived target"
         );
         assert!(
             mean_abs_diff(&mix.data, &reference) > 0.05,
@@ -4362,9 +4362,9 @@ mod tests {
     }
 
     #[test]
-    fn test_filament_one_usable_of_two_dispatched_marks_original_fallback() {
+    fn test_quinlight_one_usable_of_two_dispatched_marks_original_fallback() {
         // With 2 engines dispatched but only 1 scoring above floor,
-        // consensus is impossible — final Filament should keep the original sample.
+        // consensus is impossible — final Quinlight should keep the original sample.
         let reference: Vec<f64> = (0..4096)
             .map(|i| (i as f64 * 180.0 * 2.0 * std::f64::consts::PI / 48000.0).sin())
             .collect();
@@ -4382,9 +4382,9 @@ mod tests {
         ];
 
         let mix =
-            remaster::select_filament_mix(&reference, 1, 48_000, &engines, engines.len(), false);
+            remaster::select_quinlight_mix(&reference, 1, 48_000, &engines, engines.len(), false);
 
-        assert_eq!(mix.name, "Filament Audio");
+        assert_eq!(mix.name, "Quinlight Audio");
         assert_eq!(mix.contributors.len(), 1);
         assert_eq!(mix.contributors[0].name, "Original");
         assert!((mix.contributors[0].weight - 1.0).abs() < 1e-6);
@@ -4396,9 +4396,9 @@ mod tests {
     }
 
     #[test]
-    fn test_filament_single_dispatch_marks_original_fallback() {
+    fn test_quinlight_single_dispatch_marks_original_fallback() {
         // With only 1 engine dispatched and 1 usable, consensus is still
-        // impossible — final Filament should keep the original sample.
+        // impossible — final Quinlight should keep the original sample.
         let reference: Vec<f64> = (0..4096)
             .map(|i| (i as f64 * 180.0 * 2.0 * std::f64::consts::PI / 48000.0).sin())
             .collect();
@@ -4409,9 +4409,9 @@ mod tests {
             .collect();
         let engines = vec![("AudioSR".to_string(), good, 4096i64, 1i32)];
 
-        let mix = remaster::select_filament_mix(&reference, 1, 48_000, &engines, 1, false);
+        let mix = remaster::select_quinlight_mix(&reference, 1, 48_000, &engines, 1, false);
 
-        assert_eq!(mix.name, "Filament Audio");
+        assert_eq!(mix.name, "Quinlight Audio");
         assert_eq!(mix.contributors.len(), 1);
         assert_eq!(mix.contributors[0].name, "Original");
         assert!(
@@ -4423,14 +4423,14 @@ mod tests {
 
     #[test]
     fn test_is_no_consensus_result() {
-        assert!(remaster::is_no_consensus_result("Filament Audio"));
-        assert!(!remaster::is_no_consensus_result("Filament Audio (A+L)"));
-        assert!(!remaster::is_no_consensus_result("Filament Audio (A)"));
-        assert!(!remaster::is_no_consensus_result("Filament Audio (L+F)"));
+        assert!(remaster::is_no_consensus_result("Quinlight Audio"));
+        assert!(!remaster::is_no_consensus_result("Quinlight Audio (A+L)"));
+        assert!(!remaster::is_no_consensus_result("Quinlight Audio (A)"));
+        assert!(!remaster::is_no_consensus_result("Quinlight Audio (L+F)"));
     }
 
     #[test]
-    fn test_filament_mix_with_no_usable_engines_marks_original_fallback() {
+    fn test_quinlight_mix_with_no_usable_engines_marks_original_fallback() {
         let reference: Vec<f64> = (0..4096)
             .map(|i| (i as f64 * 220.0 * 2.0 * std::f64::consts::PI / 48000.0).sin())
             .collect();
@@ -4446,7 +4446,7 @@ mod tests {
         ];
 
         let mix =
-            remaster::select_filament_mix(&reference, 1, 48_000, &engines, engines.len(), false);
+            remaster::select_quinlight_mix(&reference, 1, 48_000, &engines, engines.len(), false);
 
         assert_eq!(mix.contributors.len(), 1);
         assert_eq!(mix.contributors[0].name, "Original");
@@ -4455,7 +4455,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filament_mix_reference_prefers_filtered_candidate() {
+    fn test_quinlight_mix_reference_prefers_filtered_candidate() {
         let base: Vec<f64> = (0..4096)
             .map(|i| (i as f64 * 180.0 * 2.0 * std::f64::consts::PI / 48000.0).sin())
             .collect();
@@ -4466,7 +4466,7 @@ mod tests {
                 s + 0.35 * (i as f64 * 9000.0 * 2.0 * std::f64::consts::PI / 48000.0).sin()
             })
             .collect();
-        let filtered_reference = remaster::build_filament_reference_48k(
+        let filtered_reference = remaster::build_quinlight_reference_48k(
             &original,
             48_000,
             1,
@@ -4492,7 +4492,7 @@ mod tests {
             ),
         ];
 
-        let mix = remaster::select_filament_mix(
+        let mix = remaster::select_quinlight_mix(
             &filtered_reference,
             1,
             48_000,
@@ -4507,7 +4507,7 @@ mod tests {
     #[test]
     fn test_looped_reference_keeps_one_shot_onset_for_first_segment() {
         let original = vec![1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0];
-        let one_shot = remaster::build_filament_reference_48k(
+        let one_shot = remaster::build_quinlight_reference_48k(
             &original,
             48_000,
             1,
@@ -4515,7 +4515,7 @@ mod tests {
             remaster::CleanupSettings::off(),
         )
         .expect("Should build one-shot reference");
-        let looped = remaster::build_filament_reference_48k(
+        let looped = remaster::build_quinlight_reference_48k(
             &original,
             48_000,
             1,
@@ -4644,7 +4644,7 @@ mod tests {
         // Render 10s with zero beta-shear (0.0, 0.0) — β-shear disabled
         let default_output = {
             let mut module = Module::from_memory(&data).expect("load module");
-            configure_filament_render(&mut module, 75, 64, true);
+            configure_quinlight_render(&mut module, 75, 64, true);
             module.set_aniso64_k_beta(0.0);
             module.set_aniso64_k_beta2(0.0);
             render_module_output_capped(&mut module, 10)
@@ -4653,7 +4653,7 @@ mod tests {
         // Render 10s with extreme beta-shear (2.0, 2.0)
         let extreme_shear_output = {
             let mut module = Module::from_memory(&data).expect("load module");
-            configure_filament_render(&mut module, 75, 64, true);
+            configure_quinlight_render(&mut module, 75, 64, true);
             module.set_aniso64_k_beta(2.0);
             module.set_aniso64_k_beta2(2.0);
             render_module_output_capped(&mut module, 10)
@@ -4684,19 +4684,19 @@ mod tests {
 
         let aniso64_output = {
             let mut module = Module::from_memory(&data).expect("load module");
-            configure_filament_render(&mut module, 75, 64, true);
+            configure_quinlight_render(&mut module, 75, 64, true);
             render_module_output_capped(&mut module, 15)
         };
 
         let sinc16_output = {
             let mut module = Module::from_memory(&data).expect("load module");
-            configure_filament_render(&mut module, 75, 16, true);
+            configure_quinlight_render(&mut module, 75, 16, true);
             render_module_output_capped(&mut module, 15)
         };
 
         let sinc8lp_output = {
             let mut module = Module::from_memory(&data).expect("load module");
-            configure_filament_render(&mut module, 75, 8, true);
+            configure_quinlight_render(&mut module, 75, 8, true);
             render_module_output_capped(&mut module, 15)
         };
 
@@ -4769,7 +4769,7 @@ mod tests {
         // Match live GUI defaults: Aniso-64 filter, 50% stereo sep, AGC enabled
         module.set_stereo_separation(DEFAULT_STEREO_SEPARATION_PERCENT);
         module.set_interpolation_filter(DEFAULT_INTERPOLATION_FILTER_LENGTH); // Aniso-64
-        module.apply_filament_processing_settings(
+        module.apply_quinlight_processing_settings(
             DEFAULT_STEREO_SEPARATION_PERCENT,
             DEFAULT_INTERPOLATION_FILTER_LENGTH,
             DEFAULT_AGC_ENABLED,
@@ -4787,9 +4787,9 @@ mod tests {
 
         // Write as raw f64 PCM
         let bytes: Vec<u8> = all_samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-        std::fs::write("/tmp/filament_render.raw", &bytes).expect("write raw PCM");
+        std::fs::write("/tmp/quinlight_render.raw", &bytes).expect("write raw PCM");
         eprintln!(
-            "Wrote {} frames ({:.1}s) to /tmp/filament_render.raw (f64 stereo 48kHz)",
+            "Wrote {} frames ({:.1}s) to /tmp/quinlight_render.raw (f64 stereo 48kHz)",
             all_samples.len() / 2,
             all_samples.len() as f64 / 2.0 / 48_000.0
         );

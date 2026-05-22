@@ -76,7 +76,7 @@ struct ModChannel
 	mixsample_t nFilter_Y[2][2]; // Filter memory - two history items per sample channel
 	mixsample_t nFilter_A0, nFilter_B0, nFilter_B1; // Filter coeffs
 	mixsample_t nFilter_HP;
-	// Filament: second biquad stage for 4-pole Butterworth modes
+	// Quinlight: second biquad stage for 4-pole Butterworth modes
 	mixsample_t nFilter_Y2[2][2];
 	mixsample_t nFilter2_A0, nFilter2_B0, nFilter2_B1;
 
@@ -86,7 +86,7 @@ struct ModChannel
 	FlagSet<ChannelFlags> dwFlags;
 	mixsample_t nROfs, nLOfs;
 	uint32 nRampLength;
-	uint32 nRampPosition;  // Filament: current position in ramp (0..nRampLength) for smoothstep
+	uint32 nRampPosition;  // Quinlight: current position in ramp (0..nRampLength) for smoothstep
 
 	const ModSample *pModSample;  // Currently assigned sample slot (may already be stopped)
 	Paula::State paulaState;

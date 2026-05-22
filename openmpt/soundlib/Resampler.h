@@ -61,7 +61,7 @@ static_assert((SINC_MASK & 0xffff) == SINC_MASK); // exceeding fractional freq
 // Every mipped mode uses trilinear blend between adjacent levels via log2(ratio).
 #define MIP_LEVELS 8
 
-// 64-tap anisotropic sinc tables (Filament Aniso-64 mode)
+// 64-tap anisotropic sinc tables (Quinlight Aniso-64 mode)
 #define SINC_WIDTH_64       64
 #define SINC_PHASES_64_BITS 16
 #define SINC_PHASES_64      (1 << SINC_PHASES_64_BITS)  // 65536

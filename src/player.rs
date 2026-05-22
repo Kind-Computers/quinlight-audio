@@ -217,7 +217,11 @@ fn apply_module_processing_settings(
     agc_enabled: bool,
     agc_profile: AgcProfile,
 ) {
-    module.apply_filament_processing_settings(stereo_separation, interpolation_filter, agc_enabled);
+    module.apply_quinlight_processing_settings(
+        stereo_separation,
+        interpolation_filter,
+        agc_enabled,
+    );
     module.set_agc_profile(agc_profile);
 }
 

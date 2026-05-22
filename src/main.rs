@@ -22,7 +22,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-use gui::Filament;
+use gui::Quinlight;
 use remaster::{CleanupEngineVersion, CleanupMode, CleanupSettings, UpscaleMode};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -107,7 +107,7 @@ impl ConvertEngineArg {
 
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 struct UpscaleCliArgs {
-    /// Filament worker mode: cpu, gpu, or hybrid (default: auto-detect — gpu if a GPU is present, else cpu)
+    /// Quinlight worker mode: cpu, gpu, or hybrid (default: auto-detect — gpu if a GPU is present, else cpu)
     #[arg(long, value_enum)]
     upscale_mode: Option<UpscaleModeArg>,
 
@@ -142,7 +142,7 @@ fn resolve_with_vendor(args: UpscaleCliArgs, vendor: engine::GpuVendor) -> Upsca
                 // for zero benefit. Downgrade to CpuOnly so the user gets 1
                 // CPU worker per engine, not 2.
                 eprintln!(
-                    "filament: --upscale-mode {explicit:?} requested but no GPU detected; \
+                    "quinlight: --upscale-mode {explicit:?} requested but no GPU detected; \
                      dropping to --upscale-mode cpu to avoid redundant CPU workers."
                 );
                 return UpscaleMode::CpuOnly;
@@ -153,7 +153,7 @@ fn resolve_with_vendor(args: UpscaleCliArgs, vendor: engine::GpuVendor) -> Upsca
                 // equivalent to CpuOnly but we keep the user's requested mode
                 // name for visibility in logs.
                 eprintln!(
-                    "filament: --upscale-mode {explicit:?} requested but no GPU detected; workers will run on CPU."
+                    "quinlight: --upscale-mode {explicit:?} requested but no GPU detected; workers will run on CPU."
                 );
             }
             mode
@@ -168,7 +168,7 @@ fn application_window_settings() -> iced::window::Settings {
         min_size: Some(gui::minimum_window_size()),
         icon: Some(gui::icon::create_icon()),
         platform_specific: iced::window::settings::PlatformSpecific {
-            application_id: "filament-audio".into(),
+            application_id: "quinlight-audio".into(),
             ..Default::default()
         },
         exit_on_close_request: false,
@@ -178,7 +178,7 @@ fn application_window_settings() -> iced::window::Settings {
 
 #[derive(Parser)]
 #[command(
-    name = "filament-audio",
+    name = "quinlight-audio",
     about = "Tracker music player and remastering tool presented by Kind Computers"
 )]
 struct Cli {
@@ -209,7 +209,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Batch render modules in a directory to FLAC/M4A (with Filament remastering by default)
+    /// Batch render modules in a directory to FLAC/M4A (with Quinlight remastering by default)
     Convert {
         /// Input file or directory containing module files
         input: PathBuf,
@@ -242,7 +242,7 @@ enum Commands {
         #[arg(long, conflicts_with = "engine")]
         no_remaster: bool,
 
-        /// Restrict Filament remastering to the selected engine(s)
+        /// Restrict Quinlight remastering to the selected engine(s)
         #[arg(long, value_enum, conflicts_with = "no_remaster")]
         engine: Vec<ConvertEngineArg>,
 
@@ -274,7 +274,7 @@ enum Commands {
         upscale: UpscaleCliArgs,
     },
     /// AI-upsample one or more standalone FLAC files through all detected
-    /// engines and write the Filament consensus result as 48 kHz / 32-bit
+    /// engines and write the Quinlight consensus result as 48 kHz / 32-bit
     /// FLAC. Passing many files in one invocation amortizes model-load cost
     /// — each engine's Python subprocess loads its model once per batch
     /// chunk instead of once per file.
@@ -286,11 +286,11 @@ enum Commands {
 
         /// Output path. For a single input, this may be a file path or a directory.
         /// For multiple inputs, it must be a directory. Defaults to
-        /// {input_stem}-Filament-Audio-Remastered-48Khz.flac next to each input.
+        /// {input_stem}-Quinlight-Audio-Remastered-48Khz.flac next to each input.
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Restrict Filament remastering to the selected engine(s)
+        /// Restrict Quinlight remastering to the selected engine(s)
         #[arg(long, value_enum)]
         engine: Vec<ConvertEngineArg>,
 
@@ -299,9 +299,9 @@ enum Commands {
         ddim_steps: u32,
 
         /// Minimum per-engine spectral-correlation score required for that
-        /// engine's output to contribute to Filament's consensus. Engines
+        /// engine's output to contribute to Quinlight's consensus. Engines
         /// below the floor are dropped for that sample; if fewer than 2
-        /// engines remain usable, Filament keeps the original sample.
+        /// engines remain usable, Quinlight keeps the original sample.
         /// Range 0.0 – 1.0. Defaults to the built-in floor (0.9).
         #[arg(long)]
         threshold: Option<f64>,
@@ -368,7 +368,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         remaster::set_no_cache(true);
     }
 
-    if cli.gl || std::env::var("FILAMENT_AUDIO_GL_RETRY").as_deref() == Ok("1") {
+    if cli.gl || std::env::var("QUINLIGHT_AUDIO_GL_RETRY").as_deref() == Ok("1") {
         // SAFETY: called before any threads are spawned
         unsafe { std::env::set_var("WGPU_BACKEND", "gl") };
     }
@@ -456,9 +456,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Error: --threshold must be in [0.0, 1.0] (got {t})");
                     std::process::exit(2);
                 }
-                remaster::set_filament_usable_score_floor(t);
+                remaster::set_quinlight_usable_score_floor(t);
                 eprintln!(
-                    "Filament Audio: usable-score floor overridden to {t:.2} via --threshold"
+                    "Quinlight Audio: usable-score floor overridden to {t:.2} via --threshold"
                 );
             }
             match upsample::run_upsample_batch(
@@ -535,13 +535,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let detect_handle = std::thread::spawn(remaster::RemasterEngine::detect);
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                iced::application(Filament::title, Filament::update, Filament::view)
+                iced::application(Quinlight::title, Quinlight::update, Quinlight::view)
                     .antialiasing(true)
-                    .subscription(Filament::subscription)
-                    .theme(Filament::theme)
+                    .subscription(Quinlight::subscription)
+                    .theme(Quinlight::theme)
                     .window(application_window_settings())
                     .run_with(move || {
-                        Filament::new(upscale_mode, detect_handle, shutdown_flag, playback_rate)
+                        Quinlight::new(upscale_mode, detect_handle, shutdown_flag, playback_rate)
                     })
             }));
 
@@ -553,7 +553,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(panic_payload) => {
                     if is_wgpu_panic(&panic_payload) && can_retry_with_gl() {
                         eprintln!(
-                            "filament: Vulkan backend crashed (Wayland DMA-BUF issue). \
+                            "quinlight: Vulkan backend crashed (Wayland DMA-BUF issue). \
                              Restarting with OpenGL backend..."
                         );
                         retry_with_gl_backend();
@@ -585,21 +585,21 @@ mod tests {
 
     #[test]
     fn playback_rate_flag_parses() {
-        let cli = Cli::try_parse_from(["filament-audio", "--playback-rate", "48000"])
+        let cli = Cli::try_parse_from(["quinlight-audio", "--playback-rate", "48000"])
             .expect("--playback-rate 48000 should parse");
         assert_eq!(cli.playback_rate, Some(48_000));
     }
 
     #[test]
     fn playback_rate_defaults_to_none() {
-        let cli = Cli::try_parse_from(["filament-audio"]).expect("root command should parse");
+        let cli = Cli::try_parse_from(["quinlight-audio"]).expect("root command should parse");
         assert_eq!(cli.playback_rate, None);
     }
 
     #[test]
     fn playback_rate_flag_rejects_out_of_range() {
-        assert!(Cli::try_parse_from(["filament-audio", "--playback-rate", "0"]).is_err());
-        assert!(Cli::try_parse_from(["filament-audio", "--playback-rate", "500000"]).is_err());
+        assert!(Cli::try_parse_from(["quinlight-audio", "--playback-rate", "0"]).is_err());
+        assert!(Cli::try_parse_from(["quinlight-audio", "--playback-rate", "500000"]).is_err());
     }
 
     #[test]
@@ -613,13 +613,13 @@ mod tests {
 
     #[test]
     fn removed_remaster_subcommand_is_rejected() {
-        let parsed = Cli::try_parse_from(["filament-audio", "remaster", "song.it"]);
+        let parsed = Cli::try_parse_from(["quinlight-audio", "remaster", "song.it"]);
         assert!(parsed.is_err());
     }
 
     #[test]
     fn convert_rejects_ensemble_flag() {
-        let parsed = Cli::try_parse_from(["filament-audio", "convert", "mods", "--ensemble"]);
+        let parsed = Cli::try_parse_from(["quinlight-audio", "convert", "mods", "--ensemble"]);
         assert!(parsed.is_err());
     }
 
@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn cli_defaults_stereo_separation_and_upscale_unset() {
-        let cli = Cli::try_parse_from(["filament-audio"]).expect("root command should parse");
+        let cli = Cli::try_parse_from(["quinlight-audio"]).expect("root command should parse");
         assert_eq!(cli.upscale.upscale_mode, None);
         assert_eq!(
             batch::default_render_interpolation_filter(),
@@ -649,7 +649,7 @@ mod tests {
             "Render and convert should share the OpenMPT interpolation default",
         );
 
-        let convert = Cli::try_parse_from(["filament-audio", "convert", "mods"])
+        let convert = Cli::try_parse_from(["quinlight-audio", "convert", "mods"])
             .expect("convert command should parse");
         match convert.command {
             Some(Commands::Convert {
@@ -667,8 +667,9 @@ mod tests {
             _ => panic!("expected convert command"),
         }
 
-        let render = Cli::try_parse_from(["filament-audio", "render", "song.it", "-o", "song.flac"])
-            .expect("render command should parse");
+        let render =
+            Cli::try_parse_from(["quinlight-audio", "render", "song.it", "-o", "song.flac"])
+                .expect("render command should parse");
         match render.command {
             Some(Commands::Render {
                 stereo_separation,
@@ -704,14 +705,14 @@ mod tests {
 
     #[test]
     fn upscale_mode_parses_for_gui_launch() {
-        let gpu = Cli::try_parse_from(["filament-audio", "--upscale-mode", "gpu"])
+        let gpu = Cli::try_parse_from(["quinlight-audio", "--upscale-mode", "gpu"])
             .expect("root gpu mode should parse");
         assert_eq!(
             resolve_with_vendor(gpu.upscale, engine::GpuVendor::Nvidia),
             UpscaleMode::GpuOnly,
         );
 
-        let hybrid = Cli::try_parse_from(["filament-audio", "--upscale-mode", "hybrid"])
+        let hybrid = Cli::try_parse_from(["quinlight-audio", "--upscale-mode", "hybrid"])
             .expect("root hybrid mode should parse");
         assert_eq!(
             resolve_with_vendor(hybrid.upscale, engine::GpuVendor::Nvidia),
@@ -721,8 +722,14 @@ mod tests {
 
     #[test]
     fn upscale_mode_parses_for_convert() {
-        let gpu = Cli::try_parse_from(["filament-audio", "convert", "mods", "--upscale-mode", "gpu"])
-            .expect("convert gpu mode should parse");
+        let gpu = Cli::try_parse_from([
+            "quinlight-audio",
+            "convert",
+            "mods",
+            "--upscale-mode",
+            "gpu",
+        ])
+        .expect("convert gpu mode should parse");
         match gpu.command {
             Some(Commands::Convert { upscale, .. }) => {
                 assert_eq!(
@@ -733,9 +740,14 @@ mod tests {
             _ => panic!("expected convert command"),
         }
 
-        let hybrid =
-            Cli::try_parse_from(["filament-audio", "convert", "mods", "--upscale-mode", "hybrid"])
-                .expect("convert hybrid mode should parse");
+        let hybrid = Cli::try_parse_from([
+            "quinlight-audio",
+            "convert",
+            "mods",
+            "--upscale-mode",
+            "hybrid",
+        ])
+        .expect("convert hybrid mode should parse");
         match hybrid.command {
             Some(Commands::Convert { upscale, .. }) => {
                 assert_eq!(
@@ -816,8 +828,14 @@ mod tests {
 
     #[test]
     fn cleanup_preset_parses_for_convert() {
-        let off = Cli::try_parse_from(["filament-audio", "convert", "mods", "--cleanup-preset", "off"])
-            .expect("convert off cleanup should parse");
+        let off = Cli::try_parse_from([
+            "quinlight-audio",
+            "convert",
+            "mods",
+            "--cleanup-preset",
+            "off",
+        ])
+        .expect("convert off cleanup should parse");
         match off.command {
             Some(Commands::Convert { cleanup_preset, .. }) => {
                 assert_eq!(cleanup_preset, CleanupModeArg::Off);
@@ -826,7 +844,7 @@ mod tests {
         }
 
         let click_ar = Cli::try_parse_from([
-            "filament-audio",
+            "quinlight-audio",
             "convert",
             "mods",
             "--cleanup-preset",
@@ -841,7 +859,7 @@ mod tests {
         }
 
         let click_median = Cli::try_parse_from([
-            "filament-audio",
+            "quinlight-audio",
             "convert",
             "mods",
             "--cleanup-preset",
@@ -856,7 +874,7 @@ mod tests {
         }
 
         let crackle = Cli::try_parse_from([
-            "filament-audio",
+            "quinlight-audio",
             "convert",
             "mods",
             "--cleanup-preset",
@@ -873,8 +891,14 @@ mod tests {
 
     #[test]
     fn cleanup_engine_parses_for_convert() {
-        let v1 = Cli::try_parse_from(["filament-audio", "convert", "mods", "--cleanup-engine", "v1"])
-            .expect("convert v1 cleanup engine should parse");
+        let v1 = Cli::try_parse_from([
+            "quinlight-audio",
+            "convert",
+            "mods",
+            "--cleanup-engine",
+            "v1",
+        ])
+        .expect("convert v1 cleanup engine should parse");
         match v1.command {
             Some(Commands::Convert { cleanup_engine, .. }) => {
                 assert_eq!(cleanup_engine, CleanupEngineArg::V1);
@@ -882,8 +906,14 @@ mod tests {
             _ => panic!("expected convert command"),
         }
 
-        let v21 = Cli::try_parse_from(["filament-audio", "convert", "mods", "--cleanup-engine", "v2-1"])
-            .expect("convert v2.1 cleanup engine should parse");
+        let v21 = Cli::try_parse_from([
+            "quinlight-audio",
+            "convert",
+            "mods",
+            "--cleanup-engine",
+            "v2-1",
+        ])
+        .expect("convert v2.1 cleanup engine should parse");
         match v21.command {
             Some(Commands::Convert { cleanup_engine, .. }) => {
                 assert_eq!(cleanup_engine, CleanupEngineArg::V21);
@@ -895,7 +925,14 @@ mod tests {
     #[test]
     fn convert_engine_selection_parses_repeatably() {
         let parsed = Cli::try_parse_from([
-            "filament-audio", "convert", "mods", "--engine", "audiosr", "--engine", "lavasr", "--engine",
+            "quinlight-audio",
+            "convert",
+            "mods",
+            "--engine",
+            "audiosr",
+            "--engine",
+            "lavasr",
+            "--engine",
             "apbwe",
         ])
         .expect("repeatable engine selection should parse");
@@ -927,14 +964,15 @@ mod tests {
 
     #[test]
     fn convert_reference_only_is_rejected() {
-        let parsed = Cli::try_parse_from(["filament-audio", "convert", "mods", "--reference-only"]);
+        let parsed =
+            Cli::try_parse_from(["quinlight-audio", "convert", "mods", "--reference-only"]);
         assert!(parsed.is_err());
     }
 
     #[test]
     fn convert_engine_still_conflicts_with_no_remaster() {
         let engine_with_no_remaster = Cli::try_parse_from([
-            "filament-audio",
+            "quinlight-audio",
             "convert",
             "mods",
             "--engine",
@@ -946,12 +984,17 @@ mod tests {
 
     #[test]
     fn retired_cleanup_presets_are_rejected() {
-        let light =
-            Cli::try_parse_from(["filament-audio", "convert", "mods", "--cleanup-preset", "light"]);
+        let light = Cli::try_parse_from([
+            "quinlight-audio",
+            "convert",
+            "mods",
+            "--cleanup-preset",
+            "light",
+        ]);
         assert!(light.is_err());
 
         let archival = Cli::try_parse_from([
-            "filament-audio",
+            "quinlight-audio",
             "convert",
             "mods",
             "--cleanup-preset",
@@ -963,7 +1006,7 @@ mod tests {
     #[test]
     fn legacy_cleanup_preset_names_are_rejected() {
         let click_ar = Cli::try_parse_from([
-            "filament-audio",
+            "quinlight-audio",
             "convert",
             "mods",
             "--cleanup-preset",
@@ -972,7 +1015,7 @@ mod tests {
         assert!(click_ar.is_err());
 
         let click_median = Cli::try_parse_from([
-            "filament-audio",
+            "quinlight-audio",
             "convert",
             "mods",
             "--cleanup-preset",
@@ -980,25 +1023,35 @@ mod tests {
         ]);
         assert!(click_median.is_err());
 
-        let crackle =
-            Cli::try_parse_from(["filament-audio", "convert", "mods", "--cleanup-preset", "crackle"]);
+        let crackle = Cli::try_parse_from([
+            "quinlight-audio",
+            "convert",
+            "mods",
+            "--cleanup-preset",
+            "crackle",
+        ]);
         assert!(crackle.is_err());
     }
 
     #[test]
     fn invalid_upscale_mode_is_rejected() {
-        let root = Cli::try_parse_from(["filament-audio", "--upscale-mode", "banana"]);
+        let root = Cli::try_parse_from(["quinlight-audio", "--upscale-mode", "banana"]);
         assert!(root.is_err());
 
-        let convert =
-            Cli::try_parse_from(["filament-audio", "convert", "mods", "--upscale-mode", "banana"]);
+        let convert = Cli::try_parse_from([
+            "quinlight-audio",
+            "convert",
+            "mods",
+            "--upscale-mode",
+            "banana",
+        ]);
         assert!(convert.is_err());
     }
 
     #[test]
     fn render_rejects_upscale_mode() {
         let parsed = Cli::try_parse_from([
-            "filament-audio",
+            "quinlight-audio",
             "render",
             "song.it",
             "-o",
@@ -1012,7 +1065,7 @@ mod tests {
     #[test]
     fn render_rejects_cleanup_preset() {
         let parsed = Cli::try_parse_from([
-            "filament-audio",
+            "quinlight-audio",
             "render",
             "song.it",
             "-o",
@@ -1026,7 +1079,7 @@ mod tests {
     #[test]
     fn render_rejects_cleanup_engine() {
         let parsed = Cli::try_parse_from([
-            "filament-audio",
+            "quinlight-audio",
             "render",
             "song.it",
             "-o",
@@ -1039,10 +1092,10 @@ mod tests {
 
     #[test]
     fn legacy_upscale_flags_are_rejected() {
-        assert!(Cli::try_parse_from(["filament-audio", "--gpu-upscale"]).is_err());
-        assert!(Cli::try_parse_from(["filament-audio", "--hybrid-upscale"]).is_err());
-        assert!(Cli::try_parse_from(["filament-audio", "convert", "mods", "--gpu"]).is_err());
-        assert!(Cli::try_parse_from(["filament-audio", "convert", "mods", "--hybrid"]).is_err());
+        assert!(Cli::try_parse_from(["quinlight-audio", "--gpu-upscale"]).is_err());
+        assert!(Cli::try_parse_from(["quinlight-audio", "--hybrid-upscale"]).is_err());
+        assert!(Cli::try_parse_from(["quinlight-audio", "convert", "mods", "--gpu"]).is_err());
+        assert!(Cli::try_parse_from(["quinlight-audio", "convert", "mods", "--hybrid"]).is_err());
     }
 }
 
@@ -1091,7 +1144,7 @@ fn is_wgpu_panic(payload: &Box<dyn std::any::Any + Send>) -> bool {
 }
 
 fn can_retry_with_gl() -> bool {
-    std::env::var("FILAMENT_AUDIO_GL_RETRY").as_deref() != Ok("1")
+    std::env::var("QUINLIGHT_AUDIO_GL_RETRY").as_deref() != Ok("1")
 }
 
 fn retry_with_gl_backend() -> ! {
@@ -1100,7 +1153,7 @@ fn retry_with_gl_backend() -> ! {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let err = std::process::Command::new(exe)
         .args(&args)
-        .env("FILAMENT_AUDIO_GL_RETRY", "1")
+        .env("QUINLIGHT_AUDIO_GL_RETRY", "1")
         .exec();
     panic!("Failed to re-exec with GL backend: {err}");
 }
@@ -1116,7 +1169,7 @@ fn install_desktop_icon() {
         eprintln!("Warning: Failed to create icon directory: {e}");
         return;
     }
-    let icon_path = icon_dir.join("filament-audio.png");
+    let icon_path = icon_dir.join("quinlight-audio.png");
     if let Err(e) = gui::icon::save_icon_png(&icon_path) {
         eprintln!("Warning: Failed to save icon: {e}");
     } else {
@@ -1128,23 +1181,23 @@ fn install_desktop_icon() {
         eprintln!("Warning: Failed to create applications directory: {e}");
         return;
     }
-    let desktop_path = apps_dir.join("filament-audio.desktop");
+    let desktop_path = apps_dir.join("quinlight-audio.desktop");
 
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "filament-audio".into());
+        .unwrap_or_else(|_| "quinlight-audio".into());
 
     match std::fs::write(
         &desktop_path,
         format!(
             "[Desktop Entry]\n\
-             Name=Filament Audio\n\
+             Name=Quinlight Audio\n\
              Comment=Tracker music player and remastering tool presented by Kind Computers\n\
              Exec={exe}\n\
-             Icon=filament-audio\n\
+             Icon=quinlight-audio\n\
              Type=Application\n\
              Categories=Audio;AudioVideo;\n\
-             StartupWMClass=filament-audio\n"
+             StartupWMClass=quinlight-audio\n"
         ),
     ) {
         Ok(()) => eprintln!("Installed desktop entry: {}", desktop_path.display()),

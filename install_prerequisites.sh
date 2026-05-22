@@ -3,9 +3,9 @@
 # Copyright (c) 2026 Kind Computers, LLC.
 set -e
 
-VENV="$HOME/.local/share/filament-audio/venv"
+VENV="$HOME/.local/share/quinlight-audio/venv"
 
-echo "Filament Audio AI engine installer"
+echo "Quinlight Audio AI engine installer"
 
 # Pick the highest installed python3.X (>=3.12) whose matching -venv package is
 # available from apt. Some distros (e.g. Ubuntu 26.04) ship a python3.13 binary
@@ -101,7 +101,7 @@ fi
 
 # AP-BWE — speech bandwidth extension (GAN, parallel amplitude/phase prediction).
 # Upstream repo has no setup.py, so clone it and download weights from Google Drive.
-APBWE_DIR="$HOME/.local/share/filament-audio/apbwe"
+APBWE_DIR="$HOME/.local/share/quinlight-audio/apbwe"
 APBWE_COMMIT="751710f22404c27e5bcc983248f8b856a04b8422"
 APBWE_FOLDER_ID="1IIYTf2zbJWzelu4IftKD6ooHloJ8mnZF"
 APBWE_WEIGHTS_URL="https://drive.google.com/drive/folders/${APBWE_FOLDER_ID}"
@@ -141,4 +141,4 @@ else
   echo "AP-BWE checkpoints already present in $APBWE_DIR/checkpoints"
 fi
 
-"$VENV/bin/python" -c "import importlib.util, os.path; ok=[m for m in ('audiosr','lavasr','flowhigh') if importlib.util.find_spec(m)]; ok += ['apbwe'] if os.path.isfile(os.path.expanduser('~/.local/share/filament-audio/apbwe/models/model.py')) else []; print('Filament Audio smoke check:', ', '.join(ok) if ok else 'no engines detected')"
+"$VENV/bin/python" -c "import importlib.util, os.path; ok=[m for m in ('audiosr','LavaSR','flowhigh') if importlib.util.find_spec(m)]; ok += ['apbwe'] if os.path.isfile(os.path.expanduser('~/.local/share/quinlight-audio/apbwe/models/model.py')) else []; print('Quinlight Audio smoke check:', ', '.join(ok) if ok else 'no engines detected')"

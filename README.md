@@ -1,11 +1,11 @@
-# Filament Audio
+# Quinlight Audio
 
-Filament Audio is a tracker music player and remastering tool for MOD/S3M/XM/IT and
+Quinlight Audio is a tracker music player and remastering tool for MOD/S3M/XM/IT and
 related formats. It plays modules, can remaster their source samples with
 optional external AI backends (AudioSR, LavaSR, FLowHigh, AP-BWE), and lets you
 A/B the result live during playback.
 
-![Filament Audio playing "Beyond the Network" with all four AI engines remastered](docs/Screenshot_1.png)
+![Quinlight Audio playing "Beyond the Network" with all four AI engines remastered](docs/Screenshot_1.png)
 
 ## Release Scope
 
@@ -27,13 +27,13 @@ A/B the result live during playback.
 - Supports batch CLI rendering for directories of modules
 - Installs as a Linux desktop app (`--install-icon`)
 
-Filament Audio works without AI engines installed. The player, archive support,
+Quinlight Audio works without AI engines installed. The player, archive support,
 reference cleanup path, and export flow remain available even if you never set
 up the optional remaster backends.
 
 ## Audiophile
 
-Filament Audio's vendored libopenmpt fork is rebuilt for end-to-end double-precision
+Quinlight Audio's vendored libopenmpt fork is rebuilt for end-to-end double-precision
 audio. Every stage from sample interpolation through mixing to output uses 64-bit
 floating point — the only quantization in the playback path is the final cast to
 f32 at the audio device.
@@ -64,7 +64,7 @@ sample mode is active.
 ### Multi-engine consensus
 
 Each enabled AI engine produces its own 48 kHz remaster of every sample.
-Filament Audio scores each candidate against the original by Pearson
+Quinlight Audio scores each candidate against the original by Pearson
 correlation of magnitude spectra below the source's Nyquist (an engine that
 hallucinates even at known frequencies isn't to be trusted), then combines
 the engines that pass via a per-bin **Karcher mean on the rotor manifold
@@ -125,16 +125,16 @@ via GitHub Pages so every browser plays them inline. Click to listen.
 
 | Module | Format | Before | After |
 | --- | --- | --- | --- |
-| 2ND_PM | S3M | [listen](https://kind-computers.github.io/filament-audio/mods/rendered/2ND_PM.mp3) | **[listen](https://kind-computers.github.io/filament-audio/mods/remastered/2ND_PM-Filament-Audio-Remastered-48Khz.mp3)** |
-| 4mat_-_eternity | XM | [listen](https://kind-computers.github.io/filament-audio/mods/rendered/4mat_-_eternity.mp3) | **[listen](https://kind-computers.github.io/filament-audio/mods/remastered/4mat_-_eternity-Filament-Audio-Remastered-48Khz.mp3)** |
-| beyond_the_network | IT | [listen](https://kind-computers.github.io/filament-audio/mods/rendered/beyond_the_network.mp3) | **[listen](https://kind-computers.github.io/filament-audio/mods/remastered/beyond_the_network-Filament-Audio-Remastered-48Khz.mp3)** |
-| Caroline | XM | [listen](https://kind-computers.github.io/filament-audio/mods/rendered/Caroline.mp3) | **[listen](https://kind-computers.github.io/filament-audio/mods/remastered/Caroline-Filament-Audio-Remastered-48Khz.mp3)** |
-| GroovyUntightFunk | XM | [listen](https://kind-computers.github.io/filament-audio/mods/rendered/GroovyUntightFunk.mp3) | **[listen](https://kind-computers.github.io/filament-audio/mods/remastered/GroovyUntightFunk-Filament-Audio-Remastered-48Khz.mp3)** |
-| jt_mind | XM | [listen](https://kind-computers.github.io/filament-audio/mods/rendered/jt_mind.mp3) | **[listen](https://kind-computers.github.io/filament-audio/mods/remastered/jt_mind-Filament-Audio-Remastered-48Khz.mp3)** |
-| jt_pools | XM | [listen](https://kind-computers.github.io/filament-audio/mods/rendered/jt_pools.mp3) | **[listen](https://kind-computers.github.io/filament-audio/mods/remastered/jt_pools-Filament-Audio-Remastered-48Khz.mp3)** |
-| sweetdre | XM | [listen](https://kind-computers.github.io/filament-audio/mods/rendered/sweetdre.mp3) | **[listen](https://kind-computers.github.io/filament-audio/mods/remastered/sweetdre-Filament-Audio-Remastered-48Khz.mp3)** |
-| tiny_tunes | MOD | [listen](https://kind-computers.github.io/filament-audio/mods/rendered/tiny_tunes.mp3) | **[listen](https://kind-computers.github.io/filament-audio/mods/remastered/tiny_tunes-Filament-Audio-Remastered-48Khz.mp3)** |
-| znm-wopeace | IT | [listen](https://kind-computers.github.io/filament-audio/mods/rendered/znm-wopeace.mp3) | **[listen](https://kind-computers.github.io/filament-audio/mods/remastered/znm-wopeace-Filament-Audio-Remastered-48Khz.mp3)** |
+| 2ND_PM | S3M | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/2ND_PM.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/2ND_PM-Quinlight-Audio-Remastered-48Khz.mp3)** |
+| 4mat_-_eternity | XM | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/4mat_-_eternity.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/4mat_-_eternity-Quinlight-Audio-Remastered-48Khz.mp3)** |
+| beyond_the_network | IT | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/beyond_the_network.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/beyond_the_network-Quinlight-Audio-Remastered-48Khz.mp3)** |
+| Caroline | XM | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/Caroline.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/Caroline-Quinlight-Audio-Remastered-48Khz.mp3)** |
+| GroovyUntightFunk | XM | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/GroovyUntightFunk.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/GroovyUntightFunk-Quinlight-Audio-Remastered-48Khz.mp3)** |
+| jt_mind | XM | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/jt_mind.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/jt_mind-Quinlight-Audio-Remastered-48Khz.mp3)** |
+| jt_pools | XM | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/jt_pools.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/jt_pools-Quinlight-Audio-Remastered-48Khz.mp3)** |
+| sweetdre | XM | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/sweetdre.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/sweetdre-Quinlight-Audio-Remastered-48Khz.mp3)** |
+| tiny_tunes | MOD | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/tiny_tunes.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/tiny_tunes-Quinlight-Audio-Remastered-48Khz.mp3)** |
+| znm-wopeace | IT | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/znm-wopeace.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/znm-wopeace-Quinlight-Audio-Remastered-48Khz.mp3)** |
 
 ### 96 kHz AAC originals
 
@@ -145,24 +145,24 @@ the system output rate at playback time — what you hear may not be the full
 
 | Module | Before | After |
 | --- | --- | --- |
-| 2ND_PM | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/2ND_PM.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/2ND_PM-Filament-Audio-Remastered-96Khz.m4a)** |
-| 4mat_-_eternity | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/4mat_-_eternity.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/4mat_-_eternity-Filament-Audio-Remastered-96Khz.m4a)** |
-| beyond_the_network | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/beyond_the_network.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/beyond_the_network-Filament-Audio-Remastered-96Khz.m4a)** |
-| Caroline | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/Caroline.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/Caroline-Filament-Audio-Remastered-96Khz.m4a)** |
-| GroovyUntightFunk | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/GroovyUntightFunk.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/GroovyUntightFunk-Filament-Audio-Remastered-96Khz.m4a)** |
-| jt_mind | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/jt_mind.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/jt_mind-Filament-Audio-Remastered-96Khz.m4a)** |
-| jt_pools | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/jt_pools.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/jt_pools-Filament-Audio-Remastered-96Khz.m4a)** |
-| sweetdre | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/sweetdre.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/sweetdre-Filament-Audio-Remastered-96Khz.m4a)** |
-| tiny_tunes | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/tiny_tunes.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/tiny_tunes-Filament-Audio-Remastered-96Khz.m4a)** |
-| znm-wopeace | [listen](https://kind-computers.github.io/filament-audio/96khz/rendered/znm-wopeace.m4a) | **[listen](https://kind-computers.github.io/filament-audio/96khz/remastered/znm-wopeace-Filament-Audio-Remastered-96Khz.m4a)** |
+| 2ND_PM | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/2ND_PM.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/2ND_PM-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| 4mat_-_eternity | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/4mat_-_eternity.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/4mat_-_eternity-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| beyond_the_network | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/beyond_the_network.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/beyond_the_network-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| Caroline | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/Caroline.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/Caroline-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| GroovyUntightFunk | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/GroovyUntightFunk.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/GroovyUntightFunk-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| jt_mind | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/jt_mind.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/jt_mind-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| jt_pools | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/jt_pools.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/jt_pools-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| sweetdre | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/sweetdre.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/sweetdre-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| tiny_tunes | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/tiny_tunes.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/tiny_tunes-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| znm-wopeace | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/znm-wopeace.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/znm-wopeace-Quinlight-Audio-Remastered-96Khz.m4a)** |
 
 Prefer the bundled download? Grab
-[filament-audio-96khz-bundle.zip](https://github.com/Kind-Computers/filament-audio/releases/download/audio-bundle-v1/filament-audio-96khz-bundle.zip)
+[quinlight-audio-96khz-bundle.zip](https://github.com/Kind-Computers/quinlight-audio/releases/download/audio-bundle-v1/quinlight-audio-96khz-bundle.zip)
 (275 MB — same 20 clips organized as `rendered/` and `remastered/`).
 
 ## Build
 
-Filament Audio currently targets Linux `x86_64-unknown-linux-gnu`. The build expects
+Quinlight Audio currently targets Linux `x86_64-unknown-linux-gnu`. The build expects
 Rust, a C++ toolchain, SDL2 headers, libarchive headers, and FFmpeg development
 libraries.
 
@@ -185,8 +185,8 @@ The supported public install path is the checked-in Linux installer:
 ./install_prerequisites.sh
 ```
 
-That script creates `~/.local/share/filament-audio/venv`, installs the pinned Python
-package set used by Filament Audio, and runs a simple smoke check at the end.
+That script creates `~/.local/share/quinlight-audio/venv`, installs the pinned Python
+package set used by Quinlight Audio, and runs a simple smoke check at the end.
 
 Supported AI matrix for this release:
 
@@ -202,34 +202,41 @@ The GUI shows the same pinned commands if the engines are missing.
 
 ```bash
 # Launch the GUI
-filament-audio
+quinlight-audio
 
 # Launch with GPU remastering
-filament-audio --upscale-mode gpu
+quinlight-audio --upscale-mode gpu
 
 # Render a module to FLAC or AAC at the default 96 kHz target
-filament-audio render track.s3m -o track.flac
-filament-audio render track.s3m -o track.aac --format aac
+quinlight-audio render track.s3m -o track.flac
+quinlight-audio render track.s3m -o track.aac --format aac
 
 # Batch render a directory
-filament-audio convert mods -o renders --format flac aac
+quinlight-audio convert mods -o renders --format flac aac
 
 # Restrict to specific engine(s)
-filament-audio convert mods -o renders --engine audiosr --engine lavasr --engine apbwe
+quinlight-audio convert mods -o renders --engine audiosr --engine lavasr --engine apbwe
 
 # Skip AI remastering (render originals only)
-filament-audio convert mods -o renders --no-remaster
+quinlight-audio convert mods -o renders --no-remaster
 
 # Reference-only cleanup output (no AI, just cleaned 48kHz reference)
-filament-audio convert mods -o renders --reference-only --cleanup-preset declick-ar
+quinlight-audio convert mods -o renders --reference-only --cleanup-preset declick-ar
 
 # Open modules from archives
-filament-audio render mods.zip -o track.flac
-filament-audio render mods.zip --file track.s3m -o out.flac
+quinlight-audio render mods.zip -o track.flac
+quinlight-audio render mods.zip --file track.s3m -o out.flac
 
 # Install .desktop file and icon
-filament-audio --install-icon
+quinlight-audio --install-icon
 ```
+
+## Sponsor
+
+Quinlight Audio is built by Kind Computers, LLC. If it's useful to you and you'd
+like to help fund continued development, you can sponsor the project on GitHub:
+
+[**❤ Sponsor Quinlight Audio on GitHub**](https://github.com/sponsors/Kind-Computers)
 
 ## Legal / Backend Note
 
@@ -237,6 +244,11 @@ AI backend redistribution and branded promotion should still be reviewed
 engine-by-engine before any bundled or company-branded release. This
 repository documents a supported external-install flow for those backends;
 it does not claim that backend weights are bundled or cleared for redistribution.
+
+**Patent pending.** Quinlight Audio's multi-engine AI consensus algorithm — the
+per-bin Karcher-mean spectral consensus on the rotor manifold described under
+[Multi-engine consensus](#multi-engine-consensus) — is the subject of a pending
+U.S. patent application.
 
 ## License
 

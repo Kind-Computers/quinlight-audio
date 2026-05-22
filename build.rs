@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DIAGNOSTICS_ENV: &str = "FILAMENT_AUDIO_NATIVE_DIAGNOSTICS";
+const DIAGNOSTICS_ENV: &str = "QUINLIGHT_AUDIO_NATIVE_DIAGNOSTICS";
 const BUILD_SIGNATURE_FILE: &str = ".openmpt-native-build-signature";
 const OPENMPT_NATIVEFLOAT_CPPFLAGS: &str =
     "-DMPT_COMPILER_QUIRK_FLOAT_PREFER64=1 -DMPT_COMPILER_QUIRK_FLOAT_PREFER32=0";
