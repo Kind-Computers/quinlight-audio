@@ -4270,6 +4270,9 @@ mod tests {
 
     #[test]
     fn test_quinlight_mix_selects_top_two_original_matches_and_weights() {
+        // Score-floor selection is a legacy spectral-path behaviour; the
+        // registration default blends all engines (no floor).
+        let _mode = remaster::ConsensusModeGuard::spectral();
         let reference: Vec<f64> = (0..4096)
             .map(|i| (i as f64 * 200.0 * 2.0 * std::f64::consts::PI / 48000.0).sin())
             .collect();
@@ -4365,6 +4368,8 @@ mod tests {
     fn test_quinlight_one_usable_of_two_dispatched_marks_original_fallback() {
         // With 2 engines dispatched but only 1 scoring above floor,
         // consensus is impossible — final Quinlight should keep the original sample.
+        // This score-floor gating is legacy spectral-path behaviour.
+        let _mode = remaster::ConsensusModeGuard::spectral();
         let reference: Vec<f64> = (0..4096)
             .map(|i| (i as f64 * 180.0 * 2.0 * std::f64::consts::PI / 48000.0).sin())
             .collect();
@@ -4431,6 +4436,9 @@ mod tests {
 
     #[test]
     fn test_quinlight_mix_with_no_usable_engines_marks_original_fallback() {
+        // "All engines below the floor → keep original" is a legacy
+        // spectral-path guarantee; registration blends whatever it is given.
+        let _mode = remaster::ConsensusModeGuard::spectral();
         let reference: Vec<f64> = (0..4096)
             .map(|i| (i as f64 * 220.0 * 2.0 * std::f64::consts::PI / 48000.0).sin())
             .collect();

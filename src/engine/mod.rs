@@ -5,6 +5,7 @@ pub(crate) mod apbwe;
 pub(crate) mod audiosr;
 pub(crate) mod flowhigh;
 pub(crate) mod lavasr;
+pub(crate) mod registration;
 pub(crate) mod rotor;
 pub(crate) mod spectral;
 
@@ -12,6 +13,7 @@ pub use apbwe::ApBweEngine;
 pub use audiosr::AudioSrEngine;
 pub use flowhigh::FlowHighEngine;
 pub use lavasr::LavaSrEngine;
+pub use registration::{ReductionMode, registration_consensus_1d};
 pub(crate) use spectral::fft_cross_correlation;
 pub use spectral::spectral_correlation;
 pub use spectral::spectral_intersection;

@@ -20,7 +20,7 @@ use crossbeam_channel::Sender;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use ac_ffmpeg::{
     codec::audio::{
@@ -288,10 +288,13 @@ impl RemasterEngine {
     /// intersection runs only once per sample.
     ///
     /// Two-wave architecture: the primary wave runs `self.engines` (enabled by
-    /// the user). For any sample where at least one primary engine scored
-    /// below `QUINLIGHT_USABLE_SCORE_FLOOR`, a fallback wave runs
-    /// `self.fallback_engines` (installed but disabled) for only those
-    /// samples to strengthen consensus. Samples whose primaries all passed
+    /// the user). The second wave runs `self.fallback_engines` (installed but
+    /// not enabled). In **registered mode** (the default consensus) the second
+    /// wave runs for *every* sample, so the registration median always blends
+    /// the full installed engine set — there is no score gate. On the legacy
+    /// spectral path the second wave is a *fallback* wave: it runs only for
+    /// samples where at least one primary engine scored below
+    /// `QUINLIGHT_USABLE_SCORE_FLOOR`, and samples whose primaries all passed
     /// take the fast path with no extra compute.
     pub fn remaster_samples(
         &self,
@@ -375,36 +378,63 @@ impl RemasterEngine {
             full_parallel,
         )?;
 
-        // Fallback wave: for samples where any primary engine scored below
-        // the 0.9 usability floor, run the installed-but-disabled engines
-        // to strengthen consensus. Scoped per-sample to minimize extra work.
+        // Second wave. Registered mode (the default) runs ALL fallback engines
+        // on EVERY sample so the registration median always has the maximum
+        // number of warped engines to blend — there is no score gate, so even
+        // "very bad" upscales contribute and are reconciled by the median. The
+        // legacy spectral path keeps the score-gated fallback wave: it only
+        // runs the installed-but-disabled engines for samples where a primary
+        // scored below the usability floor, to minimize extra compute.
         if !self.fallback_engines.is_empty() && !cancellation_requested(cancel_flag) {
-            let fallback_info = snapshot_failing_samples_and_bump_totals(
-                &pending_outputs,
-                &jobs,
-                &self.fallback_engines,
-            );
+            let registered = registration_default_active();
+            let fallback_info = if registered {
+                bump_all_samples_for_full_dispatch(&pending_outputs, &jobs, &self.fallback_engines)
+            } else {
+                snapshot_failing_samples_and_bump_totals(
+                    &pending_outputs,
+                    &jobs,
+                    &self.fallback_engines,
+                )
+            };
 
             if fallback_info.total_additional_tasks > 0 {
                 let new_total = primary_progress_total + fallback_info.total_additional_tasks;
-                let failing_set: std::collections::HashSet<i32> = fallback_info
-                    .failing_sample_indices
-                    .iter()
-                    .copied()
-                    .collect();
+                // Registered mode dispatches the wave unrestricted (all
+                // samples); the legacy path restricts it to the score-failing
+                // samples.
+                let restrict_set: Option<std::collections::HashSet<i32>> = if registered {
+                    None
+                } else {
+                    Some(
+                        fallback_info
+                            .failing_sample_indices
+                            .iter()
+                            .copied()
+                            .collect(),
+                    )
+                };
 
-                let _ = progress_tx.send(RemasterStatus::Log(format!(
-                    "Quinlight Audio: fallback wave — {} sample(s) had at least one primary engine \
-                     score below {:.2}; running {} disabled engine(s)",
-                    fallback_info.failing_sample_indices.len(),
-                    quinlight_usable_score_floor(),
-                    self.fallback_engines.len()
-                )));
+                let log_msg = if registered {
+                    format!(
+                        "Quinlight Audio: registered mode — running all {} engine(s) on {} sample(s)",
+                        self.fallback_engines.len(),
+                        fallback_info.failing_sample_indices.len(),
+                    )
+                } else {
+                    format!(
+                        "Quinlight Audio: fallback wave — {} sample(s) had at least one primary \
+                         engine score below {:.2}; running {} disabled engine(s)",
+                        fallback_info.failing_sample_indices.len(),
+                        quinlight_usable_score_floor(),
+                        self.fallback_engines.len()
+                    )
+                };
+                let _ = progress_tx.send(RemasterStatus::Log(log_msg));
                 let _ = progress_tx.send(RemasterStatus::Processing {
                     current: progress_counter.load(std::sync::atomic::Ordering::Relaxed),
                     total: new_total,
                     sample_name: format!(
-                        "Quinlight Audio: fallback wave — {} engines, {} extra tasks across \
+                        "Quinlight Audio: second wave — {} engines, {} extra tasks across \
                          {} sample(s)",
                         self.fallback_engines.len(),
                         fallback_info.total_additional_tasks,
@@ -416,7 +446,7 @@ impl RemasterEngine {
                 run_engine_wave(
                     &self.fallback_engines,
                     &jobs,
-                    Some(&failing_set),
+                    restrict_set.as_ref(),
                     &pass2_dir,
                     progress_tx,
                     result_tx,
@@ -1155,6 +1185,44 @@ fn snapshot_failing_samples_and_bump_totals(
     info
 }
 
+/// Registered-mode dispatch: every sample runs the full fallback engine set
+/// (subject only to rate eligibility), so the registration median always has
+/// the maximum number of warped engines to blend. Unlike
+/// [`snapshot_failing_samples_and_bump_totals`] there is no score gate and no
+/// FFT scoring pass — it simply bumps each job's `engines_total` by its
+/// eligible-fallback count. The returned `failing_sample_indices` lists every
+/// dispatched sample (used only for the progress count; the wave itself runs
+/// unrestricted).
+fn bump_all_samples_for_full_dispatch(
+    pending_outputs: &PendingOutputMap,
+    jobs: &[SampleJob],
+    fallback_engines: &[Box<dyn engine::UpsampleEngine>],
+) -> FallbackWaveInfo {
+    let mut info = FallbackWaveInfo {
+        failing_sample_indices: Vec::new(),
+        counts_by_job: vec![0i32; jobs.len()],
+        total_additional_tasks: 0,
+    };
+    if fallback_engines.is_empty() {
+        return info;
+    }
+    let mut pending = pending_outputs.lock().unwrap();
+    for (job_idx, job) in jobs.iter().enumerate() {
+        let extra = count_eligible_engines_for_job(job, fallback_engines);
+        if extra == 0 {
+            continue;
+        }
+        let Some(sample) = pending.get_mut(&job.index) else {
+            continue;
+        };
+        sample.engines_total += extra;
+        info.failing_sample_indices.push(job.index);
+        info.counts_by_job[job_idx] = extra;
+        info.total_additional_tasks += extra;
+    }
+    info
+}
+
 const QUINLIGHT_NAME: &str = "Quinlight Audio";
 const QUINLIGHT_ORIGINAL_NAME: &str = "Original";
 
@@ -1186,6 +1254,115 @@ pub fn set_quinlight_usable_score_floor(value: f64) {
     let clamped = value.clamp(0.0, 1.0);
     QUINLIGHT_USABLE_SCORE_FLOOR_BITS
         .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Consensus algorithm selector. `false` (default) routes the per-channel
+/// engine consensus through `registration_consensus_1d` (time-domain dense-LK
+/// warp + median against the sinc master — no STFT, no ringing); `true`
+/// selects the legacy `spectral_intersection` (frequency-domain rotor
+/// consensus). The legacy path is also used automatically, per sample, when no
+/// sinc master is available regardless of this flag.
+static QUINLIGHT_USE_SPECTRAL_CONSENSUS: AtomicBool = AtomicBool::new(false);
+
+/// Override the consensus algorithm for the rest of this process. `true`
+/// restores the legacy spectral consensus (and, on that path, the loop/seam
+/// quality gates and score-gated engine dispatch); `false` (default) uses the
+/// registration consensus. Intended for A/B comparison and instant rollback.
+pub fn set_quinlight_use_spectral_consensus(value: bool) {
+    QUINLIGHT_USE_SPECTRAL_CONSENSUS.store(value, Ordering::Relaxed);
+}
+
+/// True when the registration consensus is the active default (the spectral
+/// override is off). The single source of truth for "registered mode" — it
+/// also gates the quality-gate removal (`build_quinlight_result`) and the
+/// all-engines dispatch (`remaster_samples`).
+pub(crate) fn registration_default_active() -> bool {
+    !QUINLIGHT_USE_SPECTRAL_CONSENSUS.load(Ordering::Relaxed)
+}
+
+/// Reduction mode for the registration consensus: `0` = median (default,
+/// outlier-robust — rejects lone-engine hallucinations), `1` = mean.
+static QUINLIGHT_REGISTRATION_MODE: AtomicU8 = AtomicU8::new(0);
+
+/// Select the registration reducer: `true` = mean, `false` (default) = median.
+pub fn set_quinlight_registration_mean(mean: bool) {
+    QUINLIGHT_REGISTRATION_MODE.store(u8::from(mean), Ordering::Relaxed);
+}
+
+fn registration_reduction_mode() -> crate::engine::ReductionMode {
+    match QUINLIGHT_REGISTRATION_MODE.load(Ordering::Relaxed) {
+        1 => crate::engine::ReductionMode::Mean,
+        _ => crate::engine::ReductionMode::Median,
+    }
+}
+
+/// When the registration consensus is active, the frequency-domain source
+/// blend (`apply_source_frequency_blend_interleaved`) is skipped by default:
+/// the engines are already aligned to the sinc master, whose sub-Nyquist band
+/// *is* the source, so the blend's STFT pass is redundant (and the only
+/// remaining frequency-domain ringing source). `true` re-enables it for A/B.
+/// The blend always runs on the legacy spectral path.
+static QUINLIGHT_ENABLE_SOURCE_BLEND_REGISTRATION: AtomicBool = AtomicBool::new(false);
+
+/// Re-enable the source-frequency blend on the registration path (default off).
+pub fn set_quinlight_enable_source_blend_registration(value: bool) {
+    QUINLIGHT_ENABLE_SOURCE_BLEND_REGISTRATION.store(value, Ordering::Relaxed);
+}
+
+fn source_blend_enabled_for_registration() -> bool {
+    QUINLIGHT_ENABLE_SOURCE_BLEND_REGISTRATION.load(Ordering::Relaxed)
+}
+
+/// Test-only serialization for the process-global consensus-mode toggles.
+/// Tests that pin a non-default mode acquire this lock so they never run
+/// concurrently with one another (or with tests pinned to the default), and
+/// `ConsensusModeGuard`'s `Drop` always restores the registration default —
+/// even on panic — so a failing test can't leak `spectral` into the rest of
+/// the suite.
+#[cfg(test)]
+pub(crate) fn consensus_mode_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// RAII guard pinning the consensus mode for a single test. Holds
+/// [`consensus_mode_lock`] for its lifetime and restores all three consensus
+/// toggles to their defaults on drop.
+#[cfg(test)]
+pub(crate) struct ConsensusModeGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl ConsensusModeGuard {
+    /// Pin the legacy spectral consensus (restores its score floor, loop-seam
+    /// gates, and score-gated engine dispatch).
+    pub(crate) fn spectral() -> Self {
+        let guard = consensus_mode_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        set_quinlight_use_spectral_consensus(true);
+        Self(guard)
+    }
+
+    /// Pin the registration consensus (the default). Used so a registration-
+    /// dependent test serializes against the `spectral()` tests instead of
+    /// racing them on the shared global.
+    pub(crate) fn registration() -> Self {
+        let guard = consensus_mode_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        set_quinlight_use_spectral_consensus(false);
+        Self(guard)
+    }
+
+}
+
+#[cfg(test)]
+impl Drop for ConsensusModeGuard {
+    fn drop(&mut self) {
+        set_quinlight_use_spectral_consensus(false);
+        set_quinlight_registration_mean(false);
+        set_quinlight_enable_source_blend_registration(false);
+    }
 }
 
 /// Returns true if the engine name indicates the original sample was kept —
@@ -1232,6 +1409,10 @@ pub struct QuinlightMix {
     pub channels: i32,
     pub name: String,
     pub contributors: Vec<QuinlightContributor>,
+    /// True when the per-channel consensus ran through the registration
+    /// (dense-LK warp) path rather than the legacy spectral path. Drives the
+    /// downstream quality-gate removal in `build_quinlight_result`.
+    pub used_registration: bool,
 }
 
 #[derive(Clone)]
@@ -1264,6 +1445,7 @@ struct QuinlightSelectionReference<'a> {
 
 fn spectral_intersection_blend(
     usable: &[ScoredEngine<'_>],
+    master_48k: Option<&[f64]>,
     reference_channels: i32,
     looped: bool,
     source_reference: Option<&[f64]>,
@@ -1274,9 +1456,22 @@ fn spectral_intersection_blend(
     let min_len = usable.iter().map(|e| e.data.len()).min().unwrap_or(0);
     let min_frames = min_len / channels;
 
+    // Registration consensus needs the sinc 48 kHz master as the dense-LK warp
+    // target. Use it as the default; fall back to the legacy spectral path when
+    // the master is unavailable, the buffer is too short to align, or the
+    // spectral override is set.
+    let master = master_48k.filter(|m| !m.is_empty());
+    let use_registration =
+        master.is_some() && min_frames >= 4 && registration_default_active();
+
     let names: Vec<&str> = usable.iter().map(|e| e.name).collect();
     eprintln!(
-        "  Quinlight: spectral intersection of {} engines: {}",
+        "  Quinlight: {} consensus of {} engines: {}",
+        if use_registration {
+            "registration"
+        } else {
+            "spectral"
+        },
         usable.len(),
         names
             .iter()
@@ -1302,13 +1497,41 @@ fn spectral_intersection_blend(
             })
             .collect();
         let refs: Vec<&[f64]> = per_engine.iter().map(|v| v.as_slice()).collect();
-        let intersected = crate::engine::spectral_intersection(&refs, looped);
+        let intersected = if use_registration {
+            // Deinterleave the sinc master for this channel (same truncation
+            // rule as the engines). It is the warp/flow TARGET only — never a
+            // member of the median stack.
+            let master_ch: Vec<f64> = master
+                .unwrap()
+                .iter()
+                .skip(ch)
+                .step_by(channels)
+                .take(min_frames)
+                .copied()
+                .collect();
+            crate::engine::registration_consensus_1d(
+                &master_ch,
+                &refs,
+                looped,
+                registration_reduction_mode(),
+            )
+        } else {
+            crate::engine::spectral_intersection(&refs, looped)
+        };
         for (i, &sample) in intersected.iter().take(min_frames).enumerate() {
             output[i * channels + ch] = sample;
         }
     }
 
-    if let Some(source_reference) = source_reference {
+    // The source-frequency blend is the other STFT pass. On the registration
+    // path it is redundant (engines are already aligned to the sinc master,
+    // whose sub-Nyquist band is the source) and is skipped by default; it
+    // always runs on the spectral path.
+    let run_source_blend =
+        !use_registration || source_blend_enabled_for_registration();
+    if run_source_blend
+        && let Some(source_reference) = source_reference
+    {
         output = apply_source_frequency_blend_interleaved(
             &output,
             source_reference,
@@ -1343,6 +1566,7 @@ fn spectral_intersection_blend(
         channels: reference_channels,
         name,
         contributors,
+        used_registration: use_registration,
     }
 }
 
@@ -4783,27 +5007,42 @@ fn select_quinlight_mix_internal(
 
     let floor = quinlight_usable_score_floor();
 
-    let usable: Vec<ScoredEngine<'_>> = scored
-        .iter()
-        .filter(|engine| engine.raw_score >= floor)
-        .cloned()
-        .collect();
+    // In registered mode the consensus is the dense-LK median of engines
+    // warped to the sinc master — robust enough to blend "very bad" upscales
+    // with "very good" ones — so the per-engine score floor is bypassed and
+    // every scored engine contributes. The floor (and its rejection logging)
+    // still applies on the legacy spectral path, which can't survive a bad
+    // engine in the blend.
+    let registered = registration_default_active() && scoring_reference_48k.is_some();
 
-    let rejected: Vec<&ScoredEngine<'_>> = scored
-        .iter()
-        .filter(|engine| engine.raw_score < floor)
-        .collect();
-    if !rejected.is_empty() {
-        let details = rejected
+    let usable: Vec<ScoredEngine<'_>> = if registered {
+        scored.clone()
+    } else {
+        scored
             .iter()
-            .map(|e| format!("{} (score {:.4})", e.name, e.raw_score))
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!("  Quinlight: below floor {floor:.2} — {details}",);
+            .filter(|engine| engine.raw_score >= floor)
+            .cloned()
+            .collect()
+    };
+
+    if !registered {
+        let rejected: Vec<&ScoredEngine<'_>> = scored
+            .iter()
+            .filter(|engine| engine.raw_score < floor)
+            .collect();
+        if !rejected.is_empty() {
+            let details = rejected
+                .iter()
+                .map(|e| format!("{} (score {:.4})", e.name, e.raw_score))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("  Quinlight: below floor {floor:.2} — {details}",);
+        }
     }
 
-    // Consensus requires K >= 2 engines. A single engine has no cross-validation
-    // and cannot attenuate hallucinations via spectral intersection.
+    // Consensus requires K >= 2 engines: a single engine has no
+    // cross-validation — no median to reject a hallucination, nothing to
+    // blend — so the original sample is kept.
     match usable.len() {
         0 | 1 => {
             if usable.len() == 1 {
@@ -4834,10 +5073,12 @@ fn select_quinlight_mix_internal(
                     weight: 1.0,
                     score: 1.0,
                 }],
+                used_registration: false,
             }
         }
         _ => spectral_intersection_blend(
             &usable,
+            scoring_reference_48k,
             reference_channels,
             looped,
             source_reference,
@@ -5119,6 +5360,7 @@ fn build_quinlight_result(
             discovered_loops: None,
         });
     }
+    let used_registration = mix.used_registration;
     let mut data = mix.data;
     let channels = mix.channels.max(1) as usize;
 
@@ -5143,7 +5385,14 @@ fn build_quinlight_result(
     // accepted. If AI makes it significantly worse, reject. Both amplitude gap and
     // slope mismatch are checked; slope is rate-normalized so the comparison is
     // fair across sample rates.
-    if let Some(ref loops) = discovered_loops {
+    //
+    // Skipped in registered mode: every engine is warped onto the sinc master's
+    // exact loop timing, so the seam is clean by construction, and the robust
+    // median means a "bad" engine no longer poisons the result — the gate's
+    // whole reason to reject (and bounce to the sinc fallback) is gone.
+    if !used_registration
+        && let Some(ref loops) = discovered_loops
+    {
         if loops.normal.has_loop() {
             let ai_ls = loops.normal.start_frames.max(0) as usize;
             let ai_le = (loops.normal.end_frames.max(0) as usize).min(data.len() / channels);
@@ -5393,7 +5642,10 @@ fn build_quinlight_result(
             post_xfade_max_jump = post_xfade_max_jump.max(j);
         }
     }
-    if post_xfade_max_jump > AI_LOOP_POST_CROSSFADE_INNER_JUMP_LIMIT {
+    // Post-crossfade gate also skipped in registered mode (see the
+    // pre-crossfade note): the crossfade still runs to clean the seam, but the
+    // registration output is never bounced to the sinc fallback.
+    if !used_registration && post_xfade_max_jump > AI_LOOP_POST_CROSSFADE_INNER_JUMP_LIMIT {
         eprintln!(
             "loop quality gate (post-crossfade): sample #{} max_inner_jump={post_xfade_max_jump:.6} \
              (limit {:.6}) — keeping original",
@@ -9436,6 +9688,9 @@ mod tests {
     #[test]
     fn gui_mode_emits_progressive_finals_with_three_cached_engines() {
         let _guard = env_lock().lock().unwrap();
+        // Asserts the legacy conditional-dispatch engine count; registered mode
+        // runs every engine.
+        let _mode = ConsensusModeGuard::spectral();
         let temp_home = tempfile::tempdir().expect("Should create temp home");
         let _home = HomeGuard::set(temp_home.path());
         let work_dir = tempfile::tempdir().expect("Should create temp work dir");
@@ -9558,6 +9813,212 @@ mod tests {
             "source guidance should keep the core reference band intact \
              (before={shared_before:.4}, after={shared_after:.4})",
         );
+    }
+
+    /// Registration path: the band-limited sinc master defines the alignment
+    /// grid but is excluded from the reduction stack, so the engines' HF (which
+    /// the master lacks) survives instead of being diluted toward the master.
+    /// Asserted on the 6 kHz:220 Hz *ratio* so the blend's RMS normalisation —
+    /// which scales the whole output — can't mask the result.
+    #[test]
+    fn registration_master_excluded_preserves_engine_hf() {
+        let _mode = ConsensusModeGuard::registration();
+        let n = 8192usize;
+        let sr = 48_000.0;
+        // Master: a band-limited 220 Hz tone (no HF) — the sinc-reference analogue.
+        let master: Vec<f64> = (0..n)
+            .map(|i| 0.5 * (2.0 * std::f64::consts::PI * 220.0 * i as f64 / sr).sin())
+            .collect();
+        // Two engines agree on the master's 220 Hz PLUS a 6 kHz band the master
+        // lacks (the AI-generated highs).
+        let engine: Vec<f64> = (0..n)
+            .map(|i| {
+                0.5 * (2.0 * std::f64::consts::PI * 220.0 * i as f64 / sr).sin()
+                    + 0.4 * (2.0 * std::f64::consts::PI * 6000.0 * i as f64 / sr).sin()
+            })
+            .collect();
+        let engines = vec![
+            ("AudioSR".to_string(), engine.clone(), n as i64, 1),
+            ("LavaSR".to_string(), engine.clone(), n as i64, 1),
+        ];
+        let mix = select_quinlight_mix(&master, 1, 8_000, &engines, 2, false);
+        assert!(mix.used_registration, "should run the registration path");
+        let out_hf = frequency_component_amplitude(&mix.data, 1, 48_000, 6000.0);
+        let out_lf = frequency_component_amplitude(&mix.data, 1, 48_000, 220.0);
+        let ratio = out_hf / out_lf.max(1e-9);
+        // Engine HF:LF ratio is 0.4/0.5 = 0.8. If the master (no 6 kHz) leaked
+        // into the stack, the 6 kHz would be diluted and the ratio would drop.
+        assert!(
+            ratio > 0.6,
+            "engines' HF must survive — the band-limited master is excluded from the \
+             reduction (HF:LF ratio {ratio:.3}, expected ~0.8)",
+        );
+    }
+
+    /// Registered mode blends "very bad" upscales with good ones rather than
+    /// dropping them: with the score floor bypassed, a deliberately
+    /// uncorrelated engine still contributes (3 contributors), and the median
+    /// of the two agreeing engines rejects its out-of-band content.
+    #[test]
+    fn registration_blends_low_score_engine_without_dropping_it() {
+        let _mode = ConsensusModeGuard::registration();
+        let work_dir = tempfile::tempdir().expect("temp work");
+        let job = sample_job(work_dir.path());
+        let reference_48k = reference_48k_from_job(&job).expect("reference should resample");
+        let frames = reference_48k.len();
+        let good_a = reference_48k.clone();
+        let good_b: Vec<f64> = reference_48k
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| s + 0.01 * (i as f64 * 0.31).sin())
+            .collect();
+        // A "very bad" upscale: an uncorrelated 5 kHz tone that the legacy
+        // spectral floor (0.9) would drop.
+        let bad: Vec<f64> = (0..frames)
+            .map(|i| 0.5 * (2.0 * std::f64::consts::PI * 5000.0 * i as f64 / 48_000.0).sin())
+            .collect();
+        let engines = vec![
+            ("AudioSR".to_string(), good_a, frames as i64, 1),
+            ("LavaSR".to_string(), good_b, frames as i64, 1),
+            ("FLowHigh".to_string(), bad, frames as i64, 1),
+        ];
+        let mix = select_quinlight_mix(&reference_48k, 1, job.rate as u32, &engines, 3, false);
+        assert!(mix.used_registration, "registration path should run");
+        assert_eq!(
+            mix.contributors.len(),
+            3,
+            "all engines must be blended — none dropped by a score floor",
+        );
+        assert!(
+            mix.data.iter().all(|x| x.is_finite()),
+            "blended output must be finite even with a bad engine",
+        );
+        let shared = frequency_component_amplitude(&mix.data, 1, 48_000, 220.0);
+        let bad_band = frequency_component_amplitude(&mix.data, 1, 48_000, 5000.0);
+        assert!(
+            shared > bad_band,
+            "the two agreeing engines should win the median over the lone bad engine \
+             (shared={shared:.4}, bad={bad_band:.4})",
+        );
+    }
+
+    /// Registered mode skips the loop-seam quality gate: a looped consensus
+    /// with a deliberately ugly seam is returned as a normal 48 kHz Quinlight
+    /// mix, not bounced to the original with a `(loop gate)` tag.
+    #[test]
+    fn registered_mode_skips_loop_seam_gate() {
+        let _mode = ConsensusModeGuard::registration();
+        let work_dir = tempfile::tempdir().expect("temp work");
+        let mut job = sample_job(work_dir.path());
+        job.looped = true;
+        job.loop_info = SampleLoopInfo::forward(1024, 3072); // within 4096 source frames
+        let reference_48k = reference_48k_from_job(&job).expect("reference should resample");
+        let frames = reference_48k.len();
+        // Two agreeing engines with a step discontinuity in the loop tail — the
+        // kind of seam the legacy gate rejects.
+        let make = |jitter: f64| -> Vec<f64> {
+            reference_48k
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    let step = if i >= frames * 9 / 10 { 0.7 } else { 0.0 };
+                    s + step + jitter * (i as f64 * 0.19).sin()
+                })
+                .collect()
+        };
+        let candidates = vec![
+            SampleResult {
+                index: job.index,
+                data: make(0.0),
+                length_frames: frames as i64,
+                channels: 1,
+                sample_rate_hz: 48_000,
+                engine_name: "AudioSR".to_string(),
+                discovered_loops: None,
+            },
+            SampleResult {
+                index: job.index,
+                data: make(0.004),
+                length_frames: frames as i64,
+                channels: 1,
+                sample_rate_hz: 48_000,
+                engine_name: "LavaSR".to_string(),
+                discovered_loops: None,
+            },
+        ];
+        let result = build_quinlight_result(&job, &candidates, 2).expect("should build");
+        assert!(
+            result.engine_name.starts_with(QUINLIGHT_NAME),
+            "name={}",
+            result.engine_name,
+        );
+        assert!(
+            !result.engine_name.ends_with("(loop gate)"),
+            "registered mode must not loop-gate the result: {}",
+            result.engine_name,
+        );
+        assert!(
+            !is_no_consensus_result(&result.engine_name),
+            "consensus should have run: {}",
+            result.engine_name,
+        );
+        assert_eq!(
+            result.sample_rate_hz, 48_000,
+            "should return the 48 kHz consensus, not the original fallback",
+        );
+    }
+
+    /// When no sinc master is available, the registration path can't run and
+    /// the consensus falls back to the legacy spectral path — the engines still
+    /// score high against the native source, so consensus succeeds and the
+    /// result is a proper Quinlight mix (not a no-consensus fallback).
+    #[test]
+    fn falls_back_to_spectral_when_reference_empty() {
+        let _mode = ConsensusModeGuard::registration();
+        let work_dir = tempfile::tempdir().expect("temp work");
+        let mut job = sample_job(work_dir.path());
+        let reference_48k = reference_48k_from_job(&job).expect("reference should resample");
+        let frames = reference_48k.len();
+        let engine_a = reference_48k.clone();
+        let engine_b: Vec<f64> = reference_48k
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| s + 0.01 * (i as f64 * 0.27).sin())
+            .collect();
+        // No sinc master → registration can't run; spectral is the fallback.
+        job.reference_48k.clear();
+        let candidates = vec![
+            SampleResult {
+                index: job.index,
+                data: engine_a,
+                length_frames: frames as i64,
+                channels: 1,
+                sample_rate_hz: 48_000,
+                engine_name: "AudioSR".to_string(),
+                discovered_loops: None,
+            },
+            SampleResult {
+                index: job.index,
+                data: engine_b,
+                length_frames: frames as i64,
+                channels: 1,
+                sample_rate_hz: 48_000,
+                engine_name: "LavaSR".to_string(),
+                discovered_loops: None,
+            },
+        ];
+        let result = build_quinlight_result(&job, &candidates, 2).expect("should build");
+        assert!(
+            result.engine_name.starts_with(QUINLIGHT_NAME),
+            "name={}",
+            result.engine_name,
+        );
+        assert!(
+            !is_no_consensus_result(&result.engine_name),
+            "spectral fallback consensus should have run: {}",
+            result.engine_name,
+        );
+        assert_eq!(result.sample_rate_hz, 48_000);
     }
 
     #[test]
@@ -9705,6 +10166,7 @@ mod tests {
     #[test]
     fn skips_rate_limited_engine_before_cache_or_dispatch() {
         let _guard = env_lock().lock().unwrap();
+        let _mode = ConsensusModeGuard::spectral();
         let temp_home = tempfile::tempdir().expect("Should create temp home");
         let _home = HomeGuard::set(temp_home.path());
         let work_dir = tempfile::tempdir().expect("Should create temp work dir");
@@ -9904,6 +10366,7 @@ mod tests {
     #[test]
     fn remaster_samples_returns_cancelled_when_requested_during_engine_work() {
         let _guard = env_lock().lock().unwrap();
+        let _mode = ConsensusModeGuard::spectral();
         let temp_home = tempfile::tempdir().expect("Should create temp home");
         let _home = HomeGuard::set(temp_home.path());
         let work_dir = tempfile::tempdir().expect("Should create temp work dir");
@@ -14335,6 +14798,9 @@ mod tests {
     #[test]
     fn fallback_wave_skipped_when_all_primary_pass_gate() {
         let _guard = env_lock().lock().unwrap();
+        // Score-gated fallback dispatch is legacy spectral-path behaviour;
+        // registered mode runs every engine on every sample.
+        let _mode = ConsensusModeGuard::spectral();
         let temp_home = tempfile::tempdir().expect("temp home");
         let _home = HomeGuard::set(temp_home.path());
         let work_dir = tempfile::tempdir().expect("temp work");
@@ -14418,6 +14884,8 @@ mod tests {
     #[test]
     fn fallback_wave_runs_when_primary_candidate_fails_gate() {
         let _guard = env_lock().lock().unwrap();
+        // Score-gated fallback dispatch is legacy spectral-path behaviour.
+        let _mode = ConsensusModeGuard::spectral();
         let temp_home = tempfile::tempdir().expect("temp home");
         let _home = HomeGuard::set(temp_home.path());
         let work_dir = tempfile::tempdir().expect("temp work");
@@ -14539,6 +15007,7 @@ mod tests {
         // be silently excluded: no candidate emitted, engines_total not bumped,
         // and its panicking spawn_batch never called.
         let _guard = env_lock().lock().unwrap();
+        let _mode = ConsensusModeGuard::spectral();
         let temp_home = tempfile::tempdir().expect("temp home");
         let _home = HomeGuard::set(temp_home.path());
         let work_dir = tempfile::tempdir().expect("temp work");
@@ -14654,6 +15123,7 @@ mod tests {
         // exits at its first ensure_not_cancelled; fallback guard never runs.
         // Documents the defense-in-depth cancel check at the fallback entry.
         let _guard = env_lock().lock().unwrap();
+        let _mode = ConsensusModeGuard::spectral();
         let temp_home = tempfile::tempdir().expect("temp home");
         let _home = HomeGuard::set(temp_home.path());
         let work_dir = tempfile::tempdir().expect("temp work");

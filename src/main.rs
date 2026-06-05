@@ -105,6 +105,26 @@ impl ConvertEngineArg {
     }
 }
 
+/// Engine-consensus algorithm selector for `upsample`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ConsensusArg {
+    /// 1-D dense-LK registration: align every engine to the sinc master and
+    /// take a per-sample median. Time-domain (no STFT ringing), sample-exact
+    /// loop points. The default.
+    Registration,
+    /// Legacy frequency-domain rotor consensus (STFT per-bin Karcher mean).
+    Spectral,
+}
+
+/// Per-sample reducer for the registration consensus.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ReduceArg {
+    /// Outlier-robust: rejects a lone-engine hallucination. The default.
+    Median,
+    /// Smoother on agreed content, but only attenuates outliers by 1/N.
+    Mean,
+}
+
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 struct UpscaleCliArgs {
     /// Quinlight worker mode: cpu, gpu, or hybrid (default: auto-detect — gpu if a GPU is present, else cpu)
@@ -302,9 +322,30 @@ enum Commands {
         /// engine's output to contribute to Quinlight's consensus. Engines
         /// below the floor are dropped for that sample; if fewer than 2
         /// engines remain usable, Quinlight keeps the original sample.
-        /// Range 0.0 – 1.0. Defaults to the built-in floor (0.9).
+        /// Range 0.0 – 1.0. Defaults to the built-in floor (0.9). Only the
+        /// `spectral` consensus applies this floor; `registration` blends all
+        /// engines.
         #[arg(long)]
         threshold: Option<f64>,
+
+        /// Engine-consensus algorithm. `registration` (default) aligns every
+        /// AI engine to the sinc master via 1-D dense optical flow and takes a
+        /// per-sample median — no STFT ringing, sample-exact loop points, and
+        /// it blends all engines (no per-engine score gate, no loop-seam
+        /// gate). `spectral` is the legacy frequency-domain rotor consensus.
+        #[arg(long, value_enum, default_value = "registration")]
+        consensus: ConsensusArg,
+
+        /// Per-sample reducer for the registration consensus. Ignored on the
+        /// `spectral` path.
+        #[arg(long, value_enum, default_value = "median")]
+        reduce: ReduceArg,
+
+        /// Re-enable the frequency-domain source-frequency blend on the
+        /// registration path (off by default — registration already anchors
+        /// the low band to the sinc master). No effect on `spectral`.
+        #[arg(long)]
+        source_blend: bool,
 
         #[command(flatten)]
         upscale: UpscaleCliArgs,
@@ -444,6 +485,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine,
             ddim_steps,
             threshold,
+            consensus,
+            reduce,
+            source_blend,
             upscale,
         }) => {
             let mode = resolve_upscale_mode(upscale);
@@ -460,6 +504,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "Quinlight Audio: usable-score floor overridden to {t:.2} via --threshold"
                 );
+            }
+            remaster::set_quinlight_use_spectral_consensus(matches!(
+                consensus,
+                ConsensusArg::Spectral
+            ));
+            remaster::set_quinlight_registration_mean(matches!(reduce, ReduceArg::Mean));
+            remaster::set_quinlight_enable_source_blend_registration(source_blend);
+            if matches!(consensus, ConsensusArg::Spectral) {
+                eprintln!("Quinlight Audio: using legacy spectral consensus via --consensus");
             }
             match upsample::run_upsample_batch(
                 &inputs,
