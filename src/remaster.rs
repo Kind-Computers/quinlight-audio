@@ -9815,13 +9815,14 @@ mod tests {
         );
     }
 
-    /// Registration path: the band-limited sinc master defines the alignment
-    /// grid but is excluded from the reduction stack, so the engines' HF (which
-    /// the master lacks) survives instead of being diluted toward the master.
-    /// Asserted on the 6 kHz:220 Hz *ratio* so the blend's RMS normalisation —
-    /// which scales the whole output — can't mask the result.
+    /// Registration path: the band-limited sinc master is now a member of the
+    /// median reduction (the mathematically-correct "guidance" vote), but in the
+    /// AI-extended high band it is a low outlier the median discards — so the
+    /// engines' HF (which the master lacks) survives instead of being diluted
+    /// toward the master. Asserted on the 6 kHz:220 Hz *ratio* so the blend's RMS
+    /// normalisation — which scales the whole output — can't mask the result.
     #[test]
-    fn registration_master_excluded_preserves_engine_hf() {
+    fn registration_master_in_median_preserves_engine_hf() {
         let _mode = ConsensusModeGuard::registration();
         let n = 8192usize;
         let sr = 48_000.0;
@@ -9846,12 +9847,13 @@ mod tests {
         let out_hf = frequency_component_amplitude(&mix.data, 1, 48_000, 6000.0);
         let out_lf = frequency_component_amplitude(&mix.data, 1, 48_000, 220.0);
         let ratio = out_hf / out_lf.max(1e-9);
-        // Engine HF:LF ratio is 0.4/0.5 = 0.8. If the master (no 6 kHz) leaked
-        // into the stack, the 6 kHz would be diluted and the ratio would drop.
+        // Engine HF:LF ratio is 0.4/0.5 = 0.8. The master (no 6 kHz) is a low
+        // outlier in the high band, so the median discards it there and the
+        // 6 kHz is not diluted; the ratio stays ~0.8.
         assert!(
             ratio > 0.6,
-            "engines' HF must survive — the band-limited master is excluded from the \
-             reduction (HF:LF ratio {ratio:.3}, expected ~0.8)",
+            "engines' HF must survive — the band-limited master is a low outlier the \
+             median rejects in the high band (HF:LF ratio {ratio:.3}, expected ~0.8)",
         );
     }
 

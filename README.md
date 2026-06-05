@@ -19,10 +19,11 @@ A/B the result live during playback.
 - Opens modules directly from archives (`.zip`, `.7z`, `.rar`, `.tar.*`, `.lha`, `.cab`, `.iso`)
 - Replaces samples live during playback so you can compare Original, Reference 48k,
   and AI remasters (AudioSR, LavaSR, FLowHigh, AP-BWE) without restarting the song
-- Combines multiple AI engines into a single sample via a per-bin spectral
-  consensus on the rotor manifold — bins where the engines agree pass through,
-  bins where they disagree (the typical hallucination fingerprint) get
-  auto-suppressed
+- Combines multiple AI engines into a single sample via a time-domain
+  registration consensus — each engine is aligned to a mathematically-exact
+  sinc reference by 1-D dense optical flow, then a per-sample median rejects
+  any one engine's hallucinations without the ringing of frequency-domain
+  blending (the legacy rotor-manifold spectral consensus stays selectable)
 - Exports the live result to FLAC or AAC (256 kbps)
 - Supports batch CLI rendering for directories of modules
 - Installs as a Linux desktop app (`--install-icon`)
@@ -53,7 +54,8 @@ in the coefficient path.
 Each sample in the module can be upscaled to 48 kHz via three methods:
 
 - **AI** (AudioSR / LavaSR / FLowHigh / AP-BWE): neural bandwidth extension
-- **48k reference**: deterministic sinc resampling (FFmpeg swresample)
+- **48k reference**: deterministic sinc resampling (FFmpeg swresample) — also
+  the alignment master for the registration consensus below
 - **Original**: raw sample at native rate (typically 8–22 kHz)
 
 Samples are replaced live during playback. Pattern offset effects (`Oxx`, `SAx`)
@@ -63,38 +65,57 @@ sample mode is active.
 
 ### Multi-engine consensus
 
-Each enabled AI engine produces its own 48 kHz remaster of every sample.
-Quinlight Audio scores each candidate against the original by Pearson
-correlation of magnitude spectra below the source's Nyquist (an engine that
-hallucinates even at known frequencies isn't to be trusted), then combines
-the engines that pass via a per-bin **Karcher mean on the rotor manifold
-ℝ⁺ × S¹**:
+Each enabled AI engine produces its own 48 kHz remaster of every sample. Those
+candidates are combined into one sample by a **registration consensus** that
+works entirely in the time domain — the default, because it neither rings nor
+smears transients the way frequency-domain blending does.
 
-- **Magnitude** — geometric mean of the engine magnitudes (Karcher mean on
-  ℝ⁺ under multiplication). Smoothly biased toward the quieter engines: the
-  rotor-correct successor to softmin, without the per-bin discrete-winner
-  ringing of patched-together spectra.
-- **Phase** — circular mean of the engine phases (Karcher mean on S¹).
-- **Agreement scaling** — the resultant length of the phase rotor sum (0–1)
-  multiplies the consensus magnitude. Bins where the engines agree on phase
-  pass through at full amplitude; bins where they disagree (the typical
-  hallucination fingerprint) are attenuated proportionally.
+**Registration (default).** The deterministic 48 kHz sinc reference — the
+mathematically exact bandlimited upsample — is taken as a *master*. For each AI
+engine a dense 1-D Lucas–Kanade optical-flow field is computed from the master
+to that engine: the same "register, then reduce" method Quinlight uses on
+images, dropped to one dimension. The 2-D structure-tensor solve collapses to
+the scalar `u = −Σ(w·Ix·It) / Σ(w·Ix²)` — a per-sample sub-sample shift that
+best aligns the engine to the master. Each engine is then linearly warped onto
+the master's grid, and the engines are reduced **per sample by the median**
+(mean optional).
 
-Below the source's original Nyquist the consensus is then rotor-blended back
-toward the source spectrum itself (arithmetic-mean magnitude, shortest-arc
-SLERP on phase) so the bottom band stays anchored to the ground truth and
-the engines contribute mainly to the band-extension above. Above the source
-Nyquist the consensus passes through unchanged.
+- **No ringing.** No FFT and no per-bin magnitude/phase surgery, so none of the
+  inverse-STFT pre-echo or transient smearing the spectral path can introduce —
+  warp-then-median is phase-coherent by construction.
+- **Sample-exact loops.** Every engine is warped onto the sinc master, which
+  carries the exact loop length and loop point, and both the LK window and the
+  warp wrap circularly across the seam — so looped samples stay aligned to the
+  sample.
+- **Master is the target only.** The sinc reference defines the alignment grid
+  and the loop timing but is **excluded from the median**, so its bandlimited
+  (no-HF) content never dilutes the engines' band-extension.
+- **Robust to a bandlimited master.** A goodness-of-fit gate trusts the flow at
+  a sample only when the local model `It ≈ −u·Ix` actually explains the
+  engine-vs-master difference (`R² = sxt² / (sxx · Σ w·It²)`). High frequencies
+  the master cannot represent therefore cannot drive a spurious shift that would
+  mangle the engine's own highs.
+- **Blends bad with good.** Since the median already rejects a lone engine's
+  outlier, registered mode runs *every* engine and drops both the per-engine
+  score floor and the loop-seam quality gates: a "very bad" upscale is just an
+  outlier the median discards, not a reason to keep the original.
 
-Why operate on the rotor manifold instead of a Cartesian (complex-linear)
-blend: the chord between two phasors of comparable magnitude in ℂ passes
-closer to the origin than either endpoint when their phases disagree, so a
-linear blend silently attenuates the bin in proportion to phase mismatch —
-which the inverse STFT renders as pre-echo and transient smearing.
-Operating on the geodesic of (ℝ⁺ × S¹) makes that attenuation explicit
-instead of hidden: phase agreement modulates magnitude on purpose, which
-both sounds cleaner and is interpretable as a hallucination-rejection
-criterion rather than a silent artifact.
+**Spectral (legacy, `--consensus spectral`).** The original path scores each
+candidate against the source by Pearson correlation of magnitude spectra below
+the source's Nyquist (an engine that hallucinates even at known frequencies
+isn't to be trusted), then combines the survivors via a per-bin **Karcher mean
+on the rotor manifold ℝ⁺ × S¹**: geometric-mean magnitude (Karcher mean on ℝ⁺,
+biased toward the quieter engines), circular-mean phase (Karcher mean on S¹),
+and an agreement-scaling term — the resultant length of the phase rotor sum
+(0–1) multiplies the magnitude, so bins where the engines disagree on phase (the
+hallucination fingerprint) are attenuated. Below the source Nyquist the result
+is rotor-blended back toward the source spectrum itself (arithmetic-mean
+magnitude, shortest-arc SLERP on phase) so the bottom band stays anchored to
+ground truth. Operating on the geodesic of (ℝ⁺ × S¹) makes that attenuation
+deliberate instead of the hidden, ringing-inducing attenuation a Cartesian
+complex blend produces — but the inverse STFT it still relies on is exactly the
+ringing source the registration path removes. It remains available for A/B
+comparison and is the automatic fallback when no sinc master is present.
 
 ### Anisotropic interpolation
 

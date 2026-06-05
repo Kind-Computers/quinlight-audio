@@ -17,10 +17,14 @@
 //! 3. Per-sample **median** (default) or **mean** across the warped engine
 //!    stack.
 //!
-//! **The master is the warp/flow target ONLY — it is never a member of the
-//! reduction stack.** It is band-limited to the source Nyquist (no real
-//! high-frequency content), so including it would dilute the AI-generated
-//! highs. The reduction is over the warped engines alone.
+//! The **master** is the warp/flow target (and is never itself warped). In the
+//! default **median** reduction it is *also* a full member of the stack — a
+//! self-regulating one: band-limited to the source Nyquist, it sits among the
+//! engines in the source band (anchoring/guiding the consensus and helping
+//! outvote an in-band hallucination) but is a low outlier in the AI-extended
+//! high band, where the median rejects it, so the band extension is preserved.
+//! In **mean** mode (no outlier rejection) it stays excluded, since averaging in
+//! its zero highs would dilute the AI-generated band extension.
 //!
 //! Why this replaces the frequency-domain `spectral_intersection`: that path
 //! manipulates per-bin STFT magnitude/phase and inverse-transforms, which
@@ -81,10 +85,45 @@ pub struct LkParams {
     /// an in-band time shift, `R² ≈ 1` and the flow is trusted.
     pub min_r2: f64,
     /// Use a fixed **spatial** Gaussian window taper (`exp(−d²/2σ²)`,
-    /// `σ = radius/2`) instead of a uniform window. Value-independent, so
-    /// none of the 2D bilateral weight's bipolar-audio problems. Off by
-    /// default.
+    /// `σ = radius/2`) instead of a uniform window. Value-independent and
+    /// composes (multiplicatively) with the amplitude bilateral weight
+    /// ([`LkParams::sigma_a`]). Off by default.
     pub gaussian_window: bool,
+    /// Bipolar **bilateral (edge) weight** bandwidth, in units of the
+    /// window-local master amplitude scale (≈ the plateau half-swing of a
+    /// square wave). A tap whose master value differs from the window centre by
+    /// `sigma_a · scale` is attenuated to `e^{−1/2}`, so a window straddling a
+    /// square-wave transition solves one plateau at a time instead of a smeared
+    /// blend across both. Normalised by a window-local master variance
+    /// ([`bilateral_scale2`]), so it is level-invariant — a loud and a quiet
+    /// square weight identically. This is the bipolar analogue of the 2D image
+    /// port's `log2(luma)` bilateral (which does not apply to signed audio).
+    /// `f64::INFINITY` disables it (pure spatial weighting — the prior
+    /// behaviour).
+    pub sigma_a: f64,
+    /// Numerical guard added to the bilateral-weight denominator so a flat /
+    /// silent window (variance → 0) yields `w_photo ≈ 1` (uniform) rather than a
+    /// `0/0`. Must sit far below `2·sigma_a²·var` across the usable range.
+    pub bilateral_scale_eps: f64,
+    /// Loop-**seam guard** half-width, in samples, around each loop endpoint
+    /// (local indices `0` and `n−1`) when `looped`. `0` disables it. Within the
+    /// guard the flow is pinned to identity (registration never *moves* samples
+    /// at the seam) and the reduction is blended toward the band-limited master,
+    /// which attenuates a seam tick **shared across all engines** — such ticks
+    /// survive the per-sample median — and restores exact loop continuity. On
+    /// by default (`8`); set to `0` to disable. Self-gates on `looped`, so it is
+    /// inert for one-shot (non-looped) samples.
+    pub seam_guard_radius: usize,
+    /// Include the band-limited sinc **master** as a full member of the
+    /// per-sample **median** reduction (in addition to being the warp target),
+    /// giving the AI engines a mathematically-correct reference vote. It is
+    /// self-regulating: in the source band it sits among the engines and guides
+    /// the consensus (helping reject an in-band hallucination), while in the
+    /// AI-extended high band it is ≈ 0 — a low outlier the median discards — so
+    /// the band extension survives. **Median only**: `Mean` cannot reject it and
+    /// would soften the highs by `1/(K+1)`, so the master stays excluded there
+    /// regardless of this flag. On by default.
+    pub include_master_in_reduction: bool,
 }
 
 impl Default for LkParams {
@@ -96,6 +135,10 @@ impl Default for LkParams {
             det_floor_abs: 1e-12,
             min_r2: 0.5,
             gaussian_window: false,
+            sigma_a: 0.6,
+            bilateral_scale_eps: 1e-12,
+            seam_guard_radius: 8,
+            include_master_in_reduction: true,
         }
     }
 }
@@ -138,6 +181,27 @@ fn window_weight(d: isize, radius: isize, gaussian: bool) -> f64 {
     } else {
         1.0
     }
+}
+
+/// Window-local variance of the `master` about its window mean — the
+/// normaliser for the bipolar bilateral edge weight in [`dense_lk_1d`]. Makes
+/// the weight level-invariant: a rail-to-rail square gives `var ≈ A²`, a quiet
+/// square `≈ a²`, so the *normalised* tap-to-centre differences (and hence the
+/// weights) match. One extra pass over the same `2*radius+1` taps the flow
+/// solve already visits.
+#[inline]
+fn bilateral_scale2(master: &[f64], i: usize, radius: isize, n: usize, looped: bool) -> f64 {
+    let ii = i as isize;
+    let count = (2 * radius + 1) as f64;
+    let mut s1 = 0.0f64;
+    let mut s2 = 0.0f64;
+    for d in -radius..=radius {
+        let m = master[idx(ii + d, n, looped)];
+        s1 += m;
+        s2 += m * m;
+    }
+    let mean = s1 / count;
+    (s2 / count - mean * mean).max(0.0)
 }
 
 /// Sample `signal` at sub-sample position `pos` with linear interpolation.
@@ -202,6 +266,19 @@ pub fn dense_lk_1d(master: &[f64], engine: &[f64], looped: bool, params: LkParam
     for iter in 0..iters {
         for (i, flow_i) in flow.iter_mut().enumerate() {
             let ii = i as isize;
+            // Bipolar bilateral (edge) weight: taps whose master value differs
+            // from the window centre are attenuated, so a window straddling a
+            // square-wave transition solves one plateau at a time instead of a
+            // smeared blend. Normalised by the window-local master variance, so
+            // it is level-invariant. `sigma_a = INFINITY` ⇒ `inv_2s2 = 0` ⇒
+            // `w_photo ≡ 1` (pure spatial weighting, the prior behaviour).
+            let mc0 = master[idx(ii, n, looped)];
+            let inv_2s2 = if params.sigma_a.is_finite() {
+                let var = bilateral_scale2(master, i, r, n, looped);
+                1.0 / (2.0 * params.sigma_a * params.sigma_a * var + params.bilateral_scale_eps)
+            } else {
+                0.0
+            };
             let mut sxx = 0.0f64;
             let mut sxt = 0.0f64;
             let mut stt = 0.0f64;
@@ -211,7 +288,16 @@ pub fn dense_lk_1d(master: &[f64], engine: &[f64], looped: bool, params: LkParam
                 let mc = master[idx(j, n, looped)];
                 let ix = 0.5 * (master[idx(j + 1, n, looped)] - master[idx(j - 1, n, looped)]);
                 let it = warped[idx(j, n, looped)] - mc;
-                let w = window_weight(d, r, params.gaussian_window);
+                // Spatial × amplitude-bilateral weight. The centre tap (`d=0`,
+                // `da=0`) always keeps `w_photo=1`, so the solve never loses the
+                // sample it is estimating.
+                let w_photo = if inv_2s2 > 0.0 {
+                    let da = mc - mc0;
+                    (-(da * da) * inv_2s2).exp()
+                } else {
+                    1.0
+                };
+                let w = window_weight(d, r, params.gaussian_window) * w_photo;
                 sxx += w * ix * ix;
                 sxt += w * ix * it;
                 stt += w * it * it;
@@ -224,11 +310,21 @@ pub fn dense_lk_1d(master: &[f64], engine: &[f64], looped: bool, params: LkParam
             // and to stay well-defined when stt → 0 (then RHS → 0, LHS ≥ 0, so
             // the tiny residual flow — sxt ≈ 0 — is allowed through as ~0).
             let fit_ok = sxt * sxt >= params.min_r2 * sxx * stt;
-            let du = if sxx > det_floor && fit_ok {
+            let mut du = if sxx > det_floor && fit_ok {
                 -sxt / sxx
             } else {
                 0.0
             };
+            // Loop-seam guard (flow pin): within `seam_guard_radius` of either
+            // loop endpoint, hold the flow at identity. Registration must not
+            // *move* samples at the seam — any motion there manufactures a seam
+            // mismatch. Inert unless looped and the radius is set.
+            if params.seam_guard_radius > 0 && looped {
+                let g = params.seam_guard_radius;
+                if i < g || i >= n.saturating_sub(g) {
+                    du = 0.0;
+                }
+            }
             *flow_i += if du.is_finite() { du } else { 0.0 };
         }
         // Re-warp the ORIGINAL engine by the cumulative flow for the next
@@ -310,14 +406,40 @@ pub fn mean_per_sample(stack: &[&[f64]]) -> Vec<f64> {
     out
 }
 
+/// Loop-seam guard (reduction blend): pull the few samples at each loop
+/// endpoint (the seam between index `n−1` and `0`) toward the band-limited
+/// `master`. The blend weight `β` is a raised cosine — `1` exactly at a seam
+/// sample, ramping to `0` at distance `radius`. Because the master is the
+/// deterministic, **tick-free** reference, this attenuates a seam tick that is
+/// *shared* across all engines (and so survives the median) by `(1−β)`, while
+/// restoring exact loop continuity. The master is re-admitted ONLY in this
+/// narrow guard — the body reduction still excludes it. No-op for
+/// `radius == 0`.
+fn apply_seam_master_blend(out: &mut [f64], master: &[f64], radius: usize) {
+    let n = out.len().min(master.len());
+    if radius == 0 || n < 3 {
+        return;
+    }
+    // Cap so the two endpoint guards never overlap.
+    let r = radius.min(n / 2);
+    for k in 0..r {
+        let beta = 0.5 * (1.0 + (std::f64::consts::PI * k as f64 / r as f64).cos());
+        let head = k;
+        out[head] = (1.0 - beta) * out[head] + beta * master[head];
+        let tail = n - 1 - k;
+        out[tail] = (1.0 - beta) * out[tail] + beta * master[tail];
+    }
+}
+
 /// End-to-end 1D registration consensus with [`LkParams::default`].
 ///
 /// For each engine: compute LK flow master→engine, linearly warp the engine
-/// onto the master grid, and push the warped engine. **The master is not
-/// pushed** — it is the warp target only. The K-engine stack is reduced
-/// per-sample by `mode`. `K == 1` returns the lone engine unchanged (no warp,
-/// no master mixing); `K == 0` returns empty. Output length is the minimum
-/// engine length.
+/// onto the master grid, and push the warped engine. In the default **median**
+/// reduction the (unwarped) master is *also* pushed as a self-regulating member
+/// (see [`LkParams::include_master_in_reduction`]); in **mean** mode it is
+/// excluded. The stack is reduced per-sample by `mode`. `K == 1` returns the
+/// lone engine unchanged (no warp, no master mixing); `K == 0` returns empty.
+/// Output length is the minimum engine length.
 pub fn registration_consensus_1d(
     master: &[f64],
     engines: &[&[f64]],
@@ -364,11 +486,31 @@ pub fn registration_consensus_1d_with(
         })
         .collect();
 
-    let refs: Vec<&[f64]> = warped.iter().map(|v| v.as_slice()).collect();
-    match mode {
+    let mut refs: Vec<&[f64]> = warped.iter().map(|v| v.as_slice()).collect();
+    // Master as a full MEDIAN member (self-regulating "guidance"): it votes in
+    // the source band and is discarded as a low outlier in the AI-extended
+    // highs. Median only — Mean cannot reject it and would dilute the highs. The
+    // master is the warp grid, so it is added UNWARPED. Skip when it can't cover
+    // the full output (else the min-length reducer would truncate the result).
+    if params.include_master_in_reduction
+        && mode == ReductionMode::Median
+        && master.len() >= out_len
+        && out_len >= 3
+    {
+        refs.push(&master[..out_len]);
+    }
+    let mut reduced = match mode {
         ReductionMode::Median => median_per_sample(&refs),
         ReductionMode::Mean => mean_per_sample(&refs),
+    };
+    // Loop-seam guard (reduction blend): pull the few samples at each loop
+    // endpoint toward the band-limited, tick-free master to remove a seam tick
+    // shared across all engines and restore exact loop continuity. Body samples
+    // are untouched. Inert unless looped and the radius is set.
+    if params.seam_guard_radius > 0 && looped && align_n >= 3 {
+        apply_seam_master_blend(&mut reduced, &master[..align_n], params.seam_guard_radius);
     }
+    reduced
 }
 
 #[cfg(test)]
@@ -654,6 +796,390 @@ mod tests {
         assert!(
             (mean_u - 0.4).abs() < 0.1,
             "dense_lk_1d should recover the +0.4 sample shift, got {mean_u}"
+        );
+    }
+
+    /// Band-limited square wave: sum of odd harmonics up to Nyquist, built as
+    /// the **even** square (cosine series with alternating signs) so the sample
+    /// at index 0 sits mid-plateau (value `+amp`) rather than on an edge. With
+    /// `freq = cycles * SR / n` (integer `cycles`) it is periodic in `n`, so the
+    /// loop seam is continuous and lands in the middle of a plateau. Carries the
+    /// usual ~9% Gibbs overshoot at each edge — the chiptune case.
+    fn band_limited_square(sr: f64, n: usize, freq: f64, amp: f64) -> Vec<f64> {
+        let mut out = vec![0.0f64; n];
+        let mut k = 1.0f64;
+        let mut sign = 1.0f64;
+        while k * freq < sr / 2.0 {
+            let h = amp * 4.0 / std::f64::consts::PI / k * sign;
+            for (i, s) in out.iter_mut().enumerate() {
+                *s += h * (2.0 * std::f64::consts::PI * k * freq * i as f64 / sr).cos();
+            }
+            sign = -sign;
+            k += 2.0;
+        }
+        out
+    }
+
+    #[test]
+    fn chiptune_square_loop_keeps_edge_and_attenuates_seam_tick() {
+        // Headline test. A looped band-limited square (the seam lands mid-
+        // plateau, so it is continuous). Three engines are sub-sample shifts
+        // {0, +0.3, +0.7} of it, each carrying the SAME tick injected at the
+        // loop endpoints — a shared tick survives the per-sample median. The
+        // seam guard must (a) keep the square's edges sharp in the interior and
+        // (b) attenuate the shared seam tick; with the guard off the tick
+        // survives (negative control).
+        let n = 2048;
+        let freq = 16.0 * SR / n as f64; // 16 cycles → continuous seam
+        let master = band_limited_square(SR, n, freq, 0.8);
+        let in_peak = master.iter().fold(0.0f64, |m, &x| m.max(x.abs()));
+        let tick = 0.5 * in_peak;
+
+        let make_engine = |s: f64| {
+            let mut e = shift(&master, s, true);
+            let last = e.len() - 1;
+            e[0] += tick;
+            e[1] += 0.5 * tick;
+            e[last] += tick;
+            e[last - 1] += 0.5 * tick;
+            e
+        };
+        let e0 = make_engine(0.0);
+        let e1 = make_engine(0.3);
+        let e2 = make_engine(0.7);
+        let refs = [e0.as_slice(), e1.as_slice(), e2.as_slice()];
+
+        let guard = LkParams {
+            sigma_a: 0.6,
+            seam_guard_radius: 8,
+            ..LkParams::default()
+        };
+        let no_guard = LkParams {
+            sigma_a: 0.6,
+            seam_guard_radius: 0,
+            ..LkParams::default()
+        };
+        let out_g =
+            registration_consensus_1d_with(&master, &refs, true, ReductionMode::Median, guard);
+        let out_n =
+            registration_consensus_1d_with(&master, &refs, true, ReductionMode::Median, no_guard);
+
+        // (a) Interior (away from the seam guard): the aligned median tracks the
+        // band-limited square — edges are not smeared and no extra overshoot is
+        // introduced beyond the square's own Gibbs lobes.
+        let margin = 64;
+        let interior_peak = out_g[margin..n - margin]
+            .iter()
+            .fold(0.0f64, |m, &x| m.max(x.abs()));
+        assert!(
+            interior_peak <= in_peak * 1.05,
+            "interior overshoot {interior_peak} exceeds in_peak {in_peak}"
+        );
+        let interior_diff = mean_abs_diff(&out_g[margin..n - margin], &master[margin..n - margin]);
+        assert!(
+            interior_diff < 0.1 * rms(&master),
+            "interior should track the square (edges not smeared), diff={interior_diff}"
+        );
+
+        // (b) Seam-region deviation from the (tick-free) master, over the guard.
+        let seam_dev = |out: &[f64]| {
+            let mut d = 0.0f64;
+            for k in 0..8usize {
+                d = d.max((out[k] - master[k]).abs());
+                d = d.max((out[n - 1 - k] - master[n - 1 - k]).abs());
+            }
+            d
+        };
+        let dev_g = seam_dev(&out_g);
+        let dev_n = seam_dev(&out_n);
+        assert!(
+            dev_g < 0.15 * in_peak,
+            "seam tick should be attenuated with the guard, dev={dev_g}"
+        );
+        assert!(
+            dev_g < 0.5 * dev_n,
+            "guard must beat no-guard at the seam: guard={dev_g}, no_guard={dev_n}"
+        );
+        // Negative control: the shared tick survives the median without a guard.
+        assert!(
+            dev_n > 0.4 * tick,
+            "shared seam tick should survive without the guard, dev={dev_n}"
+        );
+    }
+
+    #[test]
+    fn bilateral_scale2_tracks_local_amplitude() {
+        // The bilateral normaliser ≈ A² across a ±A square edge, ≈ 0 inside a
+        // flat plateau, and exactly 0 in silence.
+        let n = 512;
+        let a = 0.7;
+        let sq: Vec<f64> = (0..n)
+            .map(|i| if (i / 40) % 2 == 0 { a } else { -a })
+            .collect();
+        let r = 5isize;
+        let v_flat = bilateral_scale2(&sq, 20, r, n, false);
+        assert!(
+            v_flat < 1e-9,
+            "variance inside a flat plateau should be ~0, got {v_flat}"
+        );
+        let v_edge = bilateral_scale2(&sq, 40, r, n, false);
+        assert!(
+            (v_edge - a * a).abs() < 0.2 * a * a,
+            "variance across an edge should be ≈ A², got {v_edge}"
+        );
+        let silence = vec![0.0f64; n];
+        assert_eq!(bilateral_scale2(&silence, 100, r, n, false), 0.0);
+    }
+
+    #[test]
+    fn bilateral_weight_changes_flow_on_square_edges() {
+        // The bilateral weight must actually engage: on a square's edges it
+        // produces a different flow field than pure spatial (uniform)
+        // weighting. (Proves the feature is wired in, independent of the
+        // library default.)
+        let n = 1024;
+        let freq = 6.0 * SR / n as f64;
+        let master = band_limited_square(SR, n, freq, 0.8);
+        let engine = shift(&master, 0.45, false);
+        let f_bilat = dense_lk_1d(
+            &master,
+            &engine,
+            false,
+            LkParams {
+                sigma_a: 0.6,
+                ..LkParams::default()
+            },
+        );
+        let f_unif = dense_lk_1d(
+            &master,
+            &engine,
+            false,
+            LkParams {
+                sigma_a: f64::INFINITY,
+                ..LkParams::default()
+            },
+        );
+        let max_diff = f_bilat
+            .iter()
+            .zip(&f_unif)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_diff > 1e-3,
+            "bilateral weight must change the flow vs uniform on square edges, max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn bilateral_weight_is_level_invariant() {
+        // A loud and a quiet square (same shape, ×100 amplitude) must register
+        // to the same flow — the window-local variance normaliser cancels the
+        // amplitude. (Guards against a mis-scaled bilateral that would weight by
+        // absolute amplitude.)
+        let n = 1024;
+        let freq = 8.0 * SR / n as f64;
+        let loud = band_limited_square(SR, n, freq, 0.9);
+        let quiet: Vec<f64> = loud.iter().map(|x| x * 0.01).collect();
+        let p = LkParams {
+            sigma_a: 0.6,
+            ..LkParams::default()
+        };
+        let f_loud = dense_lk_1d(&loud, &shift(&loud, 0.4, false), false, p);
+        let f_quiet = dense_lk_1d(&quiet, &shift(&quiet, 0.4, false), false, p);
+        let margin = 32;
+        let mean = |f: &[f64]| f[margin..n - margin].iter().sum::<f64>() / (n - 2 * margin) as f64;
+        assert!(
+            (mean(&f_loud) - mean(&f_quiet)).abs() < 0.05,
+            "loud and quiet squares must register identically: loud={}, quiet={}",
+            mean(&f_loud),
+            mean(&f_quiet)
+        );
+    }
+
+    #[test]
+    fn bilateral_weight_ignores_gibbs_ripple() {
+        // A band-limited square (rich Gibbs lobes) registered against itself
+        // must yield ~zero flow — the ripple does not manufacture spurious
+        // motion through the bilateral weight.
+        let n = 1024;
+        let freq = 10.0 * SR / n as f64;
+        let master = band_limited_square(SR, n, freq, 0.8);
+        let flow = dense_lk_1d(
+            &master,
+            &master,
+            false,
+            LkParams {
+                sigma_a: 0.6,
+                ..LkParams::default()
+            },
+        );
+        let max_u = flow.iter().fold(0.0f64, |m, &x| m.max(x.abs()));
+        assert!(max_u < 1e-6, "identity registration should give ~zero flow, max_u={max_u}");
+    }
+
+    #[test]
+    fn seam_guard_is_inert_when_not_looped() {
+        // Edge-aware weighting and the seam guard are both ON by default.
+        let d = LkParams::default();
+        assert!(
+            d.sigma_a.is_finite() && d.sigma_a > 0.0,
+            "edge-aware weighting must be on by default"
+        );
+        assert!(d.seam_guard_radius > 0, "seam guard must be on by default");
+        // The seam guard only acts on looped buffers; with looped=false it must
+        // be a no-op for any radius (no master re-admission off-loop).
+        let n = 512;
+        let master = tone(SR, n, 600.0, 0.6, 0.0);
+        let e1 = shift(&master, 0.2, false);
+        let e2 = shift(&master, 0.5, false);
+        let refs = [e1.as_slice(), e2.as_slice()];
+        let off = LkParams {
+            seam_guard_radius: 0,
+            ..LkParams::default()
+        };
+        let on = LkParams {
+            seam_guard_radius: 8,
+            ..LkParams::default()
+        };
+        let a = registration_consensus_1d_with(&master, &refs, false, ReductionMode::Median, off);
+        let b = registration_consensus_1d_with(&master, &refs, false, ReductionMode::Median, on);
+        assert_eq!(a, b, "seam guard must be inert when looped=false");
+    }
+
+    #[test]
+    fn high_pitch_square_no_panic() {
+        // Square whose period is shorter than the window (edges within the
+        // window): the bilateral weight may cut nearly every tap, but the centre
+        // tap (w_photo=1) and the scale eps keep the solve defined. Must not
+        // panic, NaN, or blow up.
+        let n = 600;
+        let freq = SR / 8.0; // period 8 samples
+        let master = band_limited_square(SR, n, freq, 0.8);
+        let e1 = shift(&master, 0.3, true);
+        let e2 = shift(&master, 0.6, true);
+        let refs = [e1.as_slice(), e2.as_slice()];
+        let p = LkParams {
+            sigma_a: 0.6,
+            seam_guard_radius: 8,
+            ..LkParams::default()
+        };
+        let out = registration_consensus_1d_with(&master, &refs, true, ReductionMode::Median, p);
+        assert_eq!(out.len(), n);
+        assert!(out.iter().all(|x| x.is_finite()), "output must be finite");
+        let in_peak = master.iter().fold(0.0f64, |m, &x| m.max(x.abs()));
+        let out_peak = out.iter().fold(0.0f64, |m, &x| m.max(x.abs()));
+        assert!(
+            out_peak <= in_peak * 1.5,
+            "output should stay bounded, out={out_peak} in={in_peak}"
+        );
+    }
+
+    #[test]
+    fn include_master_in_reduction_on_by_default() {
+        assert!(
+            LkParams::default().include_master_in_reduction,
+            "master guidance must be on by default"
+        );
+    }
+
+    #[test]
+    fn master_member_preserves_highs_in_median() {
+        // The master is band-limited (220 Hz only); the engines carry an extra
+        // 6 kHz the master lacks. With the master a MEDIAN member, it is a low
+        // outlier in the 6 kHz band — the median discards it — so the AI high
+        // band survives in full, while the shared in-band content is anchored.
+        let n = 8192;
+        let master = tone(SR, n, 220.0, 0.5, 0.0);
+        let engine: Vec<f64> = (0..n)
+            .map(|i| {
+                0.5 * (2.0 * std::f64::consts::PI * 220.0 * i as f64 / SR).sin()
+                    + 0.4 * (2.0 * std::f64::consts::PI * 6000.0 * i as f64 / SR).sin()
+            })
+            .collect();
+        let refs = [engine.as_slice(), engine.as_slice()];
+        let out = registration_consensus_1d(&master, &refs, false, ReductionMode::Median);
+
+        let amp_engine = component_amplitude(&engine, 6000.0, SR);
+        let amp_out = component_amplitude(&out, 6000.0, SR);
+        assert!(
+            amp_out > 0.9 * amp_engine,
+            "median rejects the band-limited master in the high band; 6 kHz must \
+             survive: out={amp_out:.4}, engine={amp_engine:.4}"
+        );
+        assert!(
+            mean_abs_diff(&out, &engine) < 0.05 * rms(&engine),
+            "median output should track the engines on shared content"
+        );
+    }
+
+    #[test]
+    fn master_member_rejects_inband_hallucination() {
+        // Even split: two clean engines (== master) and two that share an in-band
+        // 660 Hz hallucination. Engines alone (median of 4) average a clean and a
+        // dirty middle, leaking the hallucination; the master's correct vote
+        // breaks the tie (median of 5 → the clean value).
+        let n = 8192;
+        let master = tone(SR, n, 440.0, 0.5, 0.0);
+        let clean = master.clone();
+        let dirty: Vec<f64> = (0..n)
+            .map(|i| {
+                0.5 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / SR).sin()
+                    + 0.5 * (2.0 * std::f64::consts::PI * 660.0 * i as f64 / SR).sin()
+            })
+            .collect();
+        let refs = [
+            clean.as_slice(),
+            clean.as_slice(),
+            dirty.as_slice(),
+            dirty.as_slice(),
+        ];
+        let on = LkParams::default(); // include_master_in_reduction = true
+        let off = LkParams {
+            include_master_in_reduction: false,
+            ..LkParams::default()
+        };
+        let out_on =
+            registration_consensus_1d_with(&master, &refs, false, ReductionMode::Median, on);
+        let out_off =
+            registration_consensus_1d_with(&master, &refs, false, ReductionMode::Median, off);
+
+        let leak_on = component_amplitude(&out_on, 660.0, SR);
+        let leak_off = component_amplitude(&out_off, 660.0, SR);
+        assert!(
+            leak_on < 0.5 * leak_off,
+            "the master's vote should break the even-split tie: on={leak_on:.4}, \
+             off={leak_off:.4}"
+        );
+        assert!(
+            leak_on < 0.1,
+            "with the master, the 660 Hz hallucination is rejected: {leak_on:.4}"
+        );
+    }
+
+    #[test]
+    fn master_excluded_from_mean_even_when_flag_on() {
+        // The median-only gate: in MEAN mode the master is never a member, even
+        // with the flag on, so the AI high band is not diluted by its zero highs.
+        let n = 8192;
+        let master = tone(SR, n, 220.0, 0.5, 0.0);
+        let engine: Vec<f64> = (0..n)
+            .map(|i| {
+                0.5 * (2.0 * std::f64::consts::PI * 220.0 * i as f64 / SR).sin()
+                    + 0.4 * (2.0 * std::f64::consts::PI * 6000.0 * i as f64 / SR).sin()
+            })
+            .collect();
+        let refs = [engine.as_slice(), engine.as_slice()];
+        let p = LkParams {
+            include_master_in_reduction: true,
+            ..LkParams::default()
+        };
+        let out = registration_consensus_1d_with(&master, &refs, false, ReductionMode::Mean, p);
+        let amp_engine = component_amplitude(&engine, 6000.0, SR);
+        let amp_out = component_amplitude(&out, 6000.0, SR);
+        assert!(
+            amp_out > 0.9 * amp_engine,
+            "mean must keep the master excluded even with the flag on (no HF \
+             dilution): out={amp_out:.4}, engine={amp_engine:.4}"
         );
     }
 }
