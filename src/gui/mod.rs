@@ -1254,6 +1254,11 @@ struct SampleSlot {
     index: i32,
     original: Vec<f64>,
     original_rate: i32,
+    /// Native source sample rate (Hz). `original_rate` is the post-normalization
+    /// offset/loop baseline (48000 once a sub-48k sample has been normalized at
+    /// load); `native_rate` preserves the true source rate for display and engine
+    /// eligibility. Equal to `original_rate` in the legacy (un-normalized) path.
+    native_rate: i32,
     original_channels: i32,
     original_length_frames: i64,
     #[allow(dead_code)] // Read only in tests (expected_quinlight_mix)
@@ -1278,6 +1283,14 @@ struct SampleSlot {
 impl SampleSlot {
     fn has_engine_results(&self) -> bool {
         self.quinlight_result.is_some() || !self.engine_results.is_empty()
+    }
+
+    /// Whether this sample was already hi-fi at its SOURCE rate (>= 48 kHz), so
+    /// there is nothing to upscale. Uses `native_rate`, not `original_rate`: the
+    /// latter is the post-normalization 48 kHz baseline and would be true for
+    /// every normalized sub-48k sample (a false "Original" badge).
+    fn is_native_hifi(&self) -> bool {
+        self.native_rate >= 48_000
     }
 
     fn available_modes(&self) -> Vec<SampleMode> {
@@ -2152,6 +2165,13 @@ impl Quinlight {
             return;
         }
 
+        // NOTE: after load-time normalization, `slot.original` is the 48 kHz
+        // master and `slot.original_rate` is 48000 — so "restore originals"
+        // restores the 48 kHz baseline that the live module already holds, not
+        // the native sub-48k sample. This is intentional: the module is
+        // 48 kHz-resident and its Oxx/SAx offsets were patched to 48 kHz once at
+        // load; writing native data/rate back here would reintroduce a rate
+        // mismatch and the very playback tick this feature removes.
         self.player.with_module(|m| {
             for slot in &slots {
                 m.replace_sample_data(
@@ -2549,19 +2569,26 @@ impl Quinlight {
                 }
                 self.remaster_notice = None;
                 self.remaster_log.clear();
-                // Fast: just read raw sample data under brief module lock
-                let raw_samples = match self
-                    .player
-                    .with_module(|m| crate::remaster::read_raw_samples(m))
-                {
-                    Some(samples) if !samples.is_empty() => samples,
-                    _ => {
-                        self.remaster_status = RemasterStatus::Failed(
-                            "No module loaded or no eligible samples".into(),
-                        );
-                        return Task::none();
-                    }
+                // Source the remaster's originals. Preferred path: the load-time
+                // normalization stash — the live module already holds each sample
+                // at 48 kHz, and we feed the AI the pristine native PCM kept here,
+                // so every live swap is 48k -> 48k (no rate-change tick). Fallback
+                // (QUINLIGHT_NO_LOAD_NORMALIZE set, or nothing normalized): read
+                // native samples straight from the live module — legacy behavior.
+                let stash = self.player.sample_stash();
+                let from_stash = !stash.is_empty();
+                let raw_samples: Vec<crate::remaster::OriginalSample> = if from_stash {
+                    stash.iter().map(|n| n.native.clone()).collect()
+                } else {
+                    self.player
+                        .with_module(|m| crate::remaster::read_raw_samples(m))
+                        .unwrap_or_default()
                 };
+                if raw_samples.is_empty() {
+                    self.remaster_status =
+                        RemasterStatus::Failed("No module loaded or no eligible samples".into());
+                    return Task::none();
+                }
                 self.original_linear_slides = self
                     .player
                     .with_module(|m| m.linear_slides_enabled())
@@ -2580,28 +2607,50 @@ impl Quinlight {
                 }
                 let cleanup_settings = self.cleanup_settings;
 
-                // Build sample slots for original/engine mode toggling.
+                // Build sample slots for original/engine mode toggling. In the
+                // normalized path the live module already holds the 48 kHz master,
+                // so the slot baseline is that master at 48 kHz (every live swap
+                // stays rate-stable) and `native_rate` carries the source rate for
+                // display and engine eligibility. In the legacy fallback the
+                // baseline is the native sample at its own rate.
                 self.sample_slots = raw_samples
                     .iter()
-                    .map(|o| SampleSlot {
-                        index: o.index,
-                        original: o.data.clone(),
-                        original_rate: o.rate,
-                        original_channels: o.channels,
-                        original_length_frames: o.source_length_frames,
-                        loop_info: o.loop_info,
-                        engine_results: Vec::new(),
-                        quinlight_result: None,
-                        quinlight_original_fallback: false,
-                        mode: SampleMode::Original,
-                        failed: false,
-                        original_effects: Vec::new(),
-                        engines_done: 0,
-                        engines_total: self
-                            .remaster_engine
-                            .eligible_enabled_engine_count_for_rate(o.rate, &enabled_engines),
-                        muted: false,
-                        reference_48k: None,
+                    .enumerate()
+                    .map(|(i, o)| {
+                        let (original, original_rate, original_length_frames, loop_info, reference_48k) =
+                            if from_stash {
+                                let n = &stash[i];
+                                (
+                                    n.master_48k.clone(),
+                                    48_000,
+                                    n.master_len_frames,
+                                    n.loops_48k,
+                                    Some(n.master_48k.clone()),
+                                )
+                            } else {
+                                (o.data.clone(), o.rate, o.source_length_frames, o.loop_info, None)
+                            };
+                        SampleSlot {
+                            index: o.index,
+                            original,
+                            original_rate,
+                            native_rate: o.rate,
+                            original_channels: o.channels,
+                            original_length_frames,
+                            loop_info,
+                            engine_results: Vec::new(),
+                            quinlight_result: None,
+                            quinlight_original_fallback: false,
+                            mode: SampleMode::Original,
+                            failed: false,
+                            original_effects: Vec::new(),
+                            engines_done: 0,
+                            engines_total: self
+                                .remaster_engine
+                                .eligible_enabled_engine_count_for_rate(o.rate, &enabled_engines),
+                            muted: false,
+                            reference_48k,
+                        }
                     })
                     .collect();
 
@@ -4089,7 +4138,7 @@ impl Quinlight {
                             .size(9)
                             .color(theme::ACCENT_GREEN)
                             .into()
-                    } else if sl.original_rate >= 48_000 {
+                    } else if sl.is_native_hifi() {
                         container(text("Original").size(9).color(theme::PANEL_BG))
                             .padding([1, 2])
                             .style(|_theme| container::Style {
@@ -5179,6 +5228,7 @@ mod tests {
             index: 7,
             original: original_signal(),
             original_rate: 48_000,
+            native_rate: 48_000,
             original_channels: 1,
             original_length_frames: 4096,
             loop_info: crate::openmpt::SampleLoopInfo::none(),
@@ -5407,6 +5457,7 @@ mod tests {
             index: 1,
             original,
             original_rate,
+            native_rate: original_rate,
             original_channels: 1,
             original_length_frames: 4096,
             loop_info: crate::openmpt::SampleLoopInfo::none(),
@@ -6339,6 +6390,111 @@ mod tests {
             expected_param,
             "Reapplying the same engine mode should preserve a single forward XM offset scale",
         );
+    }
+
+    #[test]
+    fn normalized_slot_is_rate_stable_and_does_not_repatch_offsets() {
+        let data = std::fs::read(XM_FIXTURE).expect("read xm fixture");
+        let mut module = Module::from_memory(&data).expect("load xm fixture");
+
+        // Give sample 2 (index 1) real sub-48k content so normalization processes
+        // it (the fixture's own sample 2 may be empty), at a known native rate and
+        // with a clean (non-looped) state.
+        let sample_len = 1024usize;
+        let sine: Vec<f64> = (0..sample_len)
+            .map(|k| (2.0 * std::f64::consts::PI * (k % 64) as f64 / 64.0).sin())
+            .collect();
+        assert!(module.replace_sample_data_raw(1, &sine, sample_len as i64, 1, 16_000));
+        assert!(module.set_sample_loop_points(1, &crate::openmpt::SampleLoopInfo::none()));
+
+        let mapped_note = (1u8..=120)
+            .find(|&note| module.instrument_sample_for_note(0, note) == Some(1))
+            .expect("fixture should map a note to sample 2");
+        assert!(module.pattern_num_rows(0) > 0);
+        assert!(module.set_pattern_command(0, 0, 0, COMMAND_NOTE, mapped_note));
+        assert!(module.set_pattern_command(0, 0, 0, COMMAND_INSTRUMENT, 1));
+        assert!(module.set_pattern_command(0, 0, 0, COMMAND_EFFECT, CMD_OFFSET));
+        assert!(module.set_pattern_command(0, 0, 0, COMMAND_PARAMETER, 0x10));
+
+        let native_rate = module.sample_rate(1);
+        assert_eq!(native_rate, 16_000, "injected native rate for sample 2");
+
+        // Normalize: sample 2 -> 48 kHz, Oxx offset patched once (native -> 48k).
+        let stash = crate::remaster::normalize_samples_to_48k(&mut module);
+        let n = stash
+            .iter()
+            .find(|n| n.native.index == 1)
+            .cloned()
+            .expect("sample 2 should be normalized");
+        assert_eq!(module.sample_rate(1), 48_000);
+        let expected_param = ((0x10u32 * 48_000) / native_rate as u32).min(255) as u8;
+        assert_eq!(
+            module.get_pattern_command(0, 0, 0, COMMAND_PARAMETER),
+            expected_param,
+            "normalize should scale the Oxx offset exactly once",
+        );
+
+        // Build the normalized slot exactly as StartRemaster does: 48 kHz baseline,
+        // native rate preserved for display/eligibility.
+        let saved_effects = crate::remaster::save_effect_params(&module, 1);
+        let mut slot = SampleSlot {
+            index: 1,
+            original: n.master_48k.clone(),
+            original_rate: 48_000,
+            native_rate,
+            original_channels: n.native.channels,
+            original_length_frames: n.master_len_frames,
+            loop_info: n.loops_48k,
+            engine_results: Vec::new(),
+            quinlight_result: None,
+            quinlight_original_fallback: false,
+            mode: SampleMode::Original,
+            failed: false,
+            original_effects: saved_effects.clone(),
+            engines_done: 0,
+            engines_total: 1,
+            muted: false,
+            reference_48k: Some(n.master_48k.clone()),
+        };
+
+        // Register a 48 kHz engine result, then drive Engine -> Reference48k ->
+        // Original. The module is already 48 kHz, so every live swap must stay at
+        // 48 kHz and must NOT re-scale the (already-48k) offset.
+        let candidate = slot_result(&slot, "AudioSR", slot.original.clone());
+        let engine_mode = slot
+            .apply_candidate_result(&candidate, saved_effects)
+            .expect("candidate should activate an engine mode");
+
+        for mode in [engine_mode, SampleMode::Reference48k, SampleMode::Original] {
+            apply_sample_mode_to_slot_t(&mut module, &mut slot, mode)
+                .expect("mode should apply cleanly");
+            assert_eq!(
+                module.sample_rate(1),
+                48_000,
+                "sample must stay 48 kHz across every live swap",
+            );
+            assert_eq!(
+                module.get_pattern_command(0, 0, 0, COMMAND_PARAMETER),
+                expected_param,
+                "a 48k -> 48k swap must not re-scale the Oxx offset",
+            );
+        }
+    }
+
+    #[test]
+    fn hifi_badge_uses_native_not_baseline_rate() {
+        // A normalized sub-48k slot: baseline is 48 kHz but the source was 22050.
+        let mut slot = sample_slot();
+        slot.native_rate = 22_050;
+        slot.original_rate = 48_000;
+        assert!(
+            !slot.is_native_hifi(),
+            "a normalized sub-48k sample must NOT show the hi-fi 'Original' badge",
+        );
+
+        // A genuinely hi-fi sample (source already >= 48 kHz).
+        slot.native_rate = 48_000;
+        assert!(slot.is_native_hifi());
     }
 
     #[test]

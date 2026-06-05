@@ -39,6 +39,7 @@ pub struct PreparedModuleLoad {
     file_data: Vec<u8>,
     module: Module,
     file_size_bytes: u64,
+    sample_stash: Vec<crate::remaster::NormalizedSample>,
 }
 
 impl std::fmt::Debug for PreparedModuleLoad {
@@ -74,11 +75,25 @@ pub fn prepare_module_load_from_bytes(file_data: Vec<u8>) -> Result<PreparedModu
         ));
     }
 
-    let module = Module::from_memory(&file_data).map_err(|e| format!("Load failed: {e}"))?;
+    let mut module = Module::from_memory(&file_data).map_err(|e| format!("Load failed: {e}"))?;
+    // Normalize every sub-48 kHz sample up to 48 kHz (band-limited sinc) at load
+    // time so that, during an interactive remaster, swapping an AI-upscaled
+    // (48 kHz) sample into the live module is a 48k -> 48k replacement with no
+    // rate change — eliminating the per-voice pitch/timing tick. The pristine
+    // native samples are stashed and later fed to the AI unchanged. This runs
+    // here (off the UI thread and off the audio lock) because `prepare` is
+    // dispatched via `Task::perform`. Skippable via QUINLIGHT_NO_LOAD_NORMALIZE
+    // for A/B debugging (the GUI then falls back to reading native samples).
+    let sample_stash = if std::env::var_os("QUINLIGHT_NO_LOAD_NORMALIZE").is_none() {
+        crate::remaster::normalize_samples_to_48k(&mut module)
+    } else {
+        Vec::new()
+    };
     Ok(PreparedModuleLoad {
         file_data,
         module,
         file_size_bytes,
+        sample_stash,
     })
 }
 
@@ -142,6 +157,11 @@ struct PlayerInner {
     hrtf_mix: i32,
     hrtf_processor: Option<crate::hrtf::HrtfProcessor>,
     hrtf_dry_buf: Vec<f64>,
+    /// Pristine native (< 48 kHz) samples captured at load, each paired with the
+    /// 48 kHz master now resident in the module. The GUI remaster sources its
+    /// originals from here so the AI sees native input while live swaps stay at
+    /// 48 kHz. Replaced on every load; empty when normalization is disabled.
+    sample_stash: Vec<crate::remaster::NormalizedSample>,
 }
 
 impl PlayerInner {
@@ -165,6 +185,7 @@ impl PlayerInner {
             hrtf_mix: 33,
             hrtf_processor: None,
             hrtf_dry_buf: Vec::new(),
+            sample_stash: Vec::new(),
         }
     }
 }
@@ -178,6 +199,7 @@ fn install_prepared_load(
         file_data,
         mut module,
         file_size_bytes: _,
+        sample_stash,
     } = prepared;
     module.set_repeat_count(-1);
     apply_module_processing_settings(
@@ -189,6 +211,7 @@ fn install_prepared_load(
     );
     player.file_data = Some(file_data);
     player.module = Some(module);
+    player.sample_stash = sample_stash;
     player.status = PlaybackStatus::Playing;
     player.load_generation += 1;
 
@@ -832,6 +855,15 @@ impl Player {
     {
         let mut player = self.inner.lock().unwrap();
         player.module.as_mut().map(f)
+    }
+
+    /// Snapshot of the load-time normalization stash: the pristine native
+    /// (< 48 kHz) samples paired with their 48 kHz masters. The GUI remaster
+    /// sources its originals from here (AI sees native; live module is 48 kHz).
+    /// Empty when normalization is disabled or the module has no sub-48 kHz
+    /// samples — callers fall back to reading native samples in that case.
+    pub fn sample_stash(&self) -> Vec<crate::remaster::NormalizedSample> {
+        self.inner.lock().unwrap().sample_stash.clone()
     }
 
     pub fn install_prepared_load_with_settings(

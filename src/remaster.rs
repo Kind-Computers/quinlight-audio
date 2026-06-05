@@ -6763,7 +6763,6 @@ pub fn clear_cache_for_module(module: &mut Module) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResampleBoundaryMode {
     OneShot,
-    #[allow(dead_code)] // Constructed only in tests; matched in production resample_audio()
     LoopAware,
 }
 
@@ -7286,6 +7285,7 @@ pub(crate) fn apply_sample_replacement(
 }
 
 /// Original sample data preserved for toggle support.
+#[derive(Clone)]
 pub struct OriginalSample {
     pub index: i32,
     pub data: Vec<f64>,
@@ -7300,6 +7300,23 @@ pub struct OriginalSample {
     pub looped: bool,
     pub loop_info: SampleLoopInfo,
     pub name: String,
+}
+
+/// A sub-48 kHz sample captured at interactive load time: its pristine native
+/// PCM/rate/loops (fed to the AI on remaster) plus the band-limited 48 kHz
+/// "master" that now lives in the module, so every live sample swap stays at a
+/// constant 48 kHz and never causes a playback tick from a rate change.
+#[derive(Clone)]
+pub struct NormalizedSample {
+    /// Pristine native sample (rate < 48 kHz). Feeds the AI engines unchanged.
+    pub native: OriginalSample,
+    /// Band-limited sinc upsample of `native` to 48 kHz, DC-stripped. This is
+    /// what now resides in the live module for this sample index.
+    pub master_48k: Vec<f64>,
+    /// Frame count of `master_48k` (= master_48k.len() / channels).
+    pub master_len_frames: i64,
+    /// `native.loop_info` rescaled to 48 kHz and clamped to `master_len_frames`.
+    pub loops_48k: SampleLoopInfo,
 }
 
 /// Count samples that already meet or exceed the 48 kHz target rate.
@@ -7353,6 +7370,102 @@ pub fn read_raw_samples(module: &mut Module) -> Vec<OriginalSample> {
         }
     }
     originals
+}
+
+/// Normalize every sub-48 kHz sample in an (interactive) module up to 48 kHz
+/// using a band-limited sinc resample, rescaling each sample's loop points and
+/// `Oxx`/`SAx` offset effects, then writing the result back into the live module.
+///
+/// Returns a stash of the pristine native samples, each paired with its 48 kHz
+/// master. A later remaster feeds the AI from `native` (identical AI behavior),
+/// while every live sample swap stays at a constant 48 kHz — so replacing a
+/// sample during live playback no longer changes the per-voice step and cannot
+/// tick from a rate change. Samples already at >= 48 kHz are left untouched
+/// (never downsampled); `read_raw_samples` already filters them out.
+pub fn normalize_samples_to_48k(module: &mut Module) -> Vec<NormalizedSample> {
+    let natives = read_raw_samples(module);
+    let mut stash = Vec::with_capacity(natives.len());
+
+    for native in natives {
+        let ch = native.channels.max(1) as usize;
+        let rate = native.rate.max(1) as u32;
+
+        // DC-strip up front so the 48 kHz master matches the zero-mean-per-channel
+        // invariant the AI path enforces (mirrors extract_sample_jobs / the
+        // reference builder).
+        let mut dc = native.data.clone();
+        remove_dc_per_channel(&mut dc, ch);
+
+        // Loop-aware resample for looped samples keeps the loop seam continuous
+        // (no boundary tick during sustained playback); one-shot for non-looped
+        // reuses the shared 48 kHz reference builder.
+        let master = if native.looped {
+            match resample_audio(&dc, rate, 48_000, ch, ResampleBoundaryMode::LoopAware) {
+                Ok(mut d) => {
+                    remove_dc_per_channel(&mut d, ch);
+                    d
+                }
+                Err(e) => {
+                    eprintln!(
+                        "normalize_samples_to_48k: skipping sample {} (loop-aware resample failed: {e})",
+                        native.index
+                    );
+                    continue;
+                }
+            }
+        } else {
+            match build_current_pipeline_reference_48k(&dc, rate, ch) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!(
+                        "normalize_samples_to_48k: skipping sample {} (resample failed: {e})",
+                        native.index
+                    );
+                    continue;
+                }
+            }
+        };
+
+        if master.is_empty() {
+            continue;
+        }
+
+        let len = sample_frame_count(&master, ch);
+        let loops_48k = SampleLoopInfo {
+            normal: clamp_loop_region(
+                scaled_loop_region(native.loop_info.normal, rate, 48_000),
+                len,
+            ),
+            sustain: clamp_loop_region(
+                scaled_loop_region(native.loop_info.sustain, rate, 48_000),
+                len,
+            ),
+        };
+
+        // Write the 48 kHz master into the live module and reconcile metadata.
+        if !module.replace_sample_data_raw(native.index, &master, len, native.channels, 48_000) {
+            eprintln!(
+                "normalize_samples_to_48k: replace_sample_data_raw failed for sample {}",
+                native.index
+            );
+            continue;
+        }
+        module.set_sample_loop_points(native.index, &loops_48k);
+        // Patch Oxx/SAx sample-offset effects once here, native -> 48 kHz. After
+        // this the module's offset space is 48 kHz, so later 48k -> 48k swaps in
+        // apply_sample_mode_to_slot never re-patch (patch_sample_offsets is a
+        // no-op when old == new).
+        patch_sample_offsets(module, native.index, native.rate, 48_000);
+
+        stash.push(NormalizedSample {
+            native,
+            master_48k: master,
+            master_len_frames: len,
+            loops_48k,
+        });
+    }
+
+    stash
 }
 
 /// Process raw samples into jobs ready for AI engines: resample to 48kHz, pad, write WAVs.
@@ -13492,6 +13605,162 @@ mod tests {
             "source-guided SINC should not noticeably increase the in-loop spike for \
              2ND_SKAV sample 9 (filtered={filtered_inner_jump}, guided={guided_inner_jump}, \
              tol={inner_jump_tol})",
+        );
+    }
+
+    #[test]
+    fn normalize_upscales_sub48k_samples_to_48k_preserving_duration() {
+        let data = std::fs::read(BASIC_FIXTURE).expect("fixture should load");
+        let mut module = Module::from_memory(&data).expect("fixture module should load");
+
+        // Native (sub-48k) samples before normalization.
+        let before = read_raw_samples(&mut module);
+        assert!(
+            !before.is_empty(),
+            "fixture should have at least one sub-48k sample to normalize"
+        );
+
+        let stash = normalize_samples_to_48k(&mut module);
+        assert_eq!(
+            stash.len(),
+            before.len(),
+            "every sub-48k sample should be normalized (none skipped)"
+        );
+
+        for b in &before {
+            assert!(b.rate < 48_000, "precondition: native sample is sub-48k");
+            // The live module now reports 48 kHz for this sample...
+            assert_eq!(
+                module.sample_rate(b.index),
+                48_000,
+                "sample {} should be 48 kHz after normalization",
+                b.index
+            );
+            // ...with the same musical duration (length scales by 48000/native).
+            let expected_len =
+                scaled_frame_count(b.source_length_frames as usize, b.rate as u32, 48_000) as i64;
+            let actual_len = module.sample_length_frames(b.index);
+            assert!(
+                (actual_len - expected_len).abs() <= 2,
+                "sample {} length {} should match scaled {} (±2)",
+                b.index,
+                actual_len,
+                expected_len
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_stash_preserves_native_input_for_ai() {
+        let data = std::fs::read(BASIC_FIXTURE).expect("fixture should load");
+        let mut module = Module::from_memory(&data).expect("fixture module should load");
+
+        let before = read_raw_samples(&mut module);
+        assert!(!before.is_empty());
+        let stash = normalize_samples_to_48k(&mut module);
+
+        for b in &before {
+            let n = stash
+                .iter()
+                .find(|n| n.native.index == b.index)
+                .expect("each native sample should have a stash entry");
+            // The stash keeps the pristine native rate and PCM so the AI engines
+            // receive exactly what they did before this feature.
+            assert_eq!(n.native.rate, b.rate, "stash must keep the native rate");
+            assert!(n.native.rate < 48_000);
+            assert_eq!(
+                n.native.data, b.data,
+                "stash native PCM must be the pristine sample"
+            );
+            // The 48 kHz master is the band-limited upsample now in the module.
+            assert_eq!(
+                n.master_len_frames,
+                sample_frame_count(&n.master_48k, n.native.channels.max(1) as usize)
+            );
+            assert!(
+                n.master_len_frames > n.native.source_length_frames,
+                "upsampling a sub-48k sample yields more frames"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_loopaware_keeps_loop_seam_click_free() {
+        let data = std::fs::read(BASIC_FIXTURE).expect("fixture should load");
+        let mut module = Module::from_memory(&data).expect("fixture module should load");
+        assert!(module.num_samples() > 0);
+
+        // Inject a perfectly periodic, seamlessly-looping sine at a sub-48k rate.
+        let period = 100usize;
+        let len = period * 30; // 3000 frames, mono, 30 whole periods
+        let sine: Vec<f64> = (0..len)
+            .map(|k| (2.0 * std::f64::consts::PI * (k % period) as f64 / period as f64).sin())
+            .collect();
+        let idx = 0i32;
+        assert!(
+            module.replace_sample_data_raw(idx, &sine, len as i64, 1, 16_000),
+            "inject looped sample"
+        );
+        assert!(module.set_sample_loop_points(idx, &SampleLoopInfo::forward(0, len as i64)));
+
+        let stash = normalize_samples_to_48k(&mut module);
+        let n = stash
+            .iter()
+            .find(|n| n.native.index == idx)
+            .expect("injected sample should be normalized");
+        assert!(n.loops_48k.normal.has_loop(), "loop should survive at 48 kHz");
+
+        // Loop-aware resampling keeps the loop seam continuous: the wrap jump from
+        // the last in-loop frame back to the loop start must be no larger than a
+        // normal adjacent step inside the loop (i.e. no click). A naive one-shot
+        // resample would leave an edge discontinuity here.
+        let master = &n.master_48k;
+        let s = n.loops_48k.normal.start_frames as usize;
+        let e = n.loops_48k.normal.end_frames as usize;
+        assert!(e > s + 1 && e <= master.len());
+        let max_in_loop_step = (s..e - 1)
+            .map(|i| (master[i + 1] - master[i]).abs())
+            .fold(0.0f64, f64::max);
+        let wrap_jump = (master[s] - master[e - 1]).abs();
+        assert!(
+            wrap_jump <= 2.0 * max_in_loop_step + 1e-6,
+            "loop seam should be click-free: wrap_jump={wrap_jump}, max_in_loop_step={max_in_loop_step}"
+        );
+    }
+
+    #[test]
+    fn normalize_clamps_48k_loops_within_master_length() {
+        let data = std::fs::read(BASIC_FIXTURE).expect("fixture should load");
+        let mut module = Module::from_memory(&data).expect("fixture module should load");
+        assert!(module.num_samples() > 0);
+
+        // Inject a looped sample whose loop end sits at the very last frame.
+        let len = 2000usize;
+        let sine: Vec<f64> = (0..len)
+            .map(|k| (2.0 * std::f64::consts::PI * (k % 50) as f64 / 50.0).sin())
+            .collect();
+        let idx = 0i32;
+        assert!(module.replace_sample_data_raw(idx, &sine, len as i64, 1, 16_000));
+        assert!(module.set_sample_loop_points(idx, &SampleLoopInfo::forward(500, len as i64)));
+
+        let stash = normalize_samples_to_48k(&mut module);
+        let n = stash
+            .iter()
+            .find(|n| n.native.index == idx)
+            .expect("injected sample should be normalized");
+
+        let lp = n.loops_48k.normal;
+        assert_eq!(lp.mode, SampleLoopMode::Forward, "loop mode preserved");
+        assert!(lp.start_frames < lp.end_frames);
+        assert!(
+            lp.end_frames <= n.master_len_frames,
+            "scaled loop end {} must be clamped within master length {}",
+            lp.end_frames,
+            n.master_len_frames
+        );
+        assert!(
+            module.sample_length_frames(idx) >= lp.end_frames,
+            "module's stored loop end must be in range"
         );
     }
 
