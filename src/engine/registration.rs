@@ -14,11 +14,11 @@
 //! 2. For every AI engine, compute a dense 1D optical-flow field mapping the
 //!    master's samples to that engine's, then linearly warp the engine onto
 //!    the master's grid (`dense_lk_1d` + `linear_warp_1d`).
-//! 3. Per-sample **median** (default) or **mean** across the warped engine
+//! 3. Per-sample **mean** or **median** reduction across the warped engine
 //!    stack.
 //!
-//! The **master** is the warp/flow target (and is never itself warped). In the
-//! default **median** reduction it is *also* a full member of the stack — a
+//! The **master** is the warp/flow target (and is never itself warped). In
+//! **median** reduction it is *also* a full member of the stack — a
 //! self-regulating one: band-limited to the source Nyquist, it sits among the
 //! engines in the source band (anchoring/guiding the consensus and helping
 //! outvote an in-band hallucination) but is a low outlier in the AI-extended

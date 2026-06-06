@@ -1280,11 +1280,13 @@ pub(crate) fn registration_default_active() -> bool {
     !QUINLIGHT_USE_SPECTRAL_CONSENSUS.load(Ordering::Relaxed)
 }
 
-/// Reduction mode for the registration consensus: `0` = median (default,
-/// outlier-robust — rejects lone-engine hallucinations), `1` = mean.
-static QUINLIGHT_REGISTRATION_MODE: AtomicU8 = AtomicU8::new(0);
+/// Reduction mode for the registration consensus: `1` = mean (the shipped
+/// default — smoother on agreed content; leans on the 0.9 score gate to keep
+/// outliers out), `0` = median (outlier-robust, rejects a lone-engine
+/// hallucination; the only mode in which the sinc master joins the reduction).
+static QUINLIGHT_REGISTRATION_MODE: AtomicU8 = AtomicU8::new(1);
 
-/// Select the registration reducer: `true` = mean, `false` (default) = median.
+/// Select the registration reducer: `true` (default) = mean, `false` = median.
 pub fn set_quinlight_registration_mean(mean: bool) {
     QUINLIGHT_REGISTRATION_MODE.store(u8::from(mean), Ordering::Relaxed);
 }
@@ -1296,21 +1298,70 @@ fn registration_reduction_mode() -> crate::engine::ReductionMode {
     }
 }
 
-/// When the registration consensus is active, the frequency-domain source
-/// blend (`apply_source_frequency_blend_interleaved`) is skipped by default:
-/// the engines are already aligned to the sinc master, whose sub-Nyquist band
-/// *is* the source, so the blend's STFT pass is redundant (and the only
-/// remaining frequency-domain ringing source). `true` re-enables it for A/B.
-/// The blend always runs on the legacy spectral path.
-static QUINLIGHT_ENABLE_SOURCE_BLEND_REGISTRATION: AtomicBool = AtomicBool::new(false);
+/// The frequency-domain source blend (`apply_source_frequency_blend_interleaved`)
+/// runs on the registration path **by default**: it phase-locks the consensus
+/// output to the original source across the low band (100% source at DC → 0% at
+/// the source Nyquist), leaving everything above the source Nyquist (the
+/// AI-extended highs) untouched. Confined to the low/source band, it tightens
+/// loop-seam bass continuity. `false` disables it for A/B (the `--no-source-blend`
+/// CLI rollback). The blend always runs on the legacy spectral path regardless.
+static QUINLIGHT_ENABLE_SOURCE_BLEND_REGISTRATION: AtomicBool = AtomicBool::new(true);
 
-/// Re-enable the source-frequency blend on the registration path (default off).
+/// Toggle the source-frequency blend on the registration path (default on).
 pub fn set_quinlight_enable_source_blend_registration(value: bool) {
     QUINLIGHT_ENABLE_SOURCE_BLEND_REGISTRATION.store(value, Ordering::Relaxed);
 }
 
 fn source_blend_enabled_for_registration() -> bool {
     QUINLIGHT_ENABLE_SOURCE_BLEND_REGISTRATION.load(Ordering::Relaxed)
+}
+
+/// Default score floor for the registration path: an engine whose
+/// spectral-correlation score is below this is dropped before the median
+/// reduction. Matches the spectral path's floor (0.9,
+/// `QUINLIGHT_DEFAULT_USABLE_SCORE_FLOOR`) so the registration consensus gates
+/// AI upscales just as strictly as the frequency-consensus path — only engines
+/// that faithfully reproduce the original in-band spectrum (score 0.9+) reach
+/// the median; anything below is rejected, including the catastrophic upscales
+/// that poison the result when only two engines remain. Runtime-tunable via
+/// `--registration-floor`; `--no-registration-gate` bypasses it entirely.
+pub const QUINLIGHT_DEFAULT_REGISTRATION_CATASTROPHE_FLOOR: f64 =
+    QUINLIGHT_DEFAULT_USABLE_SCORE_FLOOR;
+
+/// Whether the registration catastrophe score gate is active (default on).
+/// `false` restores the legacy behavior of blending every scored engine — the
+/// `--no-registration-gate` A/B rollback.
+static QUINLIGHT_REGISTRATION_SCORE_GATE: AtomicBool = AtomicBool::new(true);
+
+/// Toggle the registration catastrophe score gate (default on).
+pub fn set_quinlight_registration_score_gate(value: bool) {
+    QUINLIGHT_REGISTRATION_SCORE_GATE.store(value, Ordering::Relaxed);
+}
+
+fn registration_score_gate_enabled() -> bool {
+    QUINLIGHT_REGISTRATION_SCORE_GATE.load(Ordering::Relaxed)
+}
+
+// Runtime-configurable registration catastrophe floor, stored as f64 bits for
+// lock-free atomic mutation. Defaults to
+// `QUINLIGHT_DEFAULT_REGISTRATION_CATASTROPHE_FLOOR`.
+static QUINLIGHT_REGISTRATION_CATASTROPHE_FLOOR_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(QUINLIGHT_DEFAULT_REGISTRATION_CATASTROPHE_FLOOR.to_bits());
+
+/// Effective registration catastrophe floor for this process.
+pub fn quinlight_registration_catastrophe_floor() -> f64 {
+    f64::from_bits(
+        QUINLIGHT_REGISTRATION_CATASTROPHE_FLOOR_BITS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Override the registration catastrophe floor for the rest of this process
+/// (clamped to `[0.0, 1.0]`). Called from the CLI
+/// (`quinlight upsample --registration-floor 0.6`).
+pub fn set_quinlight_registration_catastrophe_floor(value: f64) {
+    let clamped = value.clamp(0.0, 1.0);
+    QUINLIGHT_REGISTRATION_CATASTROPHE_FLOOR_BITS
+        .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Test-only serialization for the process-global consensus-mode toggles.
@@ -1360,8 +1411,12 @@ impl ConsensusModeGuard {
 impl Drop for ConsensusModeGuard {
     fn drop(&mut self) {
         set_quinlight_use_spectral_consensus(false);
-        set_quinlight_registration_mean(false);
-        set_quinlight_enable_source_blend_registration(false);
+        // Track the static defaults (reducer mean, blend on, gate on) so a
+        // guarded test can't leak a non-default into the rest of the suite.
+        set_quinlight_registration_mean(true);
+        set_quinlight_enable_source_blend_registration(true);
+        set_quinlight_registration_score_gate(true);
+        set_quinlight_registration_catastrophe_floor(QUINLIGHT_DEFAULT_REGISTRATION_CATASTROPHE_FLOOR);
     }
 }
 
@@ -1499,8 +1554,11 @@ fn spectral_intersection_blend(
         let refs: Vec<&[f64]> = per_engine.iter().map(|v| v.as_slice()).collect();
         let intersected = if use_registration {
             // Deinterleave the sinc master for this channel (same truncation
-            // rule as the engines). It is the warp/flow TARGET only — never a
-            // member of the median stack.
+            // rule as the engines). It is the dense-LK warp/flow TARGET for
+            // every engine and ALSO joins the reduction as an unwarped median
+            // guidance vote (median mode, default on) — voting in the source
+            // band and discarded as a low outlier in the AI-extended highs.
+            // See `registration_consensus_1d`.
             let master_ch: Vec<f64> = master
                 .unwrap()
                 .iter()
@@ -1523,10 +1581,9 @@ fn spectral_intersection_blend(
         }
     }
 
-    // The source-frequency blend is the other STFT pass. On the registration
-    // path it is redundant (engines are already aligned to the sinc master,
-    // whose sub-Nyquist band is the source) and is skipped by default; it
-    // always runs on the spectral path.
+    // The source-frequency blend is the other STFT pass. It runs on the
+    // registration path by default (low-band phase-lock to the source;
+    // `--no-source-blend` opts out) and always runs on the spectral path.
     let run_source_blend =
         !use_registration || source_blend_enabled_for_registration();
     if run_source_blend
@@ -5007,28 +5064,35 @@ fn select_quinlight_mix_internal(
 
     let floor = quinlight_usable_score_floor();
 
-    // In registered mode the consensus is the dense-LK median of engines
-    // warped to the sinc master — robust enough to blend "very bad" upscales
-    // with "very good" ones — so the per-engine score floor is bypassed and
-    // every scored engine contributes. The floor (and its rejection logging)
-    // still applies on the legacy spectral path, which can't survive a bad
-    // engine in the blend.
+    // Both consensus paths gate engines on the same aggressive 0.9 floor: the
+    // spectral path because one bad engine poisons the frequency-domain blend,
+    // the registration path because — even with a robust dense-LK median — a
+    // low-correlation upscale drags the result toward garbage (worst with only
+    // two engines, where the median IS their mean). `gate_floor` is the
+    // effective floor for whichever path is active, or `None` when the
+    // registration gate is disabled (`--no-registration-gate`) — then every
+    // scored engine is kept.
     let registered = registration_default_active() && scoring_reference_48k.is_some();
 
-    let usable: Vec<ScoredEngine<'_>> = if registered {
-        scored.clone()
+    let gate_floor: Option<f64> = if registered {
+        registration_score_gate_enabled().then(quinlight_registration_catastrophe_floor)
     } else {
-        scored
-            .iter()
-            .filter(|engine| engine.raw_score >= floor)
-            .cloned()
-            .collect()
+        Some(floor)
     };
 
-    if !registered {
+    let usable: Vec<ScoredEngine<'_>> = match gate_floor {
+        Some(f) => scored
+            .iter()
+            .filter(|engine| engine.raw_score >= f)
+            .cloned()
+            .collect(),
+        None => scored.clone(),
+    };
+
+    if let Some(f) = gate_floor {
         let rejected: Vec<&ScoredEngine<'_>> = scored
             .iter()
-            .filter(|engine| engine.raw_score < floor)
+            .filter(|engine| engine.raw_score < f)
             .collect();
         if !rejected.is_empty() {
             let details = rejected
@@ -5036,7 +5100,11 @@ fn select_quinlight_mix_internal(
                 .map(|e| format!("{} (score {:.4})", e.name, e.raw_score))
                 .collect::<Vec<_>>()
                 .join(", ");
-            eprintln!("  Quinlight: below floor {floor:.2} — {details}",);
+            if registered {
+                eprintln!("  Quinlight: registration catastrophe floor {f:.2} — dropped {details}",);
+            } else {
+                eprintln!("  Quinlight: below floor {f:.2} — {details}",);
+            }
         }
     }
 
@@ -5054,7 +5122,7 @@ fn select_quinlight_mix_internal(
             } else {
                 eprintln!(
                     "  Quinlight: no usable AI results (floor {:.2}); keeping original sample",
-                    floor,
+                    gate_floor.unwrap_or(floor),
                 );
             }
             let fallback_48k = reference.fallback_48k.unwrap_or(&[]);
@@ -9937,6 +10005,10 @@ mod tests {
     #[test]
     fn registration_master_in_median_preserves_engine_hf() {
         let _mode = ConsensusModeGuard::registration();
+        // Exercises MEDIAN behavior specifically — the sinc master as a
+        // median-only guidance vote that the median rejects in the HF band.
+        // Mean is now the default reducer (master excluded), so pin median.
+        set_quinlight_registration_mean(false);
         let n = 8192usize;
         let sr = 48_000.0;
         // Master: a band-limited 220 Hz tone (no HF) — the sinc-reference analogue.
@@ -9970,13 +10042,18 @@ mod tests {
         );
     }
 
-    /// Registered mode blends "very bad" upscales with good ones rather than
-    /// dropping them: with the score floor bypassed, a deliberately
-    /// uncorrelated engine still contributes (3 contributors), and the median
-    /// of the two agreeing engines rejects its out-of-band content.
+    /// With the registration catastrophe gate **disabled** (`--no-registration-gate`)
+    /// the legacy behavior holds: a deliberately uncorrelated engine still
+    /// contributes (3 contributors), and the median of the two agreeing engines
+    /// rejects its out-of-band content.
     #[test]
-    fn registration_blends_low_score_engine_without_dropping_it() {
+    fn registration_score_gate_disabled_blends_all_engines() {
         let _mode = ConsensusModeGuard::registration();
+        set_quinlight_registration_score_gate(false);
+        // The out-of-band rejection asserted below is the MEDIAN's doing (mean
+        // only attenuates by 1/N). Mean is now the default reducer, so pin
+        // median to keep testing that rejection.
+        set_quinlight_registration_mean(false);
         let work_dir = tempfile::tempdir().expect("temp work");
         let job = sample_job(work_dir.path());
         let reference_48k = reference_48k_from_job(&job).expect("reference should resample");
@@ -9987,8 +10064,8 @@ mod tests {
             .enumerate()
             .map(|(i, &s)| s + 0.01 * (i as f64 * 0.31).sin())
             .collect();
-        // A "very bad" upscale: an uncorrelated 5 kHz tone that the legacy
-        // spectral floor (0.9) would drop.
+        // A "very bad" upscale: an uncorrelated 5 kHz tone the catastrophe gate
+        // would normally drop — but the gate is off here.
         let bad: Vec<f64> = (0..frames)
             .map(|i| 0.5 * (2.0 * std::f64::consts::PI * 5000.0 * i as f64 / 48_000.0).sin())
             .collect();
@@ -10002,7 +10079,7 @@ mod tests {
         assert_eq!(
             mix.contributors.len(),
             3,
-            "all engines must be blended — none dropped by a score floor",
+            "with the gate disabled, all engines must be blended — none dropped",
         );
         assert!(
             mix.data.iter().all(|x| x.is_finite()),
@@ -10014,6 +10091,94 @@ mod tests {
             shared > bad_band,
             "the two agreeing engines should win the median over the lone bad engine \
              (shared={shared:.4}, bad={bad_band:.4})",
+        );
+    }
+
+    /// Registration score gate (default on): a catastrophically-bad engine
+    /// (an uncorrelated 5 kHz tone, score well below the 0.9 floor) is dropped
+    /// before the reduction, so only the two agreeing engines contribute and
+    /// the bad band never enters the mix.
+    #[test]
+    fn registration_score_gate_drops_catastrophic_engine() {
+        let _mode = ConsensusModeGuard::registration();
+        let work_dir = tempfile::tempdir().expect("temp work");
+        let job = sample_job(work_dir.path());
+        let reference_48k = reference_48k_from_job(&job).expect("reference should resample");
+        let frames = reference_48k.len();
+        let good_a = reference_48k.clone();
+        let good_b: Vec<f64> = reference_48k
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| s + 0.01 * (i as f64 * 0.31).sin())
+            .collect();
+        let bad: Vec<f64> = (0..frames)
+            .map(|i| 0.5 * (2.0 * std::f64::consts::PI * 5000.0 * i as f64 / 48_000.0).sin())
+            .collect();
+        let engines = vec![
+            ("AudioSR".to_string(), good_a, frames as i64, 1),
+            ("LavaSR".to_string(), good_b, frames as i64, 1),
+            ("FLowHigh".to_string(), bad, frames as i64, 1),
+        ];
+        let mix = select_quinlight_mix(&reference_48k, 1, job.rate as u32, &engines, 3, false);
+        assert!(mix.used_registration, "registration path should run");
+        assert_eq!(
+            mix.contributors.len(),
+            2,
+            "the catastrophic engine must be dropped by the registration score gate",
+        );
+        assert!(
+            mix.contributors.iter().all(|c| c.name != "FLowHigh"),
+            "the dropped engine must not be a contributor: {:?}",
+            mix.contributors.iter().map(|c| &c.name).collect::<Vec<_>>(),
+        );
+        let shared = frequency_component_amplitude(&mix.data, 1, 48_000, 220.0);
+        let bad_band = frequency_component_amplitude(&mix.data, 1, 48_000, 5000.0);
+        assert!(
+            shared > bad_band,
+            "dropping the bad engine should keep the 5 kHz band out of the mix \
+             (shared={shared:.4}, bad={bad_band:.4})",
+        );
+    }
+
+    /// The registration consensus ships with the mean reducer as its default
+    /// (chosen by listening); median remains available via `--reduce median`.
+    #[test]
+    fn registration_reducer_defaults_to_mean() {
+        let _mode = ConsensusModeGuard::registration();
+        assert_eq!(
+            registration_reduction_mode(),
+            crate::engine::ReductionMode::Mean,
+            "the registration consensus must default to the mean reducer",
+        );
+    }
+
+    /// The registration catastrophe floor is tunable via the float knob: raising
+    /// it to 1.0 rejects even the near-perfect engines (at most an exact match
+    /// could pass, and one survivor is below the K>=2 consensus minimum), so the
+    /// sample keeps its original instead of running the registration consensus.
+    #[test]
+    fn registration_catastrophe_floor_is_tunable() {
+        let _mode = ConsensusModeGuard::registration();
+        set_quinlight_registration_catastrophe_floor(1.0);
+        let work_dir = tempfile::tempdir().expect("temp work");
+        let job = sample_job(work_dir.path());
+        let reference_48k = reference_48k_from_job(&job).expect("reference should resample");
+        let frames = reference_48k.len();
+        let good_a = reference_48k.clone();
+        let good_b: Vec<f64> = reference_48k
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| s + 0.01 * (i as f64 * 0.31).sin())
+            .collect();
+        let engines = vec![
+            ("AudioSR".to_string(), good_a, frames as i64, 1),
+            ("LavaSR".to_string(), good_b, frames as i64, 1),
+        ];
+        let mix = select_quinlight_mix(&reference_48k, 1, job.rate as u32, &engines, 2, false);
+        assert!(
+            !mix.used_registration,
+            "a 1.0 catastrophe floor rejects the near-perfect engines, leaving \
+             fewer than 2 survivors — the sample must keep its original",
         );
     }
 
@@ -10080,6 +10245,111 @@ mod tests {
         assert_eq!(
             result.sample_rate_hz, 48_000,
             "should return the 48 kHz consensus, not the original fallback",
+        );
+    }
+
+    /// Registration path runs the source-frequency blend by default: with a
+    /// native source carrying a sub-Nyquist component the engines lack, the
+    /// default mix injects it into the low band, while disabling the blend
+    /// (`--no-source-blend`) leaves it out — and content above the source
+    /// Nyquist is untouched either way.
+    #[test]
+    fn registration_runs_source_blend_by_default() {
+        let _mode = ConsensusModeGuard::registration();
+        // Isolate the blend from the score gate: these engines deliberately OMIT
+        // the source's 1 kHz in-band component (so the blend has something to
+        // inject), which legitimately scores ~0.78 in-band — below the 0.9 gate.
+        // The gate is orthogonal to what this test verifies, so disable it here.
+        set_quinlight_registration_score_gate(false);
+        let native_rate = 16_000u32;
+        let native_frames = 4096usize;
+        let out_frames = scaled_frame_count(native_frames, native_rate, 48_000);
+
+        // Native source: a 300 Hz fundamental the engines share PLUS a 1 kHz
+        // component (well below the 8 kHz source Nyquist) the engines lack — so
+        // a running blend must inject it into the low band of the output.
+        let source_native: Vec<f64> = (0..native_frames)
+            .map(|i| {
+                let t = i as f64 / native_rate as f64;
+                0.5 * (2.0 * std::f64::consts::PI * 300.0 * t).sin()
+                    + 0.4 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin()
+            })
+            .collect();
+        // 48 kHz warp target (sinc-master analogue): only the shared 300 Hz.
+        let reference_48k: Vec<f64> = (0..out_frames)
+            .map(|i| {
+                let t = i as f64 / 48_000.0;
+                0.5 * (2.0 * std::f64::consts::PI * 300.0 * t).sin()
+            })
+            .collect();
+        // Two agreeing engines: shared 300 Hz + a 12 kHz band above the source
+        // Nyquist that the source lacks (must pass through the blend untouched).
+        let engine: Vec<f64> = (0..out_frames)
+            .map(|i| {
+                let t = i as f64 / 48_000.0;
+                0.5 * (2.0 * std::f64::consts::PI * 300.0 * t).sin()
+                    + 0.4 * (2.0 * std::f64::consts::PI * 12_000.0 * t).sin()
+            })
+            .collect();
+        let engines = vec![
+            ("AudioSR".to_string(), engine.clone(), out_frames as i64, 1),
+            ("LavaSR".to_string(), engine.clone(), out_frames as i64, 1),
+        ];
+        let target_rms = rms_or_zero(&source_native);
+
+        // Default (blend on — the new registration default).
+        let on = select_quinlight_mix_internal(
+            1,
+            native_rate,
+            QuinlightSelectionReference {
+                target_rms,
+                source_native: Some(&source_native),
+                score_48k: Some(&reference_48k),
+                fallback_48k: Some(&reference_48k),
+            },
+            &engines,
+            engines.len(),
+            false,
+        );
+        assert!(on.used_registration, "registration path should run (blend on)");
+
+        // Explicitly off for the A/B leg.
+        set_quinlight_enable_source_blend_registration(false);
+        let off = select_quinlight_mix_internal(
+            1,
+            native_rate,
+            QuinlightSelectionReference {
+                target_rms,
+                source_native: Some(&source_native),
+                score_48k: Some(&reference_48k),
+                fallback_48k: Some(&reference_48k),
+            },
+            &engines,
+            engines.len(),
+            false,
+        );
+        assert!(off.used_registration, "registration path should run (blend off)");
+
+        // Ratios against the shared 300 Hz fundamental factor out the mix's
+        // global RMS normalisation (which scales every bin equally).
+        let fund_on = frequency_component_amplitude(&on.data, 1, 48_000, 300.0).max(1e-9);
+        let fund_off = frequency_component_amplitude(&off.data, 1, 48_000, 300.0).max(1e-9);
+        let lf_ratio_on = frequency_component_amplitude(&on.data, 1, 48_000, 1000.0) / fund_on;
+        let lf_ratio_off = frequency_component_amplitude(&off.data, 1, 48_000, 1000.0) / fund_off;
+        assert!(
+            lf_ratio_on > 0.3 && lf_ratio_off < 0.1,
+            "the default blend must inject the source's 1 kHz low band \
+             (1kHz:300Hz on={lf_ratio_on:.3}, off={lf_ratio_off:.3})",
+        );
+
+        // The 12 kHz engine band is above the source Nyquist → untouched by the
+        // blend; its level relative to the fundamental is the same on and off.
+        let hf_ratio_on = frequency_component_amplitude(&on.data, 1, 48_000, 12_000.0) / fund_on;
+        let hf_ratio_off = frequency_component_amplitude(&off.data, 1, 48_000, 12_000.0) / fund_off;
+        assert!(
+            (hf_ratio_on - hf_ratio_off).abs() < 0.15,
+            "content above the source Nyquist must pass through unchanged \
+             (12kHz:300Hz on={hf_ratio_on:.3}, off={hf_ratio_off:.3})",
         );
     }
 

@@ -119,9 +119,10 @@ enum ConsensusArg {
 /// Per-sample reducer for the registration consensus.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ReduceArg {
-    /// Outlier-robust: rejects a lone-engine hallucination. The default.
+    /// Outlier-robust: rejects a lone-engine hallucination.
     Median,
-    /// Smoother on agreed content, but only attenuates outliers by 1/N.
+    /// Smoother on agreed content; only attenuates outliers by 1/N, so it
+    /// leans on the score gate to keep them out. The default.
     Mean,
 }
 
@@ -290,6 +291,11 @@ enum Commands {
         #[arg(long, default_value = "33")]
         hrtf_mix: i32,
 
+        /// Per-sample reducer for the registration consensus. Ignored on the
+        /// `spectral` path.
+        #[arg(long, value_enum, default_value = "mean")]
+        reduce: ReduceArg,
+
         #[command(flatten)]
         upscale: UpscaleCliArgs,
     },
@@ -322,30 +328,46 @@ enum Commands {
         /// engine's output to contribute to Quinlight's consensus. Engines
         /// below the floor are dropped for that sample; if fewer than 2
         /// engines remain usable, Quinlight keeps the original sample.
-        /// Range 0.0 – 1.0. Defaults to the built-in floor (0.9). Only the
-        /// `spectral` consensus applies this floor; `registration` blends all
-        /// engines.
+        /// Range 0.0 – 1.0. Defaults to the built-in floor (0.9). Applies to
+        /// the `spectral` consensus; the `registration` consensus uses the same
+        /// 0.9 floor but is tuned via `--registration-floor` (or disabled with
+        /// `--no-registration-gate`).
         #[arg(long)]
         threshold: Option<f64>,
 
         /// Engine-consensus algorithm. `registration` (default) aligns every
         /// AI engine to the sinc master via 1-D dense optical flow and takes a
-        /// per-sample median — no STFT ringing, sample-exact loop points, and
-        /// it blends all engines (no per-engine score gate, no loop-seam
-        /// gate). `spectral` is the legacy frequency-domain rotor consensus.
+        /// per-sample median (or mean; see `--reduce`) — no STFT ringing,
+        /// sample-exact loop points. It applies the same 0.9 per-engine score
+        /// gate as `spectral` (tune with `--registration-floor`) but skips the
+        /// loop-seam gate. `spectral` is the legacy frequency-domain rotor
+        /// consensus.
         #[arg(long, value_enum, default_value = "registration")]
         consensus: ConsensusArg,
 
         /// Per-sample reducer for the registration consensus. Ignored on the
         /// `spectral` path.
-        #[arg(long, value_enum, default_value = "median")]
+        #[arg(long, value_enum, default_value = "mean")]
         reduce: ReduceArg,
 
-        /// Re-enable the frequency-domain source-frequency blend on the
-        /// registration path (off by default — registration already anchors
-        /// the low band to the sinc master). No effect on `spectral`.
-        #[arg(long)]
-        source_blend: bool,
+        /// Disable the frequency-domain source-frequency blend on the
+        /// registration path (on by default — it phase-locks the low band to
+        /// the original source). No effect on `spectral`.
+        #[arg(long = "no-source-blend")]
+        no_source_blend: bool,
+
+        /// Disable the registration score gate, which drops AI engines scoring
+        /// below `--registration-floor` (default 0.9) before the median (on by
+        /// default). No effect on `spectral` (it has the same 0.9 floor).
+        #[arg(long = "no-registration-gate")]
+        no_registration_gate: bool,
+
+        /// Score floor for the registration gate, in [0.0, 1.0] (default 0.9,
+        /// matching the spectral path). Engines scoring below it are dropped
+        /// before the median. Lower = more permissive (e.g. 0.5 keeps decent
+        /// upscales the robust median can still absorb).
+        #[arg(long = "registration-floor")]
+        registration_floor: Option<f64>,
 
         #[command(flatten)]
         upscale: UpscaleCliArgs,
@@ -443,11 +465,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample_rate,
             no_hrtf,
             hrtf_mix,
+            reduce,
             upscale,
         }) => {
             let mode = resolve_upscale_mode(upscale);
             let agc_enabled = agc || !no_agc;
             let hrtf_mix = if no_hrtf { 0 } else { hrtf_mix };
+            remaster::set_quinlight_registration_mean(matches!(reduce, ReduceArg::Mean));
             let engine_names: Vec<String> = engine
                 .into_iter()
                 .map(|engine| engine.engine_name().to_string())
@@ -487,7 +511,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             threshold,
             consensus,
             reduce,
-            source_blend,
+            no_source_blend,
+            no_registration_gate,
+            registration_floor,
             upscale,
         }) => {
             let mode = resolve_upscale_mode(upscale);
@@ -510,7 +536,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ConsensusArg::Spectral
             ));
             remaster::set_quinlight_registration_mean(matches!(reduce, ReduceArg::Mean));
-            remaster::set_quinlight_enable_source_blend_registration(source_blend);
+            remaster::set_quinlight_enable_source_blend_registration(!no_source_blend);
+            remaster::set_quinlight_registration_score_gate(!no_registration_gate);
+            if let Some(f) = registration_floor {
+                if !(0.0..=1.0).contains(&f) {
+                    eprintln!("Error: --registration-floor must be in [0.0, 1.0] (got {f})");
+                    std::process::exit(2);
+                }
+                remaster::set_quinlight_registration_catastrophe_floor(f);
+                eprintln!(
+                    "Quinlight Audio: registration catastrophe floor set to {f:.2} via --registration-floor"
+                );
+            }
             if matches!(consensus, ConsensusArg::Spectral) {
                 eprintln!("Quinlight Audio: using legacy spectral consensus via --consensus");
             }
@@ -709,6 +746,7 @@ mod tests {
                 stereo_separation,
                 cleanup_preset,
                 cleanup_engine,
+                reduce,
                 upscale,
                 ..
             }) => {
@@ -716,6 +754,7 @@ mod tests {
                 assert_eq!(cleanup_preset, CleanupModeArg::Off);
                 assert_eq!(cleanup_engine, CleanupEngineArg::V21);
                 assert_eq!(upscale.upscale_mode, None);
+                assert_eq!(reduce, ReduceArg::Mean, "convert reducer defaults to mean");
             }
             _ => panic!("expected convert command"),
         }
@@ -807,6 +846,18 @@ mod tests {
                     resolve_with_vendor(upscale, engine::GpuVendor::Nvidia),
                     UpscaleMode::Hybrid,
                 );
+            }
+            _ => panic!("expected convert command"),
+        }
+    }
+
+    #[test]
+    fn convert_reduce_flag_parses_mean() {
+        let mean = Cli::try_parse_from(["quinlight-audio", "convert", "mods", "--reduce", "mean"])
+            .expect("convert --reduce mean should parse");
+        match mean.command {
+            Some(Commands::Convert { reduce, .. }) => {
+                assert_eq!(reduce, ReduceArg::Mean);
             }
             _ => panic!("expected convert command"),
         }
