@@ -15,11 +15,17 @@ pub const RENDER_STEREOSEPARATION_PERCENT: c_int = 2;
 pub const RENDER_INTERPOLATIONFILTER_LENGTH: c_int = 3;
 pub const RENDER_VOLUMERAMPING_STRENGTH: c_int = 4;
 
-pub const DEFAULT_STEREO_SEPARATION_PERCENT: i32 = 66;
-pub const MOD_STEREO_SEPARATION_PERCENT: i32 = 66;
+/// Default stereo separation as a percent of libopenmpt's natural width
+/// (0 = mono, 100 = as authored, 200 = exaggerated). Set to 33 — narrower than
+/// libopenmpt's own 100 default — to pull hard-panned channels toward center.
+/// Many old trackers play whole instruments out of a single channel (Amiga-style
+/// hard panning), which is fatiguing on headphones; narrowing keeps them audible
+/// in both ears while preserving a sense of width. Matches the 33% HRTF wet mix.
+pub const DEFAULT_STEREO_SEPARATION_PERCENT: i32 = 33;
+pub const MOD_STEREO_SEPARATION_PERCENT: i32 = 33;
 pub const DEFAULT_INTERPOLATION_FILTER_LENGTH: i32 = 64;
 
-/// Format-aware stereo-separation default. Currently MOD and non-MOD share 66%,
+/// Format-aware stereo-separation default. Currently MOD and non-MOD share 33%,
 /// but the hook is kept so Amiga-style hard panning can diverge later without
 /// touching every call site.
 pub fn effective_stereo_separation(path: &std::path::Path, default: i32) -> i32 {

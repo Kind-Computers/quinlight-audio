@@ -243,7 +243,7 @@ enum Commands {
         #[arg(long, default_value = "flac", num_args = 1..)]
         format: Vec<String>,
 
-        /// Stereo separation percentage (0-200, default: 66)
+        /// Stereo separation percentage (0-200, default: 33)
         #[arg(long)]
         stereo_separation: Option<i32>,
 
@@ -385,7 +385,7 @@ enum Commands {
         #[arg(long, default_value = "flac")]
         format: String,
 
-        /// Stereo separation percentage (0-200, default: 66)
+        /// Stereo separation percentage (0-200, default: 33)
         #[arg(long)]
         stereo_separation: Option<i32>,
 
