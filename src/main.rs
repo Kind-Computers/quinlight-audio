@@ -122,8 +122,13 @@ enum ReduceArg {
     /// Outlier-robust: rejects a lone-engine hallucination.
     Median,
     /// Smoother on agreed content; only attenuates outliers by 1/N, so it
-    /// leans on the score gate to keep them out. The default.
+    /// leans on the score gate to keep them out.
     Mean,
+    /// Winsorized robust mean: clamps each engine to the per-sample median ±
+    /// (k·MAD + floor) before averaging — rejects a lone spike like the median
+    /// yet keeps the mean's σ/√N smoothing where the engines agree. Tune with
+    /// `--robust-k` / `--robust-floor`. The default.
+    Robust,
 }
 
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
@@ -293,7 +298,7 @@ enum Commands {
 
         /// Per-sample reducer for the registration consensus. Ignored on the
         /// `spectral` path.
-        #[arg(long, value_enum, default_value = "mean")]
+        #[arg(long, value_enum, default_value = "robust")]
         reduce: ReduceArg,
 
         #[command(flatten)]
@@ -347,7 +352,7 @@ enum Commands {
 
         /// Per-sample reducer for the registration consensus. Ignored on the
         /// `spectral` path.
-        #[arg(long, value_enum, default_value = "mean")]
+        #[arg(long, value_enum, default_value = "robust")]
         reduce: ReduceArg,
 
         /// Disable the frequency-domain source-frequency blend on the
@@ -368,6 +373,19 @@ enum Commands {
         /// upscales the robust median can still absorb).
         #[arg(long = "registration-floor")]
         registration_floor: Option<f64>,
+
+        /// Winsor slope (MAD multiples) for `--reduce robust`: each engine is
+        /// clamped to the per-sample median ± (k·MAD + floor). 0 ⇒ a fixed
+        /// ±floor band (≈ median); large ⇒ the plain mean. Default 2.5. No
+        /// effect unless `--reduce robust`.
+        #[arg(long = "robust-k")]
+        robust_k: Option<f64>,
+
+        /// Winsor absolute floor (full-scale, |sample| ≤ 1) for `--reduce
+        /// robust` — keeps the clamp window non-zero when the engines agree
+        /// exactly. Default 0.01. No effect unless `--reduce robust`.
+        #[arg(long = "robust-floor")]
+        robust_floor: Option<f64>,
 
         #[command(flatten)]
         upscale: UpscaleCliArgs,
@@ -471,7 +489,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mode = resolve_upscale_mode(upscale);
             let agc_enabled = agc || !no_agc;
             let hrtf_mix = if no_hrtf { 0 } else { hrtf_mix };
-            remaster::set_quinlight_registration_mean(matches!(reduce, ReduceArg::Mean));
+            remaster::set_quinlight_registration_mode(match reduce {
+                ReduceArg::Median => engine::ReductionMode::Median,
+                ReduceArg::Mean => engine::ReductionMode::Mean,
+                ReduceArg::Robust => engine::ReductionMode::Robust,
+            });
             let engine_names: Vec<String> = engine
                 .into_iter()
                 .map(|engine| engine.engine_name().to_string())
@@ -514,6 +536,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_source_blend,
             no_registration_gate,
             registration_floor,
+            robust_k,
+            robust_floor,
             upscale,
         }) => {
             let mode = resolve_upscale_mode(upscale);
@@ -535,7 +559,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 consensus,
                 ConsensusArg::Spectral
             ));
-            remaster::set_quinlight_registration_mean(matches!(reduce, ReduceArg::Mean));
+            remaster::set_quinlight_registration_mode(match reduce {
+                ReduceArg::Median => engine::ReductionMode::Median,
+                ReduceArg::Mean => engine::ReductionMode::Mean,
+                ReduceArg::Robust => engine::ReductionMode::Robust,
+            });
             remaster::set_quinlight_enable_source_blend_registration(!no_source_blend);
             remaster::set_quinlight_registration_score_gate(!no_registration_gate);
             if let Some(f) = registration_floor {
@@ -547,6 +575,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "Quinlight Audio: registration catastrophe floor set to {f:.2} via --registration-floor"
                 );
+            }
+            if let Some(kk) = robust_k {
+                if !(0.0..=1.0e6).contains(&kk) {
+                    eprintln!("Error: --robust-k must be in [0.0, 1e6] (got {kk})");
+                    std::process::exit(2);
+                }
+                remaster::set_quinlight_robust_k(kk);
+                eprintln!("Quinlight Audio: robust winsor k set to {kk} via --robust-k");
+            }
+            if let Some(ff) = robust_floor {
+                if !(0.0..=2.0).contains(&ff) {
+                    eprintln!("Error: --robust-floor must be in [0.0, 2.0] (got {ff})");
+                    std::process::exit(2);
+                }
+                remaster::set_quinlight_robust_floor(ff);
+                eprintln!("Quinlight Audio: robust winsor floor set to {ff} via --robust-floor");
             }
             if matches!(consensus, ConsensusArg::Spectral) {
                 eprintln!("Quinlight Audio: using legacy spectral consensus via --consensus");
@@ -754,7 +798,7 @@ mod tests {
                 assert_eq!(cleanup_preset, CleanupModeArg::Off);
                 assert_eq!(cleanup_engine, CleanupEngineArg::V21);
                 assert_eq!(upscale.upscale_mode, None);
-                assert_eq!(reduce, ReduceArg::Mean, "convert reducer defaults to mean");
+                assert_eq!(reduce, ReduceArg::Robust, "convert reducer defaults to robust");
             }
             _ => panic!("expected convert command"),
         }
@@ -860,6 +904,47 @@ mod tests {
                 assert_eq!(reduce, ReduceArg::Mean);
             }
             _ => panic!("expected convert command"),
+        }
+    }
+
+    #[test]
+    fn convert_reduce_flag_parses_robust() {
+        let robust = Cli::try_parse_from(["quinlight-audio", "convert", "mods", "--reduce", "robust"])
+            .expect("convert --reduce robust should parse");
+        match robust.command {
+            Some(Commands::Convert { reduce, .. }) => {
+                assert_eq!(reduce, ReduceArg::Robust);
+            }
+            _ => panic!("expected convert command"),
+        }
+    }
+
+    #[test]
+    fn upsample_robust_knobs_parse() {
+        let cli = Cli::try_parse_from([
+            "quinlight-audio",
+            "upsample",
+            "in.flac",
+            "--reduce",
+            "robust",
+            "--robust-k",
+            "3.0",
+            "--robust-floor",
+            "0.02",
+        ])
+        .expect("upsample robust knobs should parse");
+        match cli.command {
+            Some(Commands::Upsample {
+                reduce,
+                robust_k,
+                robust_floor,
+                ..
+            }) => {
+                assert_eq!(reduce, ReduceArg::Robust);
+                assert_eq!(robust_k, Some(3.0));
+                assert_eq!(robust_floor, Some(0.02));
+            }
+            _ => panic!("expected upsample command"),
         }
     }
 

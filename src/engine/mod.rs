@@ -13,7 +13,7 @@ pub use apbwe::ApBweEngine;
 pub use audiosr::AudioSrEngine;
 pub use flowhigh::FlowHighEngine;
 pub use lavasr::LavaSrEngine;
-pub use registration::{ReductionMode, registration_consensus_1d};
+pub use registration::{LkParams, ReductionMode, registration_consensus_1d_with};
 pub(crate) use spectral::fft_cross_correlation;
 pub use spectral::spectral_correlation;
 pub use spectral::spectral_intersection;

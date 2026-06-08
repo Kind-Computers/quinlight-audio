@@ -14,7 +14,7 @@
 //! 2. For every AI engine, compute a dense 1D optical-flow field mapping the
 //!    master's samples to that engine's, then linearly warp the engine onto
 //!    the master's grid (`dense_lk_1d` + `linear_warp_1d`).
-//! 3. Per-sample **mean** or **median** reduction across the warped engine
+//! 3. Per-sample **mean**, **median**, or **robust** reduction across the warped engine
 //!    stack.
 //!
 //! The **master** is the warp/flow target (and is never itself warped). In
@@ -23,8 +23,8 @@
 //! engines in the source band (anchoring/guiding the consensus and helping
 //! outvote an in-band hallucination) but is a low outlier in the AI-extended
 //! high band, where the median rejects it, so the band extension is preserved.
-//! In **mean** mode (no outlier rejection) it stays excluded, since averaging in
-//! its zero highs would dilute the AI-generated band extension.
+//! In **mean** and **robust** modes it stays excluded, since blending in its
+//! zero highs would dilute the AI-generated band extension.
 //!
 //! Why this replaces the frequency-domain `spectral_intersection`: that path
 //! manipulates per-bin STFT magnitude/phase and inverse-transforms, which
@@ -39,15 +39,21 @@
 
 /// Per-sample reduction across the warped engine stack.
 ///
-/// `Median` (default) is outlier-robust: a single-engine hallucination at a
-/// sample is rejected when the other K−1 engines agree. `Mean` only
-/// attenuates an outlier by `1/K` rather than rejecting it — smoother on
-/// content the engines agree on, at the cost of outlier sensitivity.
+/// `Median` is outlier-robust: a single-engine hallucination at a sample is
+/// rejected when the other K−1 engines agree. `Mean` only attenuates an
+/// outlier by `1/K` rather than rejecting it — smoother on content the engines
+/// agree on, at the cost of outlier sensitivity. `Robust` is the winsorized
+/// middle ground and the **shipped default** (selected by the process static;
+/// see `set_quinlight_registration_mode`): it clamps each engine to the
+/// per-sample median ± a MAD-scaled tolerance before averaging, keeping the
+/// mean's smoothing where the engines agree yet rejecting a lone spike like the
+/// median. See [`robust_mean_per_sample`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReductionMode {
     #[default]
     Median,
     Mean,
+    Robust,
 }
 
 /// Tunables for [`dense_lk_1d`]. [`Default`] reproduces the recommended
@@ -120,10 +126,20 @@ pub struct LkParams {
     /// self-regulating: in the source band it sits among the engines and guides
     /// the consensus (helping reject an in-band hallucination), while in the
     /// AI-extended high band it is ≈ 0 — a low outlier the median discards — so
-    /// the band extension survives. **Median only**: `Mean` cannot reject it and
-    /// would soften the highs by `1/(K+1)`, so the master stays excluded there
-    /// regardless of this flag. On by default.
+    /// the band extension survives. **Median only**: under `Mean` and `Robust`
+    /// the master stays excluded (Mean cannot reject it, and Robust keeps the
+    /// AI-extended highs undiluted), regardless of this flag. On by default.
     pub include_master_in_reduction: bool,
+    /// Winsor window slope (multiples of the per-sample MAD) for the
+    /// [`ReductionMode::Robust`] reducer: `tol = winsor_k·MAD + winsor_abs`.
+    /// `0` ⇒ a fixed ±`winsor_abs` band; large ⇒ the plain mean. Inert for
+    /// `Median`/`Mean`.
+    pub winsor_k: f64,
+    /// Winsor absolute floor in full-scale units (audio ≈ [-1, 1]) for the
+    /// [`ReductionMode::Robust`] reducer — keeps the clamp window non-zero when
+    /// the engines agree exactly (MAD = 0) so the mean's `σ/√N` smoothing
+    /// survives. Inert for `Median`/`Mean`.
+    pub winsor_abs: f64,
 }
 
 impl Default for LkParams {
@@ -139,6 +155,8 @@ impl Default for LkParams {
             bilateral_scale_eps: 1e-12,
             seam_guard_radius: 8,
             include_master_in_reduction: true,
+            winsor_k: 2.5,
+            winsor_abs: 0.01,
         }
     }
 }
@@ -406,6 +424,74 @@ pub fn mean_per_sample(stack: &[&[f64]]) -> Vec<f64> {
     out
 }
 
+/// Per-sample **winsorized (robust) mean** across the warped engine stack
+/// (master excluded, exactly like [`mean_per_sample`]). At each sample: take
+/// the per-sample `center` (median), the median absolute deviation
+/// `mad = median(|xᵢ − center|)`, form the window `tol = winsor_k·mad +
+/// winsor_abs`, clamp every value to `[center−tol, center+tol]`, and average. A
+/// lone-engine spike that disagrees with the others by ≫ `mad` is bounded to
+/// the window (≈ rejected like a median), while agreed samples sit inside the
+/// window and pass through unchanged, so the result keeps the plain mean's
+/// `σ/√N` smoothing. `winsor_k → 0` ⇒ a fixed ±`winsor_abs` band (and, with
+/// `winsor_abs → 0`, mean ≈ median); `winsor_k → ∞` ⇒ the plain mean.
+///
+/// The window is **MAD-scaled** (sign-agnostic) rather than magnitude-relative
+/// like the 2D image port's `WINSOR_TAU·median.max(0)` term: audio is bipolar,
+/// so a magnitude window would be zero on every negative half-wave and would
+/// key off loudness instead of cross-engine disagreement. Each value is
+/// scrubbed (NaN/Inf → 0) on gather. `K == 1` passes through; `K == 0` returns
+/// empty.
+pub fn robust_mean_per_sample(stack: &[&[f64]], winsor_k: f64, winsor_abs: f64) -> Vec<f64> {
+    let k = stack.len();
+    if k == 0 {
+        return Vec::new();
+    }
+    if k == 1 {
+        return stack[0].to_vec();
+    }
+    let n = stack.iter().map(|s| s.len()).min().unwrap_or(0);
+    let inv = 1.0 / k as f64;
+    let mut out = vec![0.0f64; n];
+    let mut buf: Vec<f64> = Vec::with_capacity(k); // engine values (sorted for the median)
+    let mut dev: Vec<f64> = Vec::with_capacity(k); // |value − center| (sorted for the MAD)
+    let mid = k / 2;
+    let even = k.is_multiple_of(2);
+    for (i, slot) in out.iter_mut().enumerate() {
+        buf.clear();
+        for s in stack {
+            buf.push(scrub1(s[i]));
+        }
+        // center = median (same total-order + even/odd tie-break as `median_per_sample`).
+        buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
+        let center = if even {
+            0.5 * (buf[mid - 1] + buf[mid])
+        } else {
+            buf[mid]
+        };
+        // mad = median absolute deviation about the center.
+        dev.clear();
+        for &v in buf.iter() {
+            dev.push((v - center).abs());
+        }
+        dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
+        let mad = if even {
+            0.5 * (dev[mid - 1] + dev[mid])
+        } else {
+            dev[mid]
+        };
+        // Winsorize: clamp each value to center ± tol, then average.
+        let tol = winsor_k * mad + winsor_abs;
+        let lo = center - tol;
+        let hi = center + tol;
+        let mut acc = 0.0f64;
+        for &v in buf.iter() {
+            acc += v.clamp(lo, hi);
+        }
+        *slot = acc * inv;
+    }
+    out
+}
+
 /// Loop-seam guard (reduction blend): pull the few samples at each loop
 /// endpoint (the seam between index `n−1` and `0`) toward the band-limited
 /// `master`. The blend weight `β` is a raised cosine — `1` exactly at a seam
@@ -431,25 +517,17 @@ fn apply_seam_master_blend(out: &mut [f64], master: &[f64], radius: usize) {
     }
 }
 
-/// End-to-end 1D registration consensus with [`LkParams::default`].
+/// End-to-end 1D registration consensus with explicit [`LkParams`].
 ///
 /// For each engine: compute LK flow master→engine, linearly warp the engine
-/// onto the master grid, and push the warped engine. In the default **median**
-/// reduction the (unwarped) master is *also* pushed as a self-regulating member
-/// (see [`LkParams::include_master_in_reduction`]); in **mean** mode it is
-/// excluded. The stack is reduced per-sample by `mode`. `K == 1` returns the
+/// onto the master grid, and push the warped engine. In **median** reduction
+/// the (unwarped) master is *also* pushed as a self-regulating member (see
+/// [`LkParams::include_master_in_reduction`]); in **mean**/**robust** mode it
+/// is excluded. The stack is reduced per-sample by `mode`. `K == 1` returns the
 /// lone engine unchanged (no warp, no master mixing); `K == 0` returns empty.
-/// Output length is the minimum engine length.
-pub fn registration_consensus_1d(
-    master: &[f64],
-    engines: &[&[f64]],
-    looped: bool,
-    mode: ReductionMode,
-) -> Vec<f64> {
-    registration_consensus_1d_with(master, engines, looped, mode, LkParams::default())
-}
-
-/// [`registration_consensus_1d`] with explicit [`LkParams`].
+/// Output length is the minimum engine length. Production code calls this with
+/// the runtime winsor knobs; tests use a default-param `registration_consensus_1d`
+/// helper.
 pub fn registration_consensus_1d_with(
     master: &[f64],
     engines: &[&[f64]],
@@ -489,9 +567,10 @@ pub fn registration_consensus_1d_with(
     let mut refs: Vec<&[f64]> = warped.iter().map(|v| v.as_slice()).collect();
     // Master as a full MEDIAN member (self-regulating "guidance"): it votes in
     // the source band and is discarded as a low outlier in the AI-extended
-    // highs. Median only — Mean cannot reject it and would dilute the highs. The
-    // master is the warp grid, so it is added UNWARPED. Skip when it can't cover
-    // the full output (else the min-length reducer would truncate the result).
+    // highs. Median only — Mean and Robust exclude it (Mean cannot reject it,
+    // Robust keeps the AI highs undiluted). The master is the warp grid, so it
+    // is added UNWARPED. Skip when it can't cover the full output (else the
+    // min-length reducer would truncate the result).
     if params.include_master_in_reduction
         && mode == ReductionMode::Median
         && master.len() >= out_len
@@ -502,6 +581,7 @@ pub fn registration_consensus_1d_with(
     let mut reduced = match mode {
         ReductionMode::Median => median_per_sample(&refs),
         ReductionMode::Mean => mean_per_sample(&refs),
+        ReductionMode::Robust => robust_mean_per_sample(&refs, params.winsor_k, params.winsor_abs),
     };
     // Loop-seam guard (reduction blend): pull the few samples at each loop
     // endpoint toward the band-limited, tick-free master to remove a seam tick
@@ -516,6 +596,18 @@ pub fn registration_consensus_1d_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Convenience wrapper for the tests: the registration consensus with
+    /// default LK params. Production code calls `registration_consensus_1d_with`
+    /// directly so it can thread the runtime winsor knobs.
+    fn registration_consensus_1d(
+        master: &[f64],
+        engines: &[&[f64]],
+        looped: bool,
+        mode: ReductionMode,
+    ) -> Vec<f64> {
+        registration_consensus_1d_with(master, engines, looped, mode, LkParams::default())
+    }
 
     fn tone(sr: f64, n: usize, freq: f64, amp: f64, phase: f64) -> Vec<f64> {
         (0..n)
@@ -607,6 +699,122 @@ mod tests {
         let master = tone(SR, n, 880.0, 0.9, 0.0);
         let out = registration_consensus_1d(&master, &[engine.as_slice()], false, ReductionMode::Median);
         assert_eq!(out, engine, "single engine must pass through unchanged");
+    }
+
+    #[test]
+    fn robust_mean_rejects_spike_keeps_mean_on_agreement() {
+        // 5 engines: four agree at 0.30, one spikes to 0.95 at a few indices.
+        // The robust mean must (a) reject the spike (≈ the agreeing value, like
+        // a median) and (b) equal the PLAIN mean where all five agree.
+        let n = 64;
+        let agree = 0.30f64;
+        let base = vec![agree; n];
+        let mut spiky = base.clone();
+        let spikes = [11usize, 23, 40];
+        for &p in &spikes {
+            spiky[p] = 0.95;
+        }
+        let refs = [
+            base.as_slice(),
+            base.as_slice(),
+            base.as_slice(),
+            base.as_slice(),
+            spiky.as_slice(),
+        ];
+        let out = robust_mean_per_sample(&refs, 2.5, 0.01);
+        // At a spike: median = 0.30, MAD = 0 (four agree), tol = floor = 0.01,
+        // the 0.95 clamps to 0.31 ⇒ mean = (4·0.30 + 0.31)/5 = 0.302. The spike
+        // leaks only floor/K — ≈ rejected (a plain mean would give 0.43).
+        let plain_at_spike = (4.0 * agree + 0.95) / 5.0;
+        for &p in &spikes {
+            assert!(
+                (out[p] - 0.302).abs() < 1e-9,
+                "spike must clamp to median±floor, got {}",
+                out[p]
+            );
+            assert!(
+                (out[p] - plain_at_spike).abs() > 0.1,
+                "robust must not behave like the plain mean at the spike"
+            );
+        }
+        // Where all five agree exactly: every value inside the window ⇒ output
+        // is the plain mean (== the agreed value).
+        assert!(
+            (out[0] - agree).abs() < 1e-12,
+            "agreement must pass through as the mean"
+        );
+    }
+
+    #[test]
+    fn robust_mean_preserves_mean_under_benign_jitter() {
+        // No outlier, only sub-window jitter ⇒ nothing clamps ⇒ the robust mean
+        // equals the arithmetic mean (the σ/√N-smoothing contract), NOT the
+        // median — this is what distinguishes it from `median_per_sample`.
+        let vals = [0.20f64, 0.205, 0.198, 0.202];
+        let cols: Vec<Vec<f64>> = vals.iter().map(|&v| vec![v; 8]).collect();
+        let refs: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+        let out = robust_mean_per_sample(&refs, 2.5, 0.01);
+        let plain = vals.iter().sum::<f64>() / 4.0;
+        assert!(
+            (out[0] - plain).abs() < 1e-9,
+            "benign jitter must average like the mean, got {} vs {plain}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn robust_mean_k0_fixed_band_and_k_large_is_plain_mean() {
+        // Spread fixture (MAD > 0) so the k knob actually moves the window.
+        let vals = [0.1f64, 0.2, 0.3, 0.4, 0.95];
+        let cols: Vec<Vec<f64>> = vals.iter().map(|&v| vec![v; 4]).collect();
+        let refs: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+        // k → ∞, floor 0 ⇒ no clamp ⇒ the plain mean (0.39).
+        let big = robust_mean_per_sample(&refs, 1.0e6, 0.0);
+        let plain = vals.iter().sum::<f64>() / 5.0;
+        assert!((big[0] - plain).abs() < 1e-6, "k→∞ ⇒ plain mean, got {}", big[0]);
+        // k = 0, floor 0 ⇒ clamp every value to the median ⇒ ≈ the median (0.3).
+        let zero = robust_mean_per_sample(&refs, 0.0, 0.0);
+        assert!((zero[0] - 0.3).abs() < 1e-9, "k=0,floor=0 ⇒ median, got {}", zero[0]);
+    }
+
+    #[test]
+    fn robust_mean_is_sign_agnostic_on_negative_halfwave() {
+        // The whole point vs the 2D brightness window: a spike on the NEGATIVE
+        // half-wave is rejected identically to the positive (median.max(0) would
+        // have zeroed the window here and let it through). center = -0.30.
+        let n = 8;
+        let base = vec![-0.30f64; n];
+        let mut spiky = base.clone();
+        spiky[3] = -0.95;
+        let refs = [
+            base.as_slice(),
+            base.as_slice(),
+            base.as_slice(),
+            base.as_slice(),
+            spiky.as_slice(),
+        ];
+        let out = robust_mean_per_sample(&refs, 2.5, 0.01);
+        // tol = floor = 0.01; -0.95 clamps to -0.31 ⇒ (4·-0.30 + -0.31)/5 = -0.302.
+        assert!(
+            (out[3] + 0.302).abs() < 1e-9,
+            "negative-half spike must clamp too, got {}",
+            out[3]
+        );
+    }
+
+    #[test]
+    fn robust_mean_k1_passthrough_k0_empty() {
+        let one = vec![0.1f64, -0.2, 0.3];
+        assert_eq!(
+            robust_mean_per_sample(&[one.as_slice()], 2.5, 0.01),
+            one,
+            "K=1 must pass the lone engine through unchanged"
+        );
+        let empty: [&[f64]; 0] = [];
+        assert!(
+            robust_mean_per_sample(&empty, 2.5, 0.01).is_empty(),
+            "K=0 must return empty"
+        );
     }
 
     #[test]

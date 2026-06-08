@@ -1280,21 +1280,30 @@ pub(crate) fn registration_default_active() -> bool {
     !QUINLIGHT_USE_SPECTRAL_CONSENSUS.load(Ordering::Relaxed)
 }
 
-/// Reduction mode for the registration consensus: `1` = mean (the shipped
-/// default — smoother on agreed content; leans on the 0.9 score gate to keep
-/// outliers out), `0` = median (outlier-robust, rejects a lone-engine
-/// hallucination; the only mode in which the sinc master joins the reduction).
-static QUINLIGHT_REGISTRATION_MODE: AtomicU8 = AtomicU8::new(1);
+/// Reduction mode for the registration consensus: `2` = robust (the shipped
+/// default — a winsorized MAD-clamped mean: rejects a lone-engine spike like the
+/// median yet keeps the mean's σ/√N smoothing where the engines agree; master
+/// excluded like mean), `1` = mean (smoother on agreed content; leans on the
+/// 0.9 score gate to keep outliers out), `0` = median (outlier-robust; the only
+/// mode in which the sinc master joins the reduction).
+static QUINLIGHT_REGISTRATION_MODE: AtomicU8 = AtomicU8::new(2);
 
-/// Select the registration reducer: `true` (default) = mean, `false` = median.
-pub fn set_quinlight_registration_mean(mean: bool) {
-    QUINLIGHT_REGISTRATION_MODE.store(u8::from(mean), Ordering::Relaxed);
+/// Select the registration reducer (default
+/// [`crate::engine::ReductionMode::Robust`]).
+pub fn set_quinlight_registration_mode(mode: crate::engine::ReductionMode) {
+    let code = match mode {
+        crate::engine::ReductionMode::Median => 0,
+        crate::engine::ReductionMode::Mean => 1,
+        crate::engine::ReductionMode::Robust => 2,
+    };
+    QUINLIGHT_REGISTRATION_MODE.store(code, Ordering::Relaxed);
 }
 
 fn registration_reduction_mode() -> crate::engine::ReductionMode {
     match QUINLIGHT_REGISTRATION_MODE.load(Ordering::Relaxed) {
+        0 => crate::engine::ReductionMode::Median,
         1 => crate::engine::ReductionMode::Mean,
-        _ => crate::engine::ReductionMode::Median,
+        _ => crate::engine::ReductionMode::Robust,
     }
 }
 
@@ -1364,6 +1373,55 @@ pub fn set_quinlight_registration_catastrophe_floor(value: f64) {
         .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Default winsor slope (multiples of the per-sample MAD) for the robust
+/// registration reducer — `tol = k·MAD + floor`. The standard robust-mean
+/// multiplier: averages cleanly where the engines agree, clamps a clear
+/// lone-engine outlier toward the median.
+pub const QUINLIGHT_DEFAULT_ROBUST_K: f64 = 2.5;
+/// Default winsor absolute floor (full-scale units, audio ≈ [-1, 1]) for the
+/// robust registration reducer — keeps the clamp window non-zero when the
+/// engines agree exactly (MAD = 0) so the mean's `σ/√N` smoothing survives.
+pub const QUINLIGHT_DEFAULT_ROBUST_FLOOR: f64 = 0.01;
+
+// Runtime-configurable robust-reducer winsor knobs, stored as f64 bits for
+// lock-free atomic mutation (mirrors the catastrophe-floor pattern above).
+static QUINLIGHT_ROBUST_K_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(QUINLIGHT_DEFAULT_ROBUST_K.to_bits());
+static QUINLIGHT_ROBUST_FLOOR_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(QUINLIGHT_DEFAULT_ROBUST_FLOOR.to_bits());
+
+/// Effective winsor slope (MAD multiples) for the robust reducer this process.
+pub fn quinlight_robust_k() -> f64 {
+    f64::from_bits(QUINLIGHT_ROBUST_K_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Effective winsor absolute floor (full-scale) for the robust reducer this process.
+pub fn quinlight_robust_floor() -> f64 {
+    f64::from_bits(QUINLIGHT_ROBUST_FLOOR_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Override the robust reducer's winsor slope for the rest of this process
+/// (clamped to `[0.0, 1e6]`; non-finite ignored; `0` ⇒ a fixed ±floor band).
+/// CLI: `quinlight upsample --robust-k`.
+pub fn set_quinlight_robust_k(value: f64) {
+    if !value.is_finite() {
+        return;
+    }
+    let clamped = value.clamp(0.0, 1.0e6);
+    QUINLIGHT_ROBUST_K_BITS.store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Override the robust reducer's winsor absolute floor for the rest of this
+/// process (clamped to `[0.0, 2.0]`, full-scale units; non-finite ignored).
+/// CLI: `quinlight upsample --robust-floor`.
+pub fn set_quinlight_robust_floor(value: f64) {
+    if !value.is_finite() {
+        return;
+    }
+    let clamped = value.clamp(0.0, 2.0);
+    QUINLIGHT_ROBUST_FLOOR_BITS.store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Test-only serialization for the process-global consensus-mode toggles.
 /// Tests that pin a non-default mode acquire this lock so they never run
 /// concurrently with one another (or with tests pinned to the default), and
@@ -1377,8 +1435,9 @@ pub(crate) fn consensus_mode_lock() -> &'static std::sync::Mutex<()> {
 }
 
 /// RAII guard pinning the consensus mode for a single test. Holds
-/// [`consensus_mode_lock`] for its lifetime and restores all three consensus
-/// toggles to their defaults on drop.
+/// [`consensus_mode_lock`] for its lifetime and restores all consensus toggles
+/// (reducer mode, source blend, score gate, catastrophe floor, robust winsor
+/// knobs) to their defaults on drop.
 #[cfg(test)]
 pub(crate) struct ConsensusModeGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
@@ -1411,12 +1470,15 @@ impl ConsensusModeGuard {
 impl Drop for ConsensusModeGuard {
     fn drop(&mut self) {
         set_quinlight_use_spectral_consensus(false);
-        // Track the static defaults (reducer mean, blend on, gate on) so a
-        // guarded test can't leak a non-default into the rest of the suite.
-        set_quinlight_registration_mean(true);
+        // Track the static defaults (reducer robust, blend on, gate on, default
+        // winsor knobs) so a guarded test can't leak a non-default into the rest
+        // of the suite.
+        set_quinlight_registration_mode(crate::engine::ReductionMode::Robust);
         set_quinlight_enable_source_blend_registration(true);
         set_quinlight_registration_score_gate(true);
         set_quinlight_registration_catastrophe_floor(QUINLIGHT_DEFAULT_REGISTRATION_CATASTROPHE_FLOOR);
+        set_quinlight_robust_k(QUINLIGHT_DEFAULT_ROBUST_K);
+        set_quinlight_robust_floor(QUINLIGHT_DEFAULT_ROBUST_FLOOR);
     }
 }
 
@@ -1567,11 +1629,16 @@ fn spectral_intersection_blend(
                 .take(min_frames)
                 .copied()
                 .collect();
-            crate::engine::registration_consensus_1d(
+            crate::engine::registration_consensus_1d_with(
                 &master_ch,
                 &refs,
                 looped,
                 registration_reduction_mode(),
+                crate::engine::LkParams {
+                    winsor_k: quinlight_robust_k(),
+                    winsor_abs: quinlight_robust_floor(),
+                    ..crate::engine::LkParams::default()
+                },
             )
         } else {
             crate::engine::spectral_intersection(&refs, looped)
@@ -10007,8 +10074,8 @@ mod tests {
         let _mode = ConsensusModeGuard::registration();
         // Exercises MEDIAN behavior specifically — the sinc master as a
         // median-only guidance vote that the median rejects in the HF band.
-        // Mean is now the default reducer (master excluded), so pin median.
-        set_quinlight_registration_mean(false);
+        // Robust is now the default reducer (master excluded), so pin median.
+        set_quinlight_registration_mode(crate::engine::ReductionMode::Median);
         let n = 8192usize;
         let sr = 48_000.0;
         // Master: a band-limited 220 Hz tone (no HF) — the sinc-reference analogue.
@@ -10051,9 +10118,9 @@ mod tests {
         let _mode = ConsensusModeGuard::registration();
         set_quinlight_registration_score_gate(false);
         // The out-of-band rejection asserted below is the MEDIAN's doing (mean
-        // only attenuates by 1/N). Mean is now the default reducer, so pin
+        // only attenuates by 1/N). Robust is now the default reducer, so pin
         // median to keep testing that rejection.
-        set_quinlight_registration_mean(false);
+        set_quinlight_registration_mode(crate::engine::ReductionMode::Median);
         let work_dir = tempfile::tempdir().expect("temp work");
         let job = sample_job(work_dir.path());
         let reference_48k = reference_48k_from_job(&job).expect("reference should resample");
@@ -10140,16 +10207,24 @@ mod tests {
         );
     }
 
-    /// The registration consensus ships with the mean reducer as its default
-    /// (chosen by listening); median remains available via `--reduce median`.
+    /// The registration consensus ships with the robust (winsorized) reducer as
+    /// its default; mean and median remain available via `--reduce mean|median`.
     #[test]
-    fn registration_reducer_defaults_to_mean() {
+    fn registration_reducer_defaults_to_robust() {
         let _mode = ConsensusModeGuard::registration();
         assert_eq!(
             registration_reduction_mode(),
-            crate::engine::ReductionMode::Mean,
-            "the registration consensus must default to the mean reducer",
+            crate::engine::ReductionMode::Robust,
+            "the registration consensus must default to the robust reducer",
         );
+    }
+
+    /// The robust reducer's winsor knobs default to k = 2.5 / floor = 0.01.
+    #[test]
+    fn registration_robust_knob_defaults() {
+        let _mode = ConsensusModeGuard::registration();
+        assert_eq!(quinlight_robust_k(), QUINLIGHT_DEFAULT_ROBUST_K);
+        assert_eq!(quinlight_robust_floor(), QUINLIGHT_DEFAULT_ROBUST_FLOOR);
     }
 
     /// The registration catastrophe floor is tunable via the float knob: raising
@@ -10179,6 +10254,103 @@ mod tests {
             !mix.used_registration,
             "a 1.0 catastrophe floor rejects the near-perfect engines, leaving \
              fewer than 2 survivors — the sample must keep its original",
+        );
+    }
+
+    /// The default reducer (robust) rejects an impulsive per-engine spike at
+    /// reduction time. The score gate and source blend are disabled so it is the
+    /// REDUCER — not the gate or the low-band source lock — doing the rejection:
+    /// robust must track the clean tone far better than the plain mean does.
+    #[test]
+    fn registration_robust_reducer_rejects_spike() {
+        let _mode = ConsensusModeGuard::registration();
+        set_quinlight_registration_score_gate(false);
+        set_quinlight_enable_source_blend_registration(false);
+        let n = 8192usize;
+        let sr = 48_000.0;
+        let clean: Vec<f64> = (0..n)
+            .map(|i| 0.5 * (2.0 * std::f64::consts::PI * 220.0 * i as f64 / sr).sin())
+            .collect();
+        // Two engines agree exactly on the tone; one carries a sparse, large
+        // bipolar spike train the robust mean must clamp toward the median.
+        let mut spiky = clean.clone();
+        let mut j = 64usize;
+        while j < n {
+            spiky[j] += 0.9;
+            j += 257;
+        }
+        let engines = vec![
+            ("AudioSR".to_string(), clean.clone(), n as i64, 1),
+            ("LavaSR".to_string(), clean.clone(), n as i64, 1),
+            ("FLowHigh".to_string(), spiky, n as i64, 1),
+        ];
+        let dev = |mix: &QuinlightMix| -> f64 {
+            let mut j = 64usize;
+            let mut acc = 0.0f64;
+            let mut cnt = 0.0f64;
+            while j < n {
+                acc += (mix.data[j] - clean[j]).abs();
+                cnt += 1.0;
+                j += 257;
+            }
+            acc / cnt.max(1.0)
+        };
+        let robust = select_quinlight_mix(&clean, 1, 8_000, &engines, 3, false);
+        assert!(robust.used_registration, "robust reducer must run the registration path");
+        assert!(robust.data.iter().all(|x| x.is_finite()));
+        set_quinlight_registration_mode(crate::engine::ReductionMode::Mean);
+        let mean = select_quinlight_mix(&clean, 1, 8_000, &engines, 3, false);
+        assert!(
+            dev(&robust) < 0.5 * dev(&mean),
+            "robust must leak the spike far less than mean (robust {:.4} vs mean {:.4})",
+            dev(&robust),
+            dev(&mean),
+        );
+    }
+
+    /// The robust reducer's winsor slope is wired from the runtime knob: with the
+    /// engines given a small mutual spread (so MAD > 0), `--robust-k → ∞`
+    /// collapses the reducer to the plain mean (the spike leaks ~1/K), while
+    /// `--robust-k → 0` (floor 0) collapses it to the median (spike rejected).
+    #[test]
+    fn registration_robust_k_is_tunable() {
+        let _mode = ConsensusModeGuard::registration();
+        set_quinlight_registration_score_gate(false);
+        set_quinlight_enable_source_blend_registration(false);
+        let n = 4096usize;
+        let sr = 48_000.0;
+        let clean: Vec<f64> = (0..n)
+            .map(|i| 0.4 * (2.0 * std::f64::consts::PI * 300.0 * i as f64 / sr).sin())
+            .collect();
+        // A second engine with a small in-band jitter so the per-sample MAD is
+        // non-zero (otherwise the lone spike never moves the MAD and k is inert).
+        let jittered: Vec<f64> = clean
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| s + 0.05 * (i as f64 * 0.013).sin())
+            .collect();
+        let mut spiky = clean.clone();
+        let p = 1000usize;
+        spiky[p] += 0.9;
+        let engines = vec![
+            ("AudioSR".to_string(), clean.clone(), n as i64, 1),
+            ("LavaSR".to_string(), jittered, n as i64, 1),
+            ("FLowHigh".to_string(), spiky, n as i64, 1),
+        ];
+        let dev_at = |mix: &QuinlightMix| (mix.data[p] - clean[p]).abs();
+        // k → ∞ : plain mean (spike leaks ≈ 0.9/3 = 0.3).
+        set_quinlight_robust_k(1.0e6);
+        let mean_like = select_quinlight_mix(&clean, 1, 8_000, &engines, 3, false);
+        // k → 0, floor 0 : the median (spike rejected).
+        set_quinlight_robust_k(0.0);
+        set_quinlight_robust_floor(0.0);
+        let median_like = select_quinlight_mix(&clean, 1, 8_000, &engines, 3, false);
+        assert!(
+            dev_at(&mean_like) > 3.0 * dev_at(&median_like).max(1e-9),
+            "k→∞ must leak the spike (mean-like) far more than k→0 (median-like): \
+             mean_like {:.4}, median_like {:.4}",
+            dev_at(&mean_like),
+            dev_at(&median_like),
         );
     }
 
