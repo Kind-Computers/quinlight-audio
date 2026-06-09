@@ -12,7 +12,9 @@
 //!    Whittaker-Shannon). It defines the common time grid and carries the
 //!    exact loop length / loop point.
 //! 2. For every AI engine, compute a dense 1D optical-flow field mapping the
-//!    master's samples to that engine's, then linearly warp the engine onto
+//!    master's samples to that engine's — coarse-to-fine over a binomial
+//!    pyramid, with the cumulative flow hard-clamped to
+//!    ±[`LkParams::max_offset`] samples — then linearly warp the engine onto
 //!    the master's grid (`dense_lk_1d` + `linear_warp_1d`).
 //! 3. Per-sample **mean**, **median**, or **robust** reduction across the warped engine
 //!    stack.
@@ -57,7 +59,7 @@ pub enum ReductionMode {
 }
 
 /// Tunables for [`dense_lk_1d`]. [`Default`] reproduces the recommended
-/// single-level configuration.
+/// pyramidal configuration (2 levels, ±2-sample flow clamp).
 #[derive(Debug, Clone, Copy)]
 pub struct LkParams {
     /// Window radius in samples (window is `2*radius + 1` taps). Wider than
@@ -65,11 +67,33 @@ pub struct LkParams {
     /// source Nyquist, so the window must span ≳ one cycle of the highest
     /// master component for a well-conditioned `Σ w·Iₓ²`.
     pub radius: usize,
-    /// Forward-additive warp-refinement passes. `1` = a single linearised
-    /// solve (exact parity with the 2D single-level path). `>1` re-warps the
+    /// Forward-additive warp-refinement passes **per pyramid level**. `1` = a
+    /// single linearised solve per level (exact parity with the 2D
+    /// single-level path when `pyramid_levels == 1`). `>1` re-warps the
     /// original engine by the cumulative flow and re-solves each pass — buys
-    /// robustness against 2–4 sample drift at linear cost. No pyramid.
+    /// extra in-level convergence at linear cost.
     pub n_iters: usize,
+    /// Coarse-to-fine pyramid depth. Level 0 is full resolution; each deeper
+    /// level is binomial-filtered (`[1,4,6,4,1]/16`) and decimated ×2, solved
+    /// first, and its flow upsampled (×2 in index and value) to seed the next
+    /// finer level. A coarser level sees a ×2 longer effective window, so the
+    /// solve locks onto a 1–2 sample shift in low-frequency content whose
+    /// full-resolution linearisation breaks. `1` = single-level (the prior
+    /// behaviour). Depth is auto-capped so every level still spans the
+    /// `2*radius+1`-tap analysis window.
+    pub pyramid_levels: usize,
+    /// Hard cap on the flow magnitude, in full-resolution samples: the
+    /// cumulative flow is clamped to `±max_offset` after every refinement
+    /// pass (scaled to `max_offset / 2^level` at coarser levels, which the ×2
+    /// flow upsampling maps back exactly), so `dense_lk_1d` guarantees
+    /// `|u| ≤ max_offset`. The engines are AI upsamples of the SAME source,
+    /// so genuine offsets are small — while one runaway motion vector would
+    /// drag a good engine far off the master grid and wreck the merged
+    /// sample. The cap *bounds* an oversized offset (clamp) rather than
+    /// rejecting it to identity, keeping the flow field continuous (no warp
+    /// tears between neighbouring samples); rejecting *untrusted* flow is
+    /// [`LkParams::min_r2`]'s job. `f64::INFINITY` disables.
+    pub max_offset: f64,
     /// Structure floor on `Σ w·Iₓ²`, relative to local master energy
     /// (`Σ w·m²`). Makes the "enough gradient to trust the flow" bar
     /// level-invariant (a quiet passage registers like a loud one).
@@ -113,8 +137,11 @@ pub struct LkParams {
     pub bilateral_scale_eps: f64,
     /// Loop-**seam guard** half-width, in samples, around each loop endpoint
     /// (local indices `0` and `n−1`) when `looped`. `0` disables it. Within the
-    /// guard the flow is pinned to identity (registration never *moves* samples
-    /// at the seam) and the reduction is blended toward the band-limited master,
+    /// guard the **cumulative** flow is pinned to identity — at every pyramid
+    /// level, with the radius scaled to `ceil(radius / 2^level)`, so a
+    /// coarse-level seed cannot leak motion into the seam (registration never
+    /// *moves* samples at the seam) — and the reduction is blended toward the
+    /// band-limited master,
     /// which attenuates a seam tick **shared across all engines** — such ticks
     /// survive the per-sample median — and restores exact loop continuity. On
     /// by default (`8`); set to `0` to disable. Self-gates on `looped`, so it is
@@ -147,6 +174,8 @@ impl Default for LkParams {
         Self {
             radius: 5,
             n_iters: 1,
+            pyramid_levels: 2,
+            max_offset: 2.0,
             det_floor_rel: 1e-3,
             det_floor_abs: 1e-12,
             min_r2: 0.5,
@@ -255,34 +284,79 @@ fn sample_linear(signal: &[f64], pos: f64, looped: bool) -> f64 {
     a + (b - a) * frac
 }
 
-/// Single-level (or `n_iters`-refined) dense 1D Lucas-Kanade flow FROM the
-/// `master` TO the `engine`.
-///
-/// Per output sample `i`, over a window of radius `params.radius`:
-/// `Iₓ` is the central difference of the **master**, `Iₜ = engine − master`,
-/// and the flow is `u = −Σ(w·Iₓ·Iₜ) / Σ(w·Iₓ²)`, floored against
-/// `max(det_floor_abs, det_floor_rel · Σ w·master²)` (zero flow below the
-/// floor — flat / silent regions). The sign is such that
-/// `sample_linear(engine, i + u[i])` pulls the engine feature back onto the
-/// master's grid: an engine running `s` samples late yields `u ≈ +s`.
-///
-/// Returns one `u` per sample, length `min(master.len(), engine.len())`.
-pub fn dense_lk_1d(master: &[f64], engine: &[f64], looped: bool, params: LkParams) -> Vec<f64> {
-    let n = master.len().min(engine.len());
-    let mut flow = vec![0.0f64; n];
-    // Central differences need at least 3 samples; below that the flow is
-    // undefined — leave it at identity.
+/// Burt–Adelson pyramid downsample: binomial `[1,4,6,4,1]/16` low-pass, then
+/// decimate ×2 (keep even indices). The 5-tap kernel attenuates content near
+/// the new Nyquist, so the coarse level does not manufacture aliased
+/// gradients for the LK solve. Boundaries via [`idx`] — circular wrap when
+/// `looped`, edge replicate otherwise. Output length is `ceil(n / 2)`; an
+/// odd-length looped buffer therefore loses exact loop periodicity at the
+/// coarse level, which is acceptable because the coarse flow is only a seed
+/// the finest level refines (and the seam guard pins the seam regardless).
+fn downsample2_binomial(signal: &[f64], looped: bool) -> Vec<f64> {
+    let n = signal.len();
+    let mut out = vec![0.0f64; n.div_ceil(2)];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let c = (2 * i) as isize;
+        *slot = (signal[idx(c - 2, n, looped)]
+            + 4.0 * signal[idx(c - 1, n, looped)]
+            + 6.0 * signal[idx(c, n, looped)]
+            + 4.0 * signal[idx(c + 1, n, looped)]
+            + signal[idx(c + 2, n, looped)])
+            / 16.0;
+    }
+    out
+}
+
+/// Upsample a coarse-level flow field to the next finer level: linear
+/// interpolation at the dilated index (`i/2`), value ×2 (one coarse sample
+/// spans two fine samples). [`sample_linear`] handles the looped wrap / edge
+/// clamp at the half-sample tail overhang. Values within the coarse level's
+/// `±max_offset/2^L` clamp map exactly onto the finer level's
+/// `±max_offset/2^(L−1)`, so no re-clamp is needed here.
+fn upsample_flow2(flow_coarse: &[f64], n_fine: usize, looped: bool) -> Vec<f64> {
+    (0..n_fine)
+        .map(|i| 2.0 * sample_linear(flow_coarse, i as f64 * 0.5, looped))
+        .collect()
+}
+
+/// One pyramid level of the dense LK solve: `params.n_iters` forward-additive
+/// refinement passes over `flow`, the cumulative flow **at this level's
+/// scale** (zero, or the upsampled seed from the next coarser level). Each
+/// pass re-warps the original `engine` by the cumulative flow, accumulates
+/// the linearised increment, pins the cumulative flow to identity inside the
+/// (level-scaled) seam guard, and clamps it to `±max_offset / 2^level`.
+fn lk_refine_level(
+    master: &[f64],
+    engine: &[f64],
+    looped: bool,
+    params: LkParams,
+    level: usize,
+    flow: &mut [f64],
+) {
+    let n = master.len().min(engine.len()).min(flow.len());
     if n < 3 {
-        return flow;
+        return;
     }
     let r = params.radius.max(1) as isize;
     let iters = params.n_iters.max(1);
+    let scale = (1usize << level) as f64;
+    let clamp = if params.max_offset.is_finite() {
+        Some(params.max_offset.abs() / scale)
+    } else {
+        None
+    };
+    let guard = if params.seam_guard_radius > 0 && looped {
+        params.seam_guard_radius.div_ceil(1 << level)
+    } else {
+        0
+    };
 
-    // `warped` holds the engine re-warped by the cumulative flow between
-    // refinement passes; pass 0 sees the raw engine.
-    let mut warped: Vec<f64> = engine[..n].to_vec();
-    for iter in 0..iters {
-        for (i, flow_i) in flow.iter_mut().enumerate() {
+    for _ in 0..iters {
+        // Re-warp the ORIGINAL engine by the cumulative flow
+        // (forward-additive). A zero flow warps bit-exactly to the engine
+        // itself, so an unseeded first pass sees the raw engine.
+        let warped = linear_warp_1d(&engine[..n], &flow[..n], looped);
+        for (i, flow_i) in flow[..n].iter_mut().enumerate() {
             let ii = i as isize;
             // Bipolar bilateral (edge) weight: taps whose master value differs
             // from the window centre are attenuated, so a window straddling a
@@ -328,27 +402,99 @@ pub fn dense_lk_1d(master: &[f64], engine: &[f64], looped: bool, params: LkParam
             // and to stay well-defined when stt → 0 (then RHS → 0, LHS ≥ 0, so
             // the tiny residual flow — sxt ≈ 0 — is allowed through as ~0).
             let fit_ok = sxt * sxt >= params.min_r2 * sxx * stt;
-            let mut du = if sxx > det_floor && fit_ok {
+            let du = if sxx > det_floor && fit_ok {
                 -sxt / sxx
             } else {
                 0.0
             };
-            // Loop-seam guard (flow pin): within `seam_guard_radius` of either
-            // loop endpoint, hold the flow at identity. Registration must not
-            // *move* samples at the seam — any motion there manufactures a seam
-            // mismatch. Inert unless looped and the radius is set.
-            if params.seam_guard_radius > 0 && looped {
-                let g = params.seam_guard_radius;
-                if i < g || i >= n.saturating_sub(g) {
-                    du = 0.0;
-                }
+            // Loop-seam guard (flow pin): within the (level-scaled) guard of
+            // either loop endpoint, hold the CUMULATIVE flow at identity — a
+            // coarse-level seed must not leak motion into the seam.
+            // Registration must not *move* samples at the seam — any motion
+            // there manufactures a seam mismatch. Inert unless looped and the
+            // radius is set.
+            if guard > 0 && (i < guard || i >= n.saturating_sub(guard)) {
+                *flow_i = 0.0;
+                continue;
             }
-            *flow_i += if du.is_finite() { du } else { 0.0 };
+            let mut u = *flow_i + if du.is_finite() { du } else { 0.0 };
+            if let Some(c) = clamp {
+                u = u.clamp(-c, c);
+            }
+            *flow_i = u;
         }
-        // Re-warp the ORIGINAL engine by the cumulative flow for the next
-        // pass (forward-additive). Skip on the final pass.
-        if iter + 1 < iters {
-            warped = linear_warp_1d(&engine[..n], &flow, looped);
+    }
+}
+
+/// Pyramidal (coarse-to-fine) dense 1D Lucas-Kanade flow FROM the `master`
+/// TO the `engine`.
+///
+/// The solve runs over a binomial ×2 pyramid of [`LkParams::pyramid_levels`]
+/// levels (auto-capped so each level spans the analysis window), coarsest
+/// first; each level's flow is upsampled ([`upsample_flow2`]) to seed the
+/// next. Per output sample `i`, over a window of radius `params.radius`:
+/// `Iₓ` is the central difference of the **master**, `Iₜ = engine − master`,
+/// and the flow increment is `u = −Σ(w·Iₓ·Iₜ) / Σ(w·Iₓ²)`, floored against
+/// `max(det_floor_abs, det_floor_rel · Σ w·master²)` (zero flow below the
+/// floor — flat / silent regions). The sign is such that
+/// `sample_linear(engine, i + u[i])` pulls the engine feature back onto the
+/// master's grid: an engine running `s` samples late yields `u ≈ +s`.
+///
+/// The cumulative flow is clamped to ±[`LkParams::max_offset`] (scaled per
+/// level) after every pass, so the returned field always satisfies
+/// `|u[i]| ≤ max_offset` — an engine offset beyond the cap is *bounded*
+/// (clamped), not rejected to identity.
+///
+/// Returns one `u` per sample, length `min(master.len(), engine.len())`.
+pub fn dense_lk_1d(master: &[f64], engine: &[f64], looped: bool, params: LkParams) -> Vec<f64> {
+    let n = master.len().min(engine.len());
+    // Central differences need at least 3 samples; below that the flow is
+    // undefined — leave it at identity.
+    if n < 3 {
+        return vec![0.0f64; n];
+    }
+    // Pyramid depth: admit a coarser level only while it still spans the
+    // analysis window, capped by `params.pyramid_levels`.
+    let min_len = (2 * params.radius.max(1) + 1).max(3);
+    let mut lens = vec![n];
+    while lens.len() < params.pyramid_levels.max(1) {
+        let next = lens.last().unwrap().div_ceil(2);
+        if next < min_len {
+            break;
+        }
+        lens.push(next);
+    }
+    let levels = lens.len();
+
+    // Master/engine pyramids for levels 1.. (level 0 borrows the inputs).
+    let mut m_pyr: Vec<Vec<f64>> = Vec::with_capacity(levels - 1);
+    let mut e_pyr: Vec<Vec<f64>> = Vec::with_capacity(levels - 1);
+    for l in 1..levels {
+        let (mp, ep) = if l == 1 {
+            (
+                downsample2_binomial(&master[..n], looped),
+                downsample2_binomial(&engine[..n], looped),
+            )
+        } else {
+            (
+                downsample2_binomial(&m_pyr[l - 2], looped),
+                downsample2_binomial(&e_pyr[l - 2], looped),
+            )
+        };
+        m_pyr.push(mp);
+        e_pyr.push(ep);
+    }
+
+    let mut flow = vec![0.0f64; lens[levels - 1]];
+    for level in (0..levels).rev() {
+        let (m, e): (&[f64], &[f64]) = if level == 0 {
+            (&master[..n], &engine[..n])
+        } else {
+            (&m_pyr[level - 1], &e_pyr[level - 1])
+        };
+        lk_refine_level(m, e, looped, params, level, &mut flow);
+        if level > 0 {
+            flow = upsample_flow2(&flow, lens[level - 1], looped);
         }
     }
     flow
@@ -1005,6 +1151,157 @@ mod tests {
             (mean_u - 0.4).abs() < 0.1,
             "dense_lk_1d should recover the +0.4 sample shift, got {mean_u}"
         );
+    }
+
+    #[test]
+    fn pyramid_and_clamp_defaults() {
+        let p = LkParams::default();
+        assert_eq!(p.pyramid_levels, 2);
+        assert_eq!(p.max_offset, 2.0);
+    }
+
+    #[test]
+    fn max_offset_clamps_large_spurious_shift() {
+        // Engine shifted by +5 samples — far beyond the ±2 cap. The returned
+        // flow must stay within ±max_offset everywhere; with the cap disabled
+        // (and enough pyramid/iteration headroom to chase the shift) the
+        // interior flow exceeds 2 — proving the clamp, not the solve, is what
+        // bounds it.
+        let n = 2048;
+        let master: Vec<f64> = (0..n)
+            .map(|i| {
+                0.6 * (2.0 * std::f64::consts::PI * 500.0 * i as f64 / SR).sin()
+                    + 0.3 * (2.0 * std::f64::consts::PI * 1200.0 * i as f64 / SR).sin()
+            })
+            .collect();
+        let engine = shift(&master, 5.0, false);
+        let flow = dense_lk_1d(&master, &engine, false, LkParams::default());
+        assert!(
+            flow.iter().all(|u| u.abs() <= 2.0 + 1e-9),
+            "flow must respect max_offset = 2"
+        );
+        let unclamped = dense_lk_1d(
+            &master,
+            &engine,
+            false,
+            LkParams {
+                max_offset: f64::INFINITY,
+                pyramid_levels: 4,
+                n_iters: 3,
+                ..LkParams::default()
+            },
+        );
+        assert!(
+            unclamped.iter().any(|u| u.abs() > 2.0),
+            "negative control: without the cap a +5 shift should drive |u| past 2"
+        );
+    }
+
+    #[test]
+    fn pyramid_recovers_supersample_shift() {
+        // A +1.8 sample shift on 1 kHz + 4 kHz content: the 4 kHz component
+        // (12-sample period) breaks the single-level linearisation at that
+        // distance, but the coarse level sees a +0.9 shift — inside its
+        // convergence basin (and inside its ±1 scaled clamp) — and seeds the
+        // fine solve next to the answer.
+        let n = 2048;
+        let master: Vec<f64> = (0..n)
+            .map(|i| {
+                0.6 * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / SR).sin()
+                    + 0.3 * (2.0 * std::f64::consts::PI * 4000.0 * i as f64 / SR).sin()
+            })
+            .collect();
+        let engine = shift(&master, 1.8, false);
+        let margin = 16;
+        let mean_u =
+            |flow: &[f64]| flow[margin..n - margin].iter().sum::<f64>() / (n - 2 * margin) as f64;
+
+        let pyr = dense_lk_1d(&master, &engine, false, LkParams::default());
+        let err_pyr = (mean_u(&pyr) - 1.8).abs();
+        assert!(err_pyr < 0.25, "pyramidal LK should recover +1.8, err {err_pyr}");
+
+        let single = dense_lk_1d(
+            &master,
+            &engine,
+            false,
+            LkParams {
+                pyramid_levels: 1,
+                ..LkParams::default()
+            },
+        );
+        let err_single = (mean_u(&single) - 1.8).abs();
+        assert!(
+            err_single > 2.0 * err_pyr,
+            "negative control: single-level error ({err_single}) should be materially worse than pyramidal ({err_pyr})"
+        );
+    }
+
+    #[test]
+    fn seam_guard_pins_cumulative_flow_under_pyramid() {
+        // Looped, integer-cycle master globally shifted +1.5: the coarse-level
+        // seed is nonzero everywhere, so the finest-level guard must zero the
+        // CUMULATIVE flow at the seam — exactly — while the interior tracks
+        // the shift. Regression test for the guard zeroing only the per-pass
+        // increment.
+        let n = 2048;
+        let freq = 32.0 * SR / n as f64; // integer cycles → loop-continuous
+        let master = tone(SR, n, freq, 0.8, 0.3);
+        let engine = shift(&master, 1.5, true);
+        let params = LkParams::default();
+        let flow = dense_lk_1d(&master, &engine, true, params);
+        let g = params.seam_guard_radius;
+        for i in 0..g {
+            assert_eq!(flow[i], 0.0, "head guard sample {i} must be pinned");
+            assert_eq!(
+                flow[n - 1 - i],
+                0.0,
+                "tail guard sample {} must be pinned",
+                n - 1 - i
+            );
+        }
+        let margin = 64;
+        let mean_u = flow[margin..n - margin].iter().sum::<f64>() / (n - 2 * margin) as f64;
+        assert!(
+            (mean_u - 1.5).abs() < 0.3,
+            "interior should track the +1.5 shift, got {mean_u}"
+        );
+    }
+
+    #[test]
+    fn pyramid_auto_caps_levels_short_signal() {
+        // Requesting more levels than the signal can support must auto-cap
+        // (every level still spans the analysis window) and never panic.
+        for &n in &[16usize, 8, 3] {
+            let master = tone(SR, n, 1000.0, 0.5, 0.0);
+            let engine = shift(&master, 0.5, false);
+            let flow = dense_lk_1d(
+                &master,
+                &engine,
+                false,
+                LkParams {
+                    pyramid_levels: 6,
+                    ..LkParams::default()
+                },
+            );
+            assert_eq!(flow.len(), n);
+            assert!(flow.iter().all(|u| u.is_finite() && u.abs() <= 2.0));
+        }
+    }
+
+    #[test]
+    fn dense_lk_finite_with_nonfinite_engine() {
+        // NaN/Inf engine samples must not poison the flow: the increment
+        // guard runs before the clamp (`f64::clamp` propagates NaN), and the
+        // pyramid path low-passes the garbage into the coarse levels too.
+        let n = 1024;
+        let master = tone(SR, n, 1500.0, 0.6, 0.0);
+        let mut engine = shift(&master, 0.7, false);
+        engine[100] = f64::NAN;
+        engine[500] = f64::INFINITY;
+        engine[900] = f64::NEG_INFINITY;
+        let flow = dense_lk_1d(&master, &engine, false, LkParams::default());
+        assert_eq!(flow.len(), n);
+        assert!(flow.iter().all(|u| u.is_finite() && u.abs() <= 2.0));
     }
 
     /// Band-limited square wave: sum of odd harmonics up to Nyquist, built as
