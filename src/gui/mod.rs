@@ -1749,6 +1749,8 @@ pub struct Quinlight {
     // Keyjazz
     keyjazz_sample: Option<i32>,
     keyjazz_data: Option<Vec<f64>>,
+    /// Rate of `keyjazz_data` in Hz, captured when the sample was selected.
+    keyjazz_rate: i32,
 
     // Waveform viewer (replaces oscilloscope when Some). The cache persists
     // the rendered geometry so long samples don't rebuild on every tick —
@@ -1863,6 +1865,7 @@ impl Quinlight {
                 groove_data: Vec::new(),
                 keyjazz_sample: None,
                 keyjazz_data: None,
+                keyjazz_rate: 48_000,
                 selected_waveform_sample: None,
                 waveform_cache: canvas::Cache::default(),
                 render_progress_rx: None,
@@ -1965,6 +1968,25 @@ impl Quinlight {
         };
         let slot_index = slot.index;
         let is_playing = self.player_state.status == PlaybackStatus::Playing;
+        // Precompute the 48 kHz reference outside the module lock: the sinc
+        // resample over the whole sample can stall the audio callback (and
+        // trip the underrun-based buffer growth) if done under `with_module`.
+        // The in-lock lazy path in apply_sample_mode_to_slot then finds it
+        // already populated.
+        if matches!(target_mode, SampleMode::Reference48k)
+            && self.sample_slots[slot_idx].reference_48k.is_none()
+        {
+            let slot = &self.sample_slots[slot_idx];
+            let data = crate::remaster::resample_audio(
+                &slot.original,
+                slot.original_rate.max(1) as u32,
+                48_000,
+                slot.original_channels.max(1) as usize,
+                crate::remaster::ResampleBoundaryMode::OneShot,
+            )
+            .map_err(|err| format!("Sample {}: {err}", slot_index + 1))?;
+            self.sample_slots[slot_idx].reference_48k = Some(data);
+        }
         let player = Arc::clone(&self.player);
         let result = player
             .with_module(|module| {
@@ -2857,10 +2879,27 @@ impl Quinlight {
                 self.ddim_steps = steps;
             }
             Message::ClearSongCache => {
-                let deleted = self
-                    .player
-                    .with_module(crate::remaster::clear_cache_for_module)
-                    .unwrap_or(0);
+                // Hash from the pristine stash natives: after load-time
+                // normalization the live module holds only 48 kHz masters,
+                // whose rate and PCM can never reproduce the cache keys. This
+                // also keeps the per-sample reference renders + SHA-256 work
+                // off the player lock, where it would stall the audio
+                // callback. The module fallback covers un-normalized sessions
+                // (QUINLIGHT_NO_LOAD_NORMALIZE / no sub-48 kHz samples).
+                let stash = self.player.sample_stash();
+                let deleted = if stash.is_empty() {
+                    let deleted = self
+                        .player
+                        .with_module(crate::remaster::clear_cache_for_module)
+                        .unwrap_or(0);
+                    // The long lock hold can trip the underrun detector and
+                    // permanently double the device buffer; that would be
+                    // contention, not a real underrun.
+                    self.player.clear_stall_underrun();
+                    deleted
+                } else {
+                    crate::remaster::clear_cache_for_stash(&stash)
+                };
                 self.remaster_notice = Some(if deleted > 0 {
                     format!(
                         "Cleared {deleted} cached sample{}",
@@ -3089,22 +3128,31 @@ impl Quinlight {
                     Some(index)
                 };
                 self.waveform_cache.clear();
-                // Extract and cache sample data (convert stereo to mono)
-                self.keyjazz_data = self
+                // Extract and cache sample data (convert stereo to mono),
+                // along with its resident rate for playback-rate correction.
+                let extracted = self
                     .player
                     .with_module(|m| {
                         let data = m.read_sample_data(index)?;
+                        let rate = m.sample_rate(index);
                         let channels = m.sample_channels(index);
                         if channels == 2 {
                             // Average L+R to mono
                             let mono: Vec<f64> =
                                 data.chunks(2).map(|c| (c[0] + c[1]) * 0.5).collect();
-                            Some(mono)
+                            Some((mono, rate))
                         } else {
-                            Some(data)
+                            Some((data, rate))
                         }
                     })
                     .flatten();
+                match extracted {
+                    Some((data, rate)) => {
+                        self.keyjazz_data = Some(data);
+                        self.keyjazz_rate = rate.max(1);
+                    }
+                    None => self.keyjazz_data = None,
+                }
             }
             Message::KeyPressed(key, modifiers) => {
                 use iced::keyboard::{Key, key::Named};
@@ -3143,7 +3191,14 @@ impl Quinlight {
                         // Keyjazz: map keyboard to notes
                         if let Some(note) = key_to_note(c.as_str()) {
                             if let Some(ref data) = self.keyjazz_data {
-                                let rate_ratio = 2.0_f64.powf((note as f64 - 60.0) / 12.0);
+                                // The keyjazz mixer advances one source sample
+                                // per output frame at ratio 1.0, so fold in
+                                // data rate vs device rate — otherwise pitch
+                                // shifts with whatever rate SDL negotiated.
+                                let device_rate = self.player.current_playback_rate().max(1);
+                                let rate_ratio = 2.0_f64.powf((note as f64 - 60.0) / 12.0)
+                                    * self.keyjazz_rate as f64
+                                    / device_rate as f64;
                                 self.player.send(PlayerCommand::PlaySample {
                                     data: data.clone(),
                                     rate_ratio,
@@ -3209,9 +3264,14 @@ impl Quinlight {
                     } else {
                         &bt.ai_data
                     };
+                    // Both blind-test buffers are prepared at 48 kHz; correct
+                    // for the negotiated device rate or the audition plays at
+                    // the wrong pitch/speed (e.g. 2x fast on a 96 kHz device).
+                    let rate_ratio =
+                        48_000.0 / self.player.current_playback_rate().max(1) as f64;
                     self.player.send(PlayerCommand::PlaySample {
                         data: data.clone(),
-                        rate_ratio: 1.0,
+                        rate_ratio,
                     });
                 }
             }
@@ -3222,9 +3282,11 @@ impl Quinlight {
                     } else {
                         &bt.original_data
                     };
+                    let rate_ratio =
+                        48_000.0 / self.player.current_playback_rate().max(1) as f64;
                     self.player.send(PlayerCommand::PlaySample {
                         data: data.clone(),
-                        rate_ratio: 1.0,
+                        rate_ratio,
                     });
                 }
             }

@@ -337,14 +337,6 @@ unsafe extern "C" {
         module: *mut OpenmptModule,
         ctl: *const c_char,
     ) -> c_double;
-
-    // AVX2 SIMD kernel for stereo 64-tap dot product (Aniso64AVX2.cpp)
-    fn aniso64_dot_stereo_avx2(
-        kernel: *const c_double,
-        samples: *const c_double,
-        out_l: *mut c_double,
-        out_r: *mut c_double,
-    );
 }
 
 #[cfg(test)]

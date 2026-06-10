@@ -3900,6 +3900,77 @@ mod tests {
         assert_eq!(module.aniso64_k_r(), 2.5);
     }
 
+    #[test]
+    fn aniso64_ctl_setters_reject_nan() {
+        let data = std::fs::read(XM_FIXTURE).expect("Failed to read XM fixture");
+        let mut module = Module::from_memory(&data).expect("Failed to load XM fixture");
+        // NaN compares false against both range bounds, so a `< lo || > hi`
+        // check lets it through into UB float->int casts in the mixer.
+        assert!(!module.set_aniso64_k_r(f64::NAN));
+        assert!(
+            (module.aniso64_k_r() - 0.8).abs() < 1e-12,
+            "k_r must be unchanged after a NaN set"
+        );
+        assert!(!module.set_aniso64_k_beta(f64::NAN));
+        assert!(
+            (module.aniso64_k_beta() - 0.65).abs() < 1e-12,
+            "k_beta must be unchanged after a NaN set"
+        );
+        assert!(!module.set_aniso64_k_beta2(f64::NAN));
+        assert!(
+            (module.aniso64_k_beta2() - 0.15).abs() < 1e-12,
+            "k_beta2 must be unchanged after a NaN set"
+        );
+    }
+
+    #[test]
+    fn sample_index_out_of_range_is_rejected_not_aliased() {
+        let data = std::fs::read(BASIC_FIXTURE).expect("test fixture must exist");
+        let module = Module::from_memory(&data).expect("load module");
+        assert!(module.sample_rate(0) > 0, "sample 0 must exist in the fixture");
+        // A bare uint16 cast of (index + 1) would alias 65536 onto sample 1
+        // (index 0), and i32::MAX would be signed-overflow UB in the C++.
+        assert_eq!(module.sample_rate(65535), 0);
+        assert_eq!(module.sample_rate(65536), 0);
+        assert_eq!(module.sample_rate(i32::MAX), 0);
+        assert_eq!(module.sample_rate(-1), 0);
+        assert_eq!(module.sample_length_frames(65536), 0);
+        assert_eq!(module.sample_channels(i32::MAX), 0);
+    }
+
+    #[test]
+    fn failed_loop_points_leave_sample_untouched() {
+        let data = std::fs::read(BASIC_FIXTURE).expect("test fixture must exist");
+        let mut module = Module::from_memory(&data).expect("load module");
+        let sample_index = 0;
+        let len = module.sample_length_frames(sample_index);
+        assert!(len > 2, "fixture sample 0 must have data");
+        let before = module.sample_loop_info(sample_index);
+
+        // Valid normal loop paired with an invalid sustain loop (end past the
+        // sample length): the call must fail atomically, without committing
+        // the normal loop and leaving stale precomputed wrap/mip strips.
+        let invalid = SampleLoopInfo::with_loops(
+            SampleLoopRegion::forward(0, len),
+            SampleLoopRegion::forward(0, len + 1),
+        );
+        assert!(!module.set_sample_loop_points(sample_index, &invalid));
+        assert_eq!(
+            module.sample_loop_info(sample_index),
+            before,
+            "failed set_sample_loop_points must not mutate the sample"
+        );
+
+        // A loop_end that wraps to 0 when truncated to 32 bits must be
+        // rejected by the pre-cast int64 validation, not "succeed" as 0.
+        let wrapping = SampleLoopInfo::with_loops(
+            SampleLoopRegion::forward(0, 1i64 << 32),
+            SampleLoopRegion::none(),
+        );
+        assert!(!module.set_sample_loop_points(sample_index, &wrapping));
+        assert_eq!(module.sample_loop_info(sample_index), before);
+    }
+
     /// Build a synthetic sample-mode fixture for the data-mip gather: load
     /// the S3M fixture (no instrument envelopes or autovibrato), replace a
     /// sample with `wave` (mono, declared at `declared_rate` Hz), set the
@@ -5012,7 +5083,10 @@ mod tests {
     // --- Aniso-64 enhancement tests ---
 
     /// Calls the extern "C" AVX2 stereo dot product for testing.
-    /// Safety: kernel must have 64 elements, samples must have 128 elements.
+    /// Safety: kernel must have 64 elements, samples must have 128 elements,
+    /// and the CPU must support AVX2 (the symbol is compiled with -mavx2;
+    /// callers must check is_x86_feature_detected! first or this is SIGILL).
+    #[cfg(target_arch = "x86_64")]
     unsafe fn call_aniso64_stereo(kernel: &[f64; 64], samples: &[f64; 128]) -> (f64, f64) {
         unsafe extern "C" {
             fn aniso64_dot_stereo_avx2(
@@ -5031,7 +5105,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn aniso64_stereo_avx2_deinterleave_correctness() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("skipping aniso64_stereo_avx2_deinterleave_correctness: CPU lacks AVX2");
+            return;
+        }
         // Identity kernel: 1.0 at tap 31, 0.0 elsewhere — should pick out sample pair 31
         let mut kernel = [0.0f64; 64];
         kernel[31] = 1.0;

@@ -692,9 +692,13 @@ struct Aniso64Interpolation
 		incRaw = chn.increment.GetRaw();
 
 		// Depth of the data mip pyramid built for this sample. 0 (no
-		// pyramid yet) degrades to a level-0-only gather.
+		// pyramid yet) degrades to a level-0-only gather. CanFitMips guards
+		// against a stale nMipLevelsBuilt carried along by a ModSample struct
+		// copy whose buffer was later swapped without PrecomputeLoops (e.g.
+		// the tracker-only LoadExternalSample path): if the current
+		// length/format cannot contain a pyramid, never read past the body.
 		const ModSample *smp = chn.pModSample;
-		const int maxLevel = (smp != nullptr && smp->HasSampleData())
+		const int maxLevel = (smp != nullptr && smp->HasSampleData() && ModSample::CanFitMips(smp->nLength, smp->GetBytesPerSample()))
 			? std::min(static_cast<int>(smp->nMipLevelsBuilt), SampleMip::MaxLevels(smp->nLength))
 			: 0;
 		const double mu = std::min(std::log2(ratio), static_cast<double>(maxLevel));

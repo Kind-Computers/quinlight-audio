@@ -53,6 +53,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used to blow the first callback's deadline and falsely grow the buffer)
 
 ### Fixed
+- **Code-review hardening pass** across the vendored libopenmpt extensions
+  and their Rust callers:
+  - Samples without a data mip pyramid (over-budget allocations or a failed
+    build) now route to the octave-spaced polyphase resampler beyond 2×
+    downsampling instead of playing badly under-bandlimited through the
+    one-octave Aniso-64 kernel family
+  - "Clear song cache" works again for normalized modules: hashes are now
+    derived from the pristine load-time stash (the live module only holds
+    48 kHz masters, which can never reproduce the cache keys), and the
+    hashing/render work no longer runs while holding the audio-callback lock
+  - Keyjazz and blind-test audition now correct for sample rate vs the
+    negotiated device rate (previously an octave up / 2× fast on a 96 kHz
+    device)
+  - `set_sample_loop_points` validates both loop regions (in 64-bit, pre-cast)
+    before mutating, so a failed call can no longer leave new loop points live
+    against stale precomputed wrap buffers and mip strips (regression-tested)
+  - Sample/instrument indices in the Quinlight C accessors are range-checked
+    before narrowing — out-of-range indices (e.g. 65536) no longer silently
+    alias valid samples, and `i32::MAX` no longer overflows (regression-tested)
+  - NaN is rejected by the `aniso64_k_beta`/`k_beta2`/`k_r` ctl setters
+    (it previously slipped past the range checks into undefined float→int
+    casts in the mixer; regression-tested)
+  - Ping-pong loop turnarounds no longer spike the Aniso-64 shear/blur
+    derivatives (the increment's sign flip read as a 2·|inc| pitch jump every
+    bounce); the second-order term is now also tempo-robust
+  - Load-time normalization handles `set_sample_loop_points` failure by
+    clearing the loops instead of silently leaving native-rate loop points
+    against the 48 kHz buffer
+  - Sample-offset effect patching compares instrument numbers in 32-bit
+    (sample 255 wrapped onto the "none" sentinel, ≥256 aliased low instruments
+    in >255-sample modules)
+  - `--playback-rate`/`convert --sample-rate` are validated against
+    libopenmpt's 8000–192000 Hz render range (out-of-range rates produced
+    permanent silence or a misleading batch abort)
+  - The no-audio-device player drops commands instead of queuing them forever
+    (slow unbounded memory growth); the AVX2 SIMD unit test is gated on CPU
+    feature detection; `aniso64_k_r` participates in resampler-settings
+    equality; the mip builder catches `length_error` as well as `bad_alloc`
 - The Aniso-64 loop-start strips disengaged 2^level× too early after each
   loop wrap (`CHN_WRAPPED_LOOP` lifetime was sized for the level-0 kernel),
   letting pre-loop attack content bleed into deep-mip loop passes — up to

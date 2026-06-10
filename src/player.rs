@@ -949,6 +949,12 @@ impl Player {
     }
 
     pub fn send(&self, cmd: PlayerCommand) {
+        // Only the audio callback drains the queue. The dummy player has no
+        // callback, so queuing there would leak every command for the life
+        // of the session (PlaySample clones whole sample buffers).
+        if self.sdl.is_none() {
+            return;
+        }
         let _ = self.command_tx.send(cmd);
     }
 

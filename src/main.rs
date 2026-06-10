@@ -229,7 +229,9 @@ struct Cli {
     /// Force the GUI playback DAC sample rate in Hz. If unset, auto-negotiates
     /// from [96000, 88200, 48000, 44100]. Useful when 96 kHz crashes Bluetooth
     /// headphones — pass `--playback-rate 48000` to cap output at 48 kHz.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(8000..=384000))]
+    /// Capped at 192000: libopenmpt's render range is 8000-192000 Hz, and a
+    /// rate outside it makes every read return 0 frames (permanent silence).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(8000..=192000))]
     playback_rate: Option<u32>,
 }
 
@@ -284,8 +286,10 @@ enum Commands {
         #[arg(long, default_value = "50")]
         ddim_steps: u32,
 
-        /// Override output sample rate in Hz (default: 96000, capped at 96000 for AAC)
-        #[arg(long)]
+        /// Override output sample rate in Hz (default: 96000, capped at 96000 for AAC).
+        /// Range 8000-192000: outside libopenmpt's render range every read
+        /// returns 0 frames, which would abort the whole batch as "no audio".
+        #[arg(long, value_parser = clap::value_parser!(u32).range(8000..=192000))]
         sample_rate: Option<u32>,
 
         /// Disable HRTF headphone spatialization in rendered output

@@ -7126,6 +7126,40 @@ pub fn collect_cache_hashes_for_module(module: &mut Module) -> Vec<String> {
     all_hashes
 }
 
+/// Collect cache hashes from the load-time normalization stash. The stash
+/// natives are the pristine sub-48 kHz PCM the cache keys were derived from;
+/// after `normalize_samples_to_48k` the live module holds only 48 kHz masters,
+/// whose rate and PCM can never reproduce those keys, so the module-based
+/// collection above only works for un-normalized sessions.
+pub fn collect_cache_hashes_for_stash(stash: &[NormalizedSample]) -> Vec<String> {
+    let mut all_hashes = Vec::new();
+
+    for entry in stash {
+        let native = &entry.native;
+        if native.data.is_empty() || native.channels <= 0 || native.rate <= 0 {
+            continue;
+        }
+        let loop_prep = LoopPrepPlan::from_sample(native.source_length_frames, native.loop_info);
+        all_hashes.extend(collect_cache_hashes_for_sample(
+            &native.data,
+            native.rate,
+            native.channels,
+            loop_prep,
+        ));
+    }
+
+    all_hashes.sort();
+    all_hashes.dedup();
+    all_hashes
+}
+
+/// Delete cached upscaled samples for every native sample in the stash.
+/// Runs entirely from the snapshot — no module (player lock) needed.
+pub fn clear_cache_for_stash(stash: &[NormalizedSample]) -> usize {
+    let hashes = collect_cache_hashes_for_stash(stash);
+    delete_cache_files_for_hashes(&hashes)
+}
+
 /// Delete cache files matching the given hashes from the cache directory.
 pub fn delete_cache_files_for_hashes(hashes: &[String]) -> usize {
     let cache = cache_dir();
@@ -7497,7 +7531,11 @@ fn patch_sample_offsets_non_xm(
     old_rate: i32,
     new_rate: i32,
 ) {
-    let instrument = (sample_index + 1) as u8; // S3M/IT: instrument = sample + 1
+    // S3M/IT: instrument = sample + 1. Compare in i32: pattern instrument
+    // bytes are u8, so a u8 cast would wrap sample 255 onto the "no
+    // instrument seen yet" state (0) and alias sample >= 256 onto a
+    // low-numbered instrument; in i32 such samples simply never match.
+    let instrument = sample_index + 1;
     let num_patterns = module.num_patterns();
     let num_channels = module.num_channels();
     let old_r = old_rate as u32;
@@ -7508,11 +7546,11 @@ fn patch_sample_offsets_non_xm(
         if num_rows <= 0 {
             continue;
         }
-        let mut channel_instrument = vec![0u8; num_channels as usize];
+        let mut channel_instrument = vec![0i32; num_channels as usize];
 
         for row in 0..num_rows {
             for ch in 0..num_channels {
-                let instr = module.get_pattern_command(pat, row, ch, COMMAND_INSTRUMENT);
+                let instr = i32::from(module.get_pattern_command(pat, row, ch, COMMAND_INSTRUMENT));
                 if instr > 0 {
                     channel_instrument[ch as usize] = instr;
                 }
@@ -7616,7 +7654,8 @@ pub fn patch_sample_offsets(module: &mut Module, sample_index: i32, old_rate: i3
 pub type SavedEffectParam = (i32, i32, i32, u8);
 
 fn save_effect_params_non_xm(module: &Module, sample_index: i32) -> Vec<SavedEffectParam> {
-    let instrument = (sample_index + 1) as u8;
+    // i32 comparison for the same wrap-around reason as patch_sample_offsets.
+    let instrument = sample_index + 1;
     let num_patterns = module.num_patterns();
     let num_channels = module.num_channels();
     let mut saved = Vec::new();
@@ -7626,11 +7665,11 @@ fn save_effect_params_non_xm(module: &Module, sample_index: i32) -> Vec<SavedEff
         if num_rows <= 0 {
             continue;
         }
-        let mut channel_instrument = vec![0u8; num_channels as usize];
+        let mut channel_instrument = vec![0i32; num_channels as usize];
 
         for row in 0..num_rows {
             for ch in 0..num_channels {
-                let instr = module.get_pattern_command(pat, row, ch, COMMAND_INSTRUMENT);
+                let instr = i32::from(module.get_pattern_command(pat, row, ch, COMMAND_INSTRUMENT));
                 if instr > 0 {
                     channel_instrument[ch as usize] = instr;
                 }
@@ -7907,7 +7946,22 @@ pub fn normalize_samples_to_48k(module: &mut Module) -> Vec<NormalizedSample> {
             );
             continue;
         }
-        module.set_sample_loop_points(native.index, &loops_48k);
+        // replace_sample_data_raw does not scale loop points — they must be
+        // set explicitly or the module keeps native-rate loop frames against
+        // the 48 kHz buffer (audibly corrupted sustained notes). On failure,
+        // clear the loops so module state and the stash stay consistent
+        // rather than silently recording loops_48k as applied.
+        let loops_48k = if module.set_sample_loop_points(native.index, &loops_48k) {
+            loops_48k
+        } else {
+            eprintln!(
+                "normalize_samples_to_48k: set_sample_loop_points failed for sample {}; clearing loops",
+                native.index
+            );
+            let cleared = crate::openmpt::SampleLoopInfo::none();
+            let _ = module.set_sample_loop_points(native.index, &cleared);
+            cleared
+        };
         // Patch Oxx/SAx sample-offset effects once here, native -> 48 kHz. After
         // this the module's offset space is 48 kHz, so later 48k -> 48k swaps in
         // apply_sample_mode_to_slot never re-patch (patch_sample_offsets is a

@@ -110,7 +110,7 @@ public:
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wfloat-equal"
 #endif // MPT_COMPILER_CLANG
-		return SrcMode == cmp.SrcMode && emulateAmiga == cmp.emulateAmiga && aniso64_k_beta == cmp.aniso64_k_beta && aniso64_k_beta2 == cmp.aniso64_k_beta2
+		return SrcMode == cmp.SrcMode && emulateAmiga == cmp.emulateAmiga && aniso64_k_beta == cmp.aniso64_k_beta && aniso64_k_beta2 == cmp.aniso64_k_beta2 && aniso64_k_r == cmp.aniso64_k_r
 #ifdef MODPLUG_TRACKER
 			&& gdWFIRCutoff == cmp.gdWFIRCutoff && gbWFIRType == cmp.gbWFIRType
 #endif

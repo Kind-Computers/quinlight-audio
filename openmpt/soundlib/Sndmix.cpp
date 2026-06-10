@@ -2422,13 +2422,19 @@ bool CSoundFile::ReadNote()
 			if(!chn.prevIncrement.IsZero())
 			{
 				const double spt = std::max(1.0, static_cast<double>(m_PlayState.m_nSamplesPerTick));
-				const double incNow = static_cast<double>(chn.increment.GetRaw());
-				const double incPrev = static_cast<double>(chn.prevIncrement.GetRaw());
-				const double prevDelta = static_cast<double>(chn.prevDeltaIncrement.GetRaw());
+				// Magnitudes: Fastmix flips the increment's sign at ping-pong
+				// turnarounds, which is a direction change, not pitch motion —
+				// the raw delta would read a bounce as a 2·|inc| pitch jump and
+				// slam the shear/blur to its clamp on every reversal.
+				const double incNow = std::abs(static_cast<double>(chn.increment.GetRaw()));
+				const double incPrev = std::abs(static_cast<double>(chn.prevIncrement.GetRaw()));
+				const double prevDot = chn.anisoIncDot;
 				chn.anisoIncDot = (incNow - incPrev) / spt;
-				chn.anisoIncDotDot = ((incNow - incPrev) - prevDelta) / (spt * spt);
+				// Second difference of the already-normalized dots, so it stays
+				// correct across tempo (tick length) changes too.
+				chn.anisoIncDotDot = (chn.anisoIncDot - prevDot) / spt;
 				const auto mipOf = [](double rawAbs) { return std::log2(std::max(1.0, rawAbs / 4294967296.0)); };
-				chn.anisoMuDot = (mipOf(std::abs(incNow)) - mipOf(std::abs(incPrev))) / spt;
+				chn.anisoMuDot = (mipOf(incNow) - mipOf(incPrev)) / spt;
 			} else
 			{
 				chn.anisoIncDot = 0.0;

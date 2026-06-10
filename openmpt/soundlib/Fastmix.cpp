@@ -365,6 +365,22 @@ bool CSoundFile::MixChannel(int count, ModChannel &chn, CHANNELINDEX channel, bo
 		auto [pOfsL, pOfsR] = GetChannelOffsets(chn, channel);
 
 		uint32 functionNdx = MixFuncTable::ResamplingModeToMixFlags(static_cast<ResamplingMode>(chn.resamplingMode));
+		// Aniso-64's kernel family only spans one octave — the deeper octaves
+		// come from the per-sample data mip pyramid. Without a usable pyramid
+		// (none built, or the sample exceeded the allocation budget so the mip
+		// region doesn't exist), the gather would be badly under-bandlimited
+		// beyond 2x downsampling, so route this channel to the octave-spaced
+		// polyphase mip path instead.
+		if(chn.resamplingMode == SRCMODE_ANISO64)
+		{
+			const int64 incRaw = chn.increment.GetRaw();
+			const bool downsampling2x = incRaw >= (int64(2) << 32) || incRaw <= -(int64(2) << 32);
+			const bool havePyramid = chn.pModSample != nullptr
+				&& chn.pModSample->nMipLevelsBuilt > 0
+				&& ModSample::CanFitMips(chn.pModSample->nLength, chn.pModSample->GetBytesPerSample());
+			if(downsampling2x && !havePyramid)
+				functionNdx = MixFuncTable::ndxKaiser;
+		}
 		if(chn.pModSample != nullptr)
 		{
 			switch(chn.pModSample->GetRuntimeSampleFormat())

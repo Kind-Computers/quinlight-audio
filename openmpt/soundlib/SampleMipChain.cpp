@@ -411,11 +411,13 @@ void BuildSampleMips(ModSample &smp, const CSoundFile &sndFile)
 			BuildSampleMipsImpl<double>(smp, sndFile);
 		else if(smp.GetRuntimeSampleFormat() == ModSample::RuntimeSampleFormat::Float32)
 			BuildSampleMipsImpl<somefloat32>(smp, sndFile);
-	} catch(const std::bad_alloc &)
+	} catch(const std::exception &)
 	{
 		// The double-precision working buffers are transient but can reach
-		// several GiB for maximum-length samples. PrecomputeLoops must not
-		// throw — degrade to the level-0-only gather instead.
+		// several GiB for maximum-length samples; besides bad_alloc, vector
+		// can throw length_error when the request exceeds max_size() (32-bit
+		// size_t). PrecomputeLoops must not throw — degrade to the
+		// level-0-only gather instead.
 		smp.nMipLevelsBuilt = 0;
 	}
 }

@@ -2233,21 +2233,24 @@ void module_impl::ctl_set_floatingpoint( std::string_view ctl, double value, boo
 	} else if ( ctl == "render.opl.volume_factor" ) {
 		m_sndFile->m_OPLVolumeFactor = mpt::saturate_round<std::int32_t>( value * static_cast<double>( OpenMPT::CSoundFile::m_OPLVolumeFactorScale ) );
 	} else if ( ctl == "render.resampler.aniso64_k_beta" ) {
-		if ( value < 0.0 || value > 2.0 ) {
+		// NaN must be rejected too, so test the accepted range positively.
+		if ( !( value >= 0.0 && value <= 2.0 ) ) {
 			throw openmpt::exception("invalid aniso64_k_beta value (range: 0.0-2.0)");
 		}
 		auto settings = m_sndFile->m_Resampler.m_Settings;
 		settings.aniso64_k_beta = value;
 		m_sndFile->SetResamplerSettings( settings );
 	} else if ( ctl == "render.resampler.aniso64_k_beta2" ) {
-		if ( value < 0.0 || value > 2.0 ) {
+		// NaN must be rejected too, so test the accepted range positively.
+		if ( !( value >= 0.0 && value <= 2.0 ) ) {
 			throw openmpt::exception("invalid aniso64_k_beta2 value (range: 0.0-2.0)");
 		}
 		auto settings = m_sndFile->m_Resampler.m_Settings;
 		settings.aniso64_k_beta2 = value;
 		m_sndFile->SetResamplerSettings( settings );
 	} else if ( ctl == "render.resampler.aniso64_k_r" ) {
-		if ( value < 0.0 || value > 4.0 ) {
+		// NaN must be rejected too, so test the accepted range positively.
+		if ( !( value >= 0.0 && value <= 4.0 ) ) {
 			throw openmpt::exception("invalid aniso64_k_r value (range: 0.0-4.0)");
 		}
 		auto settings = m_sndFile->m_Resampler.m_Settings;
@@ -2371,13 +2374,31 @@ OpenMPT::SmpLength scale_sample_frame_count_round( OpenMPT::SmpLength frames, ui
 	return mpt::saturate_cast<OpenMPT::SmpLength>( scaled );
 }
 
+// 0-based public index -> 1-based internal index, or 0 if out of range.
+// Range-checked before any arithmetic or narrowing cast: `index + 1` would be
+// signed-overflow UB at INT32_MAX, and a bare uint16 cast would alias
+// out-of-range indices onto valid samples (e.g. 65536 -> sample 1).
+OpenMPT::SAMPLEINDEX checked_sample_index( const OpenMPT::CSoundFile & sndFile, std::int32_t index ) {
+	if ( index < 0 || index >= static_cast<std::int32_t>( sndFile.GetNumSamples() ) ) {
+		return 0;
+	}
+	return static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+}
+
+OpenMPT::INSTRUMENTINDEX checked_instrument_index( const OpenMPT::CSoundFile & sndFile, std::int32_t index ) {
+	if ( index < 0 || index >= static_cast<std::int32_t>( sndFile.GetNumInstruments() ) ) {
+		return 0;
+	}
+	return static_cast<OpenMPT::INSTRUMENTINDEX>( index + 1 );
+}
+
 } // namespace
 
 // --- Quinlight sample data access extensions ---
 
 std::int32_t module_impl::get_sample_rate( std::int32_t index ) const {
 	// C API uses 0-based indices, internal uses 1-based
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2392,7 +2413,7 @@ std::int32_t module_impl::get_sample_rate( std::int32_t index ) const {
 }
 
 std::int64_t module_impl::get_sample_length_frames( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2401,7 +2422,7 @@ std::int64_t module_impl::get_sample_length_frames( std::int32_t index ) const {
 }
 
 std::int32_t module_impl::get_sample_channels( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2410,7 +2431,7 @@ std::int32_t module_impl::get_sample_channels( std::int32_t index ) const {
 }
 
 std::int32_t module_impl::get_sample_c5_speed( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2419,7 +2440,7 @@ std::int32_t module_impl::get_sample_c5_speed( std::int32_t index ) const {
 }
 
 std::int32_t module_impl::get_sample_relative_tone( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2428,7 +2449,7 @@ std::int32_t module_impl::get_sample_relative_tone( std::int32_t index ) const {
 }
 
 std::int32_t module_impl::get_sample_fine_tune( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2437,7 +2458,7 @@ std::int32_t module_impl::get_sample_fine_tune( std::int32_t index ) const {
 }
 
 std::int32_t module_impl::get_sample_default_volume( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2446,7 +2467,7 @@ std::int32_t module_impl::get_sample_default_volume( std::int32_t index ) const 
 }
 
 std::int32_t module_impl::has_sample_default_pan( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2455,7 +2476,7 @@ std::int32_t module_impl::has_sample_default_pan( std::int32_t index ) const {
 }
 
 std::int32_t module_impl::get_sample_default_pan( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 128;
 	}
@@ -2464,7 +2485,7 @@ std::int32_t module_impl::get_sample_default_pan( std::int32_t index ) const {
 }
 
 std::int32_t module_impl::get_instrument_keyboard_sample( std::int32_t instrument_index, std::int32_t note ) const {
-	OpenMPT::INSTRUMENTINDEX insIdx = static_cast<OpenMPT::INSTRUMENTINDEX>( instrument_index + 1 );
+	OpenMPT::INSTRUMENTINDEX insIdx = checked_instrument_index( *m_sndFile, instrument_index );
 	if ( insIdx < 1 || insIdx > m_sndFile->GetNumInstruments() ) {
 		return -1;
 	}
@@ -2483,7 +2504,7 @@ std::int32_t module_impl::get_instrument_keyboard_sample( std::int32_t instrumen
 }
 
 std::int64_t module_impl::read_sample_data( std::int32_t index, double * buffer, std::int64_t buffer_frames ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() || buffer_frames <= 0 ) {
 		return 0;
 	}
@@ -2517,7 +2538,7 @@ std::int64_t module_impl::read_sample_data( std::int32_t index, double * buffer,
 }
 
 int module_impl::replace_sample_data( std::int32_t index, const double * data, std::int64_t length_frames, std::int32_t channels, std::int32_t new_sample_rate ) {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2628,7 +2649,7 @@ int module_impl::replace_sample_data( std::int32_t index, const double * data, s
 }
 
 int module_impl::replace_sample_data_raw( std::int32_t index, const double * data, std::int64_t length_frames, std::int32_t channels, std::int32_t new_sample_rate ) {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2706,11 +2727,27 @@ int module_impl::replace_sample_data_raw( std::int32_t index, const double * dat
 }
 
 int module_impl::set_sample_loop_points( std::int32_t index, std::int64_t loop_start, std::int64_t loop_end, std::int32_t loop_mode, std::int64_t sustain_start, std::int64_t sustain_end, std::int32_t sustain_mode ) {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
 	OpenMPT::ModSample & smp = m_sndFile->GetSample( smpIdx );
+
+	// Validate both regions before mutating anything, in int64 (a bounds check
+	// after the SmpLength cast would let e.g. loop_end == 2^32 wrap to 0 and
+	// pass). A failed call must leave the sample untouched: the mixer keeps
+	// reading the precomputed wrap buffers and mip strips, which only
+	// PrecomputeLoops below brings back in sync with the loop points.
+	if ( loop_mode != 0 ) {
+		if ( loop_start < 0 || loop_end <= loop_start || loop_end > static_cast<std::int64_t>( smp.nLength ) ) {
+			return 0;
+		}
+	}
+	if ( sustain_mode != 0 ) {
+		if ( sustain_start < 0 || sustain_end <= sustain_start || sustain_end > static_cast<std::int64_t>( smp.nLength ) ) {
+			return 0;
+		}
+	}
 
 	// Normal loop
 	if ( loop_mode == 0 ) {
@@ -2719,9 +2756,6 @@ int module_impl::set_sample_loop_points( std::int32_t index, std::int64_t loop_s
 		smp.nLoopStart = 0;
 		smp.nLoopEnd = 0;
 	} else {
-		if ( loop_start < 0 || loop_end <= loop_start || static_cast<OpenMPT::SmpLength>( loop_end ) > smp.nLength ) {
-			return 0;
-		}
 		smp.uFlags.set( OpenMPT::CHN_LOOP );
 		if ( loop_mode == 2 ) {
 			smp.uFlags.set( OpenMPT::CHN_PINGPONGLOOP );
@@ -2739,9 +2773,6 @@ int module_impl::set_sample_loop_points( std::int32_t index, std::int64_t loop_s
 		smp.nSustainStart = 0;
 		smp.nSustainEnd = 0;
 	} else {
-		if ( sustain_start < 0 || sustain_end <= sustain_start || static_cast<OpenMPT::SmpLength>( sustain_end ) > smp.nLength ) {
-			return 0;
-		}
 		smp.uFlags.set( OpenMPT::CHN_SUSTAINLOOP );
 		if ( sustain_mode == 2 ) {
 			smp.uFlags.set( OpenMPT::CHN_PINGPONGSUSTAIN );
@@ -2758,7 +2789,7 @@ int module_impl::set_sample_loop_points( std::int32_t index, std::int64_t loop_s
 }
 
 int module_impl::refresh_channels_for_sample( std::int32_t index ) {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2923,7 +2954,7 @@ std::string module_impl::get_best_save_format_extension() const {
 }
 
 std::int32_t module_impl::get_sample_bits_per_sample( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2932,7 +2963,7 @@ std::int32_t module_impl::get_sample_bits_per_sample( std::int32_t index ) const
 }
 
 std::int32_t module_impl::get_sample_format( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return -1;
 	}
@@ -2952,7 +2983,7 @@ std::int32_t module_impl::get_sample_format( std::int32_t index ) const {
 }
 
 int module_impl::has_sample_loop( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2960,7 +2991,7 @@ int module_impl::has_sample_loop( std::int32_t index ) const {
 }
 
 std::int64_t module_impl::get_sample_loop_start( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2972,7 +3003,7 @@ std::int64_t module_impl::get_sample_loop_start( std::int32_t index ) const {
 }
 
 std::int64_t module_impl::get_sample_loop_end( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2984,7 +3015,7 @@ std::int64_t module_impl::get_sample_loop_end( std::int32_t index ) const {
 }
 
 std::int32_t module_impl::get_sample_loop_mode( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -2996,7 +3027,7 @@ std::int32_t module_impl::get_sample_loop_mode( std::int32_t index ) const {
 }
 
 int module_impl::has_sample_sustain_loop( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -3004,7 +3035,7 @@ int module_impl::has_sample_sustain_loop( std::int32_t index ) const {
 }
 
 std::int64_t module_impl::get_sample_sustain_loop_start( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -3016,7 +3047,7 @@ std::int64_t module_impl::get_sample_sustain_loop_start( std::int32_t index ) co
 }
 
 std::int64_t module_impl::get_sample_sustain_loop_end( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
@@ -3028,7 +3059,7 @@ std::int64_t module_impl::get_sample_sustain_loop_end( std::int32_t index ) cons
 }
 
 std::int32_t module_impl::get_sample_sustain_loop_mode( std::int32_t index ) const {
-	OpenMPT::SAMPLEINDEX smpIdx = static_cast<OpenMPT::SAMPLEINDEX>( index + 1 );
+	OpenMPT::SAMPLEINDEX smpIdx = checked_sample_index( *m_sndFile, index );
 	if ( smpIdx < 1 || smpIdx > m_sndFile->GetNumSamples() ) {
 		return 0;
 	}
