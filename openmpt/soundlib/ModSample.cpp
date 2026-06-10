@@ -12,6 +12,7 @@
 #include "ModSample.h"
 #include "AudioCriticalSection.h"
 #include "modsmp_ctrl.h"
+#include "SampleMipChain.h"
 #include "Sndfile.h"
 #include "mpt/base/numbers.hpp"
 
@@ -158,6 +159,7 @@ void ModSample::Initialize(MODTYPE type)
 	rootNote = 0;
 	runtimeFormat = RuntimeSampleFormat::Auto;
 	saveBitsPerSample = 8;
+	nMipLevelsBuilt = 0;
 	filename = "";
 
 	if(type & (MOD_TYPE_DBM | MOD_TYPE_IMF | MOD_TYPE_MED))
@@ -227,6 +229,7 @@ void ModSample::ReplaceWaveform(void *newWaveform, const SmpLength newLength, CS
 	ctrlChn::ReplaceSample(sndFile, *this, newWaveform, newLength, setFlags, resetFlags);
 	pData.pSample = newWaveform;
 	nLength = newLength;
+	nMipLevelsBuilt = 0;
 	FreeSample(oldWaveform);
 }
 
@@ -364,6 +367,7 @@ int8 ModSample::ReadSampleAsInt8(SmpLength frame, uint8 channel) const noexcept
 size_t ModSample::AllocateSample()
 {
 	FreeSample();
+	nMipLevelsBuilt = 0;
 
 	if((pData.pSample = AllocateSample(nLength, GetBytesPerSample())) == nullptr)
 	{
@@ -403,22 +407,53 @@ size_t ModSample::GetRealSampleBufferSize(SmpLength numSamples, size_t bytesPerS
 	// * 2x InterpolationMaxLookahead before the loop point (because we start at InterpolationMaxLookahead before the loop point and will look backwards from there as well)
 	// * 2x InterpolationMaxLookahead after the loop point (for wrap-around)
 	// * 4x InterpolationMaxLookahead for the sustain loop (same as the two points above)
+	// Quinlight: plus the Aniso-64 data mip pyramid (see SampleMip in
+	// ModSample.h) — bodies sum to < numSamples frames, fixed per-level
+	// margins/strips add ~1.2K frames per level.
+
+	static_assert(SampleMip::kLookahead == InterpolationLookaheadBufferSize);
 
 	const SmpLength maxSize = Util::MaxValueOfType(numSamples);
 	const SmpLength lookaheadBufferSize = (MaxSamplingPointSize + 1 + 4 + 4) * InterpolationLookaheadBufferSize;
 
-	if(numSamples == 0 || numSamples > MAX_SAMPLE_LENGTH || lookaheadBufferSize > maxSize - numSamples)
+	if(numSamples == 0 || numSamples > MAX_SAMPLE_LENGTH)
 	{
 		return 0;
 	}
-	numSamples += lookaheadBufferSize;
-
-	if(maxSize / bytesPerSample < numSamples)
+	// MAX_SAMPLE_LENGTH = 2^28, mip frames < numSamples + 8 * 1.3K — the
+	// total stays far below SmpLength (uint32) range, but accumulate in
+	// 64 bits anyway and re-check before narrowing.
+	uint64 totalFrames = uint64(numSamples) + lookaheadBufferSize + SampleMip::TotalMipFrames(numSamples);
+	if(totalFrames > maxSize || maxSize / bytesPerSample < totalFrames)
 	{
-		return 0;
+		// No room for the mip pyramid at this length/format (reachable for
+		// huge float64 stereo samples): fall back to the pre-mip layout so
+		// such samples still load. BuildSampleMips skips them via CanFitMips,
+		// which mirrors the check above.
+		totalFrames = uint64(numSamples) + lookaheadBufferSize;
+		if(totalFrames > maxSize || maxSize / bytesPerSample < totalFrames)
+		{
+			return 0;
+		}
 	}
 
-	return numSamples * bytesPerSample;
+	return static_cast<size_t>(totalFrames * bytesPerSample);
+}
+
+
+// Whether GetRealSampleBufferSize's budget includes the Aniso-64 data mip
+// pyramid for this sample size/format. Must mirror its check exactly: the mip
+// builder writes nothing when this is false.
+bool ModSample::CanFitMips(SmpLength numSamples, size_t bytesPerSample)
+{
+	if(numSamples == 0 || numSamples > MAX_SAMPLE_LENGTH)
+	{
+		return false;
+	}
+	const SmpLength maxSize = Util::MaxValueOfType(numSamples);
+	const SmpLength lookaheadBufferSize = (MaxSamplingPointSize + 1 + 4 + 4) * InterpolationLookaheadBufferSize;
+	const uint64 totalFrames = uint64(numSamples) + lookaheadBufferSize + SampleMip::TotalMipFrames(numSamples);
+	return totalFrames <= maxSize && maxSize / bytesPerSample >= totalFrames;
 }
 
 
@@ -426,6 +461,7 @@ void ModSample::FreeSample()
 {
 	FreeSample(pData.pSample);
 	pData.pSample = nullptr;
+	nMipLevelsBuilt = 0;
 }
 
 
@@ -618,6 +654,11 @@ void ModSample::PrecomputeLoops(CSoundFile &sndFile, bool updateChannels)
 		PrecomputeLoopsImpl<double>(*this, sndFile);
 	else if(GetRuntimeSampleFormat() == RuntimeSampleFormat::Float32)
 		PrecomputeLoopsImpl<somefloat32>(*this, sndFile);
+
+	// Rebuild the Aniso-64 data mip pyramid. Bodies depend on the waveform,
+	// strips also on the loop points; PrecomputeLoops is called for both
+	// kinds of mutation, so this single hook keeps the pyramid current.
+	BuildSampleMips(*this, sndFile);
 }
 
 

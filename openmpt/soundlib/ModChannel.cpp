@@ -65,6 +65,9 @@ void ModChannel::Reset(ResetFlags resetMask, const CSoundFile &sndFile, CHANNELI
 		increment = SamplePosition(0);
 		prevIncrement = SamplePosition(0);
 		prevDeltaIncrement = SamplePosition(0);
+		anisoIncDot = 0.0;
+		anisoIncDotDot = 0.0;
+		anisoMuDot = 0.0;
 		nPeriod = 0;
 		position.Set(0);
 		nLength = 0;
@@ -125,6 +128,9 @@ void ModChannel::Stop()
 	increment.Set(0);
 	prevIncrement.Set(0);
 	prevDeltaIncrement.Set(0);
+	anisoIncDot = 0.0;
+	anisoIncDotDot = 0.0;
+	anisoMuDot = 0.0;
 	position.Set(0);
 	nLeftVU = nRightVU = 0.0;
 	nVolume = 0;

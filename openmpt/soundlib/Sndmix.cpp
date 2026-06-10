@@ -2414,6 +2414,28 @@ bool CSoundFile::ReadNote()
 			}
 			chn.increment = ninc;
 
+			// Per-OUTPUT-SAMPLE pitch-motion state for the Aniso-64 gather.
+			// The raw per-tick increment delta scales with tick length (tempo),
+			// so normalize by this tick's sample count — the paper's μ̇ is a
+			// per-sample derivative. Skipped on the first tick of a note
+			// (prevIncrement is zero: the step from silence is not motion).
+			if(!chn.prevIncrement.IsZero())
+			{
+				const double spt = std::max(1.0, static_cast<double>(m_PlayState.m_nSamplesPerTick));
+				const double incNow = static_cast<double>(chn.increment.GetRaw());
+				const double incPrev = static_cast<double>(chn.prevIncrement.GetRaw());
+				const double prevDelta = static_cast<double>(chn.prevDeltaIncrement.GetRaw());
+				chn.anisoIncDot = (incNow - incPrev) / spt;
+				chn.anisoIncDotDot = ((incNow - incPrev) - prevDelta) / (spt * spt);
+				const auto mipOf = [](double rawAbs) { return std::log2(std::max(1.0, rawAbs / 4294967296.0)); };
+				chn.anisoMuDot = (mipOf(std::abs(incNow)) - mipOf(std::abs(incPrev))) / spt;
+			} else
+			{
+				chn.anisoIncDot = 0.0;
+				chn.anisoIncDotDot = 0.0;
+				chn.anisoMuDot = 0.0;
+			}
+
 			if((chn.dwFlags & (CHN_ADLIB | CHN_MUTE | CHN_SYNCMUTE)) == CHN_ADLIB && m_opl)
 			{
 				const bool doProcess = m_playBehaviour[kOPLFlexibleNoteOff] || !chn.dwFlags[CHN_NOTEFADE] || GetType() == MOD_TYPE_S3M;

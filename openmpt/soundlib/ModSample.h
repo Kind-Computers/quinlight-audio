@@ -17,6 +17,74 @@ OPENMPT_NAMESPACE_BEGIN
 
 class CSoundFile;
 
+// Quinlight: per-sample decimated data mip pyramid for the Aniso-64 gather.
+// Levels k = 1..MaxLevels(nLength) are appended to the single sample
+// allocation after the existing loop wrap-around buffers. Layout per level,
+// in frames:
+//   [kMipPre pre-hold | BodyFrames body | kMipPost post-hold | kMipNumWindows * kMipStripWin strips]
+// Mip-k sample n corresponds exactly to mip-0 position n << k (dyadic
+// sampling); loop points are never rounded onto the mip grid. Loop
+// correctness is provided by the strip windows, which hold the decimation of
+// the *periodically extended* mip-0 signal around each loop boundary — two
+// windows per loop because on the mip-k grid the loop start and loop end sit
+// at different intra-period phases (the loop length is generally not a
+// multiple of 2^k).
+// All offsets are relative to pData and depend only on nLength, so no extra
+// pointers are stored in ModSample and FreeSample stays unchanged.
+namespace SampleMip
+{
+	inline constexpr SmpLength kLookahead = 64;  // == InterpolationLookaheadBufferSize (static_assert in ModSample.cpp)
+	inline constexpr int kMaxLevels = 7;         // == MIP_LEVELS - 1 (static_assert in FloatMixer.h)
+	inline constexpr SmpLength kMipPre = kLookahead;
+	inline constexpr SmpLength kMipPost = kLookahead;
+	inline constexpr SmpLength kMipStripWin = 4 * kLookahead;  // 256 frames per strip window
+	inline constexpr int kMipNumWindows = 4;
+	enum StripWindow { kStripLoopEnd = 0, kStripLoopStart = 1, kStripSustainEnd = 2, kStripSustainStart = 3 };
+
+	// Deepest level built for a sample of the given length: floor(log2(len)),
+	// capped. Levels are built down to single-frame bodies so short samples
+	// never fall back to an under-bandlimited kernel.
+	constexpr int MaxLevels(SmpLength len) noexcept
+	{
+		int d = 0;
+		while(d < kMaxLevels && (len >> (d + 1)) >= 1)
+			d++;
+		return d;
+	}
+	// +2: the playback position may transiently reach nLength, plus shear headroom.
+	constexpr SmpLength BodyFrames(SmpLength len, int k) noexcept { return (len >> k) + 2; }
+	constexpr uint64 LevelFrames(SmpLength len, int k) noexcept
+	{
+		return uint64(kMipPre) + BodyFrames(len, k) + kMipPost + uint64(kMipNumWindows) * kMipStripWin;
+	}
+	// Frames from pData to the start of level k's pre-hold margin (k >= 1).
+	// Base: nLength + 9*64 = end of the existing post-hold + loop + sustain
+	// wrap region laid out by PrecomputeLoopsImpl.
+	constexpr uint64 LevelOffsetFrames(SmpLength len, int k) noexcept
+	{
+		uint64 ofs = uint64(len) + 9 * uint64(kLookahead);
+		for(int m = 1; m < k; m++)
+			ofs += LevelFrames(len, m);
+		return ofs;
+	}
+	constexpr uint64 BodyOffsetFrames(SmpLength len, int k) noexcept
+	{
+		return LevelOffsetFrames(len, k) + kMipPre;
+	}
+	constexpr uint64 StripOffsetFrames(SmpLength len, int k, int window) noexcept
+	{
+		return LevelOffsetFrames(len, k) + kMipPre + BodyFrames(len, k) + kMipPost + uint64(window) * kMipStripWin;
+	}
+	constexpr uint64 TotalMipFrames(SmpLength len) noexcept
+	{
+		uint64 total = 0;
+		const int d = MaxLevels(len);
+		for(int k = 1; k <= d; k++)
+			total += LevelFrames(len, k);
+		return total;
+	}
+}
+
 // Sample Struct
 struct ModSample
 {
@@ -59,6 +127,10 @@ struct ModSample
 	uint8  rootNote;						// For multisample import
 	RuntimeSampleFormat runtimeFormat = RuntimeSampleFormat::Auto;
 	uint8 saveBitsPerSample = 8;
+	// Number of Aniso-64 data mip levels built for the current waveform
+	// (0 = none; the gather then degrades to level-0-only). Set by
+	// PrecomputeLoops, reset whenever the waveform is replaced.
+	uint8 nMipLevelsBuilt = 0;
 
 	//char name[MAX_SAMPLENAME];			// Maybe it would be nicer to have sample names here, but that would require some refactoring.
 	mpt::charbuf<MAX_SAMPLEFILENAME> filename;
@@ -208,6 +280,8 @@ struct ModSample
 	static void *AllocateSample(SmpLength numFrames, size_t bytesPerSample);
 	// Compute sample buffer size in bytes, including any overhead introduced by pre-computed loops and such. Returns 0 if sample is too big.
 	static size_t GetRealSampleBufferSize(SmpLength numSamples, size_t bytesPerSample);
+	// Whether GetRealSampleBufferSize's budget includes the Aniso-64 data mip pyramid for this size/format.
+	static bool CanFitMips(SmpLength numSamples, size_t bytesPerSample);
 
 	void FreeSample();
 	static void FreeSample(void *samplePtr);

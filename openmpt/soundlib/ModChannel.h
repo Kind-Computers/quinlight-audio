@@ -66,6 +66,9 @@ struct ModChannel
 	SamplePosition increment;    // Sample speed relative to mixing frequency (fixed point)
 	SamplePosition prevIncrement;      // Previous tick's increment for anisotropic β-shear
 	SamplePosition prevDeltaIncrement; // Previous tick's Δincrement for 2nd-order β-shear (acceleration)
+	double anisoIncDot;                // d(raw increment)/d(output sample) this tick — tempo-invariant β-shear velocity
+	double anisoIncDotDot;             // Second difference of the raw increment per output sample² — β-shear acceleration
+	double anisoMuDot;                 // d(mip level)/d(output sample), log2 pitch-band units — drives the R footprint widening
 	const void *pCurrentSample;  // Currently playing sample (nullptr if no sample is playing)
 	double leftVol;              // 0.0...1.0 channel volume (left)
 	double rightVol;             // 0.0...1.0 channel volume (right)

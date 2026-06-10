@@ -585,7 +585,11 @@ pub struct ModuleInfo {
 }
 
 /// Safe wrapper around an openmpt_module.
-/// Not Send/Sync — must be used from a single thread.
+///
+/// `Send` but NOT `Sync` (see the `unsafe impl Send` near the end of this
+/// file): the module may be created on a loader thread and moved, but all
+/// access must be serialized — in this app through the `PlayerInner` mutex —
+/// because libopenmpt modules are not thread-safe for concurrent use.
 pub struct Module {
     ptr: *mut OpenmptModule,
 }
@@ -793,18 +797,18 @@ impl Module {
         }
     }
 
-    pub fn set_aniso64_k_beta(&mut self, value: f64) {
+    /// Returns `false` if the C++ side rejected the value (out of range).
+    #[must_use]
+    pub fn set_aniso64_k_beta(&mut self, value: f64) -> bool {
         let ctl = c"render.resampler.aniso64_k_beta";
-        unsafe {
-            openmpt_module_ctl_set_floatingpoint(self.ptr, ctl.as_ptr(), value);
-        }
+        unsafe { openmpt_module_ctl_set_floatingpoint(self.ptr, ctl.as_ptr(), value) != 0 }
     }
 
-    pub fn set_aniso64_k_beta2(&mut self, value: f64) {
+    /// Returns `false` if the C++ side rejected the value (out of range).
+    #[must_use]
+    pub fn set_aniso64_k_beta2(&mut self, value: f64) -> bool {
         let ctl = c"render.resampler.aniso64_k_beta2";
-        unsafe {
-            openmpt_module_ctl_set_floatingpoint(self.ptr, ctl.as_ptr(), value);
-        }
+        unsafe { openmpt_module_ctl_set_floatingpoint(self.ptr, ctl.as_ptr(), value) != 0 }
     }
 
     pub fn aniso64_k_beta(&self) -> f64 {
@@ -814,6 +818,21 @@ impl Module {
 
     pub fn aniso64_k_beta2(&self) -> f64 {
         let ctl = c"render.resampler.aniso64_k_beta2";
+        unsafe { openmpt_module_ctl_get_floatingpoint(self.ptr, ctl.as_ptr()) }
+    }
+
+    /// Pitch-axis footprint widening weight for the Aniso-64 gather:
+    /// `R = 1 + k_r * |mu_dot|` (paper Eq. 15). `0.0` disables widening
+    /// (pure per-slice shear); default 0.8; valid range 0.0-4.0.
+    /// Returns `false` if the C++ side rejected the value (out of range).
+    #[must_use]
+    pub fn set_aniso64_k_r(&mut self, value: f64) -> bool {
+        let ctl = c"render.resampler.aniso64_k_r";
+        unsafe { openmpt_module_ctl_set_floatingpoint(self.ptr, ctl.as_ptr(), value) != 0 }
+    }
+
+    pub fn aniso64_k_r(&self) -> f64 {
+        let ctl = c"render.resampler.aniso64_k_r";
         unsafe { openmpt_module_ctl_get_floatingpoint(self.ptr, ctl.as_ptr()) }
     }
 
@@ -1123,6 +1142,15 @@ impl Module {
         channels: i32,
         new_sample_rate: i32,
     ) -> bool {
+        // Safety guard for the C side, which reads exactly
+        // `length_frames * channels` doubles from `data`: a mismatched
+        // length would be a heap over-read reachable from safe Rust.
+        if length_frames <= 0
+            || !(1..=2).contains(&channels)
+            || (length_frames as u128) * (channels as u128) != data.len() as u128
+        {
+            return false;
+        }
         let result = unsafe {
             openmpt_module_replace_sample_data(
                 self.ptr,
@@ -1146,6 +1174,15 @@ impl Module {
         channels: i32,
         new_sample_rate: i32,
     ) -> bool {
+        // Safety guard for the C side, which reads exactly
+        // `length_frames * channels` doubles from `data`: a mismatched
+        // length would be a heap over-read reachable from safe Rust.
+        if length_frames <= 0
+            || !(1..=2).contains(&channels)
+            || (length_frames as u128) * (channels as u128) != data.len() as u128
+        {
+            return false;
+        }
         let result = unsafe {
             openmpt_module_replace_sample_data_raw(
                 self.ptr,

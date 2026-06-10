@@ -77,8 +77,11 @@ to that engine: the same "register, then reduce" method Quinlight uses on
 images, dropped to one dimension. The 2-D structure-tensor solve collapses to
 the scalar `u = −Σ(w·Ix·It) / Σ(w·Ix²)` — a per-sample sub-sample shift that
 best aligns the engine to the master. Each engine is then linearly warped onto
-the master's grid, and the engines are reduced **per sample by the median**
-(mean optional).
+the master's grid, and the engines are reduced per sample by a **winsorized
+robust mean** (the default: each engine is clamped to the per-sample median ±
+(k·MAD + floor) before averaging, rejecting a lone spike like the median while
+keeping the mean's smoothing where engines agree); plain `median` and `mean`
+reducers are selectable via `--reduce`.
 
 - **No ringing.** No FFT and no per-bin magnitude/phase surgery, so none of the
   inverse-STFT pre-echo or transient smearing the spectral path can introduce —
@@ -87,18 +90,23 @@ the master's grid, and the engines are reduced **per sample by the median**
   carries the exact loop length and loop point, and both the LK window and the
   warp wrap circularly across the seam — so looped samples stay aligned to the
   sample.
-- **Master is the target only.** The sinc reference defines the alignment grid
-  and the loop timing but is **excluded from the median**, so its bandlimited
-  (no-HF) content never dilutes the engines' band-extension.
+- **Master guides, gently.** The sinc reference defines the alignment grid and
+  the loop timing. In `median` mode it also joins the reduction as a
+  self-regulating member (it votes in the source band and is discarded as a
+  low outlier in the AI-extended highs); in `mean`/`robust` modes it is
+  excluded so its bandlimited (no-HF) content never dilutes the engines'
+  band-extension.
 - **Robust to a bandlimited master.** A goodness-of-fit gate trusts the flow at
   a sample only when the local model `It ≈ −u·Ix` actually explains the
   engine-vs-master difference (`R² = sxt² / (sxx · Σ w·It²)`). High frequencies
   the master cannot represent therefore cannot drive a spurious shift that would
   mangle the engine's own highs.
-- **Blends bad with good.** Since the median already rejects a lone engine's
-  outlier, registered mode runs *every* engine and drops both the per-engine
-  score floor and the loop-seam quality gates: a "very bad" upscale is just an
-  outlier the median discards, not a reason to keep the original.
+- **Strict by default.** Registered mode keeps the per-engine usable-score
+  floor (0.9 Pearson correlation against the native-rate original): engines
+  scoring below it are dropped for that sample, and a sample with fewer than
+  two passing engines keeps its original audio rather than shipping a dubious
+  blend. The floor is tunable (`--threshold`), but the default philosophy is
+  to leave a sample unremastered before risking a wrong one.
 
 **Spectral (legacy, `--consensus spectral`).** The original path scores each
 candidate against the source by Pearson correlation of magnitude spectra below
@@ -123,15 +131,34 @@ Pitch bends (vibrato, portamento, slides) are tracked in full `double` precision
 (`PitchT = double`, `FreqT = double`) — no fixed-point period tables or integer
 slide accumulators. IT linear slides use `pow(2.0, amount/768.0)` directly.
 
-The resampling filter is a 64-tap polyphase sinc with 65536 phases (16-bit phase
-resolution) and an octave-spaced mipmap chain. Each mipmap level tunes Kaiser
-window beta independently (β = 14.0 at unity down to β = 8.0 at 128× downsample)
-with anisotropic velocity shear coefficients (k_β = 0.65, k_β² = 0.15) that
-widen the transition band in proportion to playback speed, keeping the stopband
-clean during fast pitch sweeps.
+The resampling filter is a 64-tap polyphase sinc with 65536 phases (16-bit
+phase resolution) over **true per-sample data mip-maps** — every sample
+carries an octave-decimated pyramid (GPU texture-chain style, the design
+paper's W[q,m]), built at load time through a cascaded 63-tap Kaiser
+half-band. Reading mip level j makes the 64 taps span 64·2^j original
+samples, so heavy pitch-down stays properly bandlimited at any ratio. The
+decimation is **loop-aware**: loop bodies decimate as periodic signals
+(ping-pong as reflected-periodic, sustain loops included) via per-level
+boundary strips, so nothing past a loop point ever bleeds into the loop and
+seams stay click-free at any transposition. Each slice samples its mip with a
+kernel matched to the residual ratio (a fractional one-octave Kaiser family,
+β = 14.0 at unity to β = 11.0 near the octave edge).
+
+On top of the data pyramid sits the full **sheared-separable anisotropic
+gather** from the design paper (Eq. 13/14): the reconstruction footprint
+spans up to four mip slices around the continuous level μ, widened by
+`R = 1 + k_r·|μ̇|` when the pitch is moving (`render.resampler.aniso64_k_r`,
+default 0.8), with stretched-tent slice weights that reduce exactly to the
+classic trilinear blend at steady pitch. Each slice's phase taps are sheared
+by `β·(j−μ)` where `β = k_β·İ + k_β²·Ï` (`aniso64_k_beta` = 0.65,
+`aniso64_k_beta2` = 0.15) — per-output-sample, tempo-invariant derivatives of
+the playback increment, so the shear strength no longer depends on the
+module's tick length.
 
 Full derivation and design notes:
 [audio_anisotropic_filter_v2.pdf](docs/audio_anisotropic_filter_v2.pdf).
+(The PDF's §12 "Connection to real engines" describes the pre-Aniso-64
+16-tap engine; the shipped default is the 64-tap gather above.)
 
 SIMD kernels are compiled for SSE2, AVX, AVX2, and AVX-512 with fully unrolled
 accumulator loops — runtime dispatch picks the widest available path.

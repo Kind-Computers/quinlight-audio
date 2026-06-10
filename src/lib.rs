@@ -3820,6 +3820,476 @@ mod tests {
         );
     }
 
+    /// Render the deep-vibrato fixture under the Aniso-64 interpolator with
+    /// the given gather knobs. Used to verify the full sheared-separable
+    /// gather (per-slice shear + R footprint widening) end to end.
+    fn render_aniso_gather(k_beta: f64, k_beta2: f64, k_r: f64, seconds: u32) -> Vec<f64> {
+        const VIBRATO_FIXTURE: &str = "mods/jt_pools.xm";
+        let data = std::fs::read(VIBRATO_FIXTURE).expect("vibrato fixture must exist");
+        let mut module = Module::from_memory(&data).expect("load module");
+        configure_quinlight_render(&mut module, 75, 64, true);
+        assert!(module.set_aniso64_k_beta(k_beta));
+        assert!(module.set_aniso64_k_beta2(k_beta2));
+        assert!(module.set_aniso64_k_r(k_r));
+        render_module_output_capped(&mut module, seconds)
+    }
+
+    fn rms_of(samples: &[f64]) -> f64 {
+        (samples.iter().map(|x| x * x).sum::<f64>() / samples.len().max(1) as f64).sqrt()
+    }
+
+    /// The gather must be bit-deterministic for identical settings — the
+    /// remaster pipeline caches by content hash, so nondeterministic
+    /// rendering would poison cache keys.
+    #[test]
+    fn aniso64_gather_is_deterministic() {
+        let a = render_aniso_gather(0.65, 0.15, 0.8, 3);
+        let b = render_aniso_gather(0.65, 0.15, 0.8, 3);
+        assert_eq!(a.len(), b.len());
+        assert!(
+            a.iter().zip(b.iter()).all(|(x, y)| x == y),
+            "identical settings must render bit-identical audio"
+        );
+    }
+
+    /// With all gather knobs at zero the interpolator reduces to plain
+    /// trilinear mip interpolation; at the defaults the pitch-motion gather
+    /// engages. The two must differ under deep vibrato while staying
+    /// level-matched and finite.
+    #[test]
+    fn aniso64_gather_engages_and_stays_level_matched() {
+        let plain = render_aniso_gather(0.0, 0.0, 0.0, 10);
+        let gathered = render_aniso_gather(0.65, 0.15, 0.8, 10);
+
+        assert!(plain.iter().all(|x| x.is_finite()));
+        assert!(gathered.iter().all(|x| x.is_finite()));
+
+        let n = plain.len().min(gathered.len());
+        let diff: f64 = plain[..n]
+            .iter()
+            .zip(gathered[..n].iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            diff > 0.0,
+            "the anisotropic gather must engage under deep vibrato"
+        );
+
+        let rms_plain = rms_of(&plain[..n]);
+        let rms_gathered = rms_of(&gathered[..n]);
+        assert!(rms_plain > 0.0 && rms_gathered > 0.0);
+        let db = 20.0 * (rms_gathered / rms_plain).log10();
+        assert!(
+            db.abs() < 1.0,
+            "gather must be level-preserving: {db:.3} dB difference"
+        );
+    }
+
+    #[test]
+    fn aniso64_k_r_ctl_round_trips() {
+        let data = std::fs::read(XM_FIXTURE).expect("Failed to read XM fixture");
+        let mut module = Module::from_memory(&data).expect("Failed to load XM fixture");
+        assert!((module.aniso64_k_r() - 0.8).abs() < 1e-12, "default k_r");
+        assert!(module.set_aniso64_k_r(0.0));
+        assert_eq!(module.aniso64_k_r(), 0.0);
+        assert!(module.set_aniso64_k_r(2.5));
+        assert_eq!(module.aniso64_k_r(), 2.5);
+        // Out-of-range values must be rejected AND leave the setting intact.
+        assert!(!module.set_aniso64_k_r(5.0));
+        assert!(!module.set_aniso64_k_r(-0.1));
+        assert_eq!(module.aniso64_k_r(), 2.5);
+    }
+
+    /// Build a synthetic sample-mode fixture for the data-mip gather: load
+    /// the S3M fixture (no instrument envelopes or autovibrato), replace a
+    /// sample with `wave` (mono, declared at `declared_rate` Hz), set the
+    /// given loop, and hold middle-C on an otherwise cleared pattern — so the
+    /// playback ratio is exactly `declared_rate / 48000`.
+    fn render_mip_fixture(
+        wave: &[f64],
+        loop_info: &SampleLoopInfo,
+        declared_rate: i32,
+        seconds: u32,
+        keyoff_row: Option<i32>,
+    ) -> Vec<f64> {
+        const NOTE_MIDDLE_C: u8 = 61;
+        const NOTE_KEYOFF: u8 = 255;
+        let data = std::fs::read(S3M_FIXTURE).expect("S3M fixture must exist");
+        let mut module = Module::from_memory(&data).expect("load S3M fixture");
+        configure_quinlight_render(&mut module, 75, 64, false);
+
+        let sample = first_nonempty_sample(&module);
+        assert!(
+            module.replace_sample_data_raw(
+                sample.index,
+                wave,
+                wave.len() as i64,
+                1,
+                declared_rate
+            ),
+            "replace_sample_data_raw should accept the synthetic wave"
+        );
+        assert!(module.set_sample_loop_points(sample.index, loop_info));
+        assert!(module.refresh_channels_for_sample(sample.index));
+
+        // Clear EVERY pattern, not just the one holding our note: the fixture
+        // tests must not depend on the S3M's own content (or its pathological
+        // initial speed) keeping later patterns out of the analysis window.
+        let num_channels = module.num_channels();
+        for pattern in 0..module.num_patterns() {
+            for row in 0..module.pattern_num_rows(pattern) {
+                for ch in 0..num_channels {
+                    assert!(module.set_pattern_command(pattern, row, ch, COMMAND_NOTE, 0));
+                    assert!(module.set_pattern_command(pattern, row, ch, COMMAND_INSTRUMENT, 0));
+                    assert!(module.set_pattern_command(
+                        pattern,
+                        row,
+                        ch,
+                        COMMAND_VOLUME_COMMAND,
+                        0
+                    ));
+                    assert!(module.set_pattern_command(pattern, row, ch, COMMAND_VOLUME, 0));
+                    assert!(module.set_pattern_command(pattern, row, ch, COMMAND_EFFECT, 0));
+                    assert!(module.set_pattern_command(pattern, row, ch, COMMAND_PARAMETER, 0));
+                }
+            }
+        }
+        let rows = module.pattern_num_rows(0);
+        assert!(rows >= 8, "S3M fixture pattern 0 should have rows");
+        assert!(module.set_pattern_command(0, 0, 0, COMMAND_NOTE, NOTE_MIDDLE_C));
+        assert!(module.set_pattern_command(
+            0,
+            0,
+            0,
+            COMMAND_INSTRUMENT,
+            (sample.index + 1) as u8
+        ));
+        // Always pin the row rate (speed 3 at tempo 125 = 16.667 rows/s) so
+        // timings are independent of the fixture's odd header speed. Both
+        // commands go on channel 0 (S3M skips effects on unused channels),
+        // so they need two rows: row 0 still runs at speed 3 but the header
+        // tempo (33), giving ~0.227 s; rows 1+ run at 0.06 s each. A keyoff
+        // at row R therefore lands at ~0.227 + (R - 1) * 0.06 s.
+        const CMD_SPEED: u8 = 16;
+        const CMD_TEMPO: u8 = 17;
+        assert!(module.set_pattern_command(0, 0, 0, COMMAND_EFFECT, CMD_SPEED));
+        assert!(module.set_pattern_command(0, 0, 0, COMMAND_PARAMETER, 3));
+        assert!(module.set_pattern_command(0, 1, 0, COMMAND_EFFECT, CMD_TEMPO));
+        assert!(module.set_pattern_command(0, 1, 0, COMMAND_PARAMETER, 125));
+        if let Some(row) = keyoff_row {
+            assert!(row < rows, "keyoff row must fit in pattern 0");
+            assert!(module.set_pattern_command(0, row, 0, COMMAND_NOTE, NOTE_KEYOFF));
+        }
+        module.set_position_seconds(0.0);
+        render_module_output_capped(&mut module, seconds)
+    }
+
+    /// Loop body: a sine that is exactly periodic over `loop_len`. Tail:
+    /// FULL-SCALE deterministic noise right after the loop end — if mip
+    /// decimation ever blends across the loop boundary, this leaks into the
+    /// steady looped output.
+    fn looped_sine_with_noise_tail(loop_len: usize, periods: usize, total: usize) -> Vec<f64> {
+        let mut wave = vec![0.0f64; total];
+        for (i, value) in wave.iter_mut().enumerate().take(loop_len) {
+            *value = 0.8
+                * (2.0 * std::f64::consts::PI * periods as f64 * i as f64 / loop_len as f64).sin();
+        }
+        let mut state = 0x9E3779B97F4A7C15u64;
+        for value in wave.iter_mut().skip(loop_len) {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *value = ((state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) * 0.9;
+        }
+        wave
+    }
+
+    /// Phase-continuous wave: pure tone inside `[0, loop_len)`, frequency
+    /// ramping smoothly to 2x after the loop end, fading out at the very end
+    /// so the one-shot tail finish is click-free by construction.
+    fn sustain_sine_with_chirp_tail(loop_len: usize, periods: usize, total: usize) -> Vec<f64> {
+        let base = periods as f64 / loop_len as f64; // cycles per frame
+        let mut wave = vec![0.0f64; total];
+        let mut phase = 0.0f64;
+        for (i, value) in wave.iter_mut().enumerate() {
+            *value = 0.8 * (2.0 * std::f64::consts::PI * phase).sin();
+            let freq = if i < loop_len {
+                base
+            } else {
+                (base * (1.0 + (i - loop_len) as f64 / (8.0 * loop_len as f64))).min(2.0 * base)
+            };
+            phase += freq;
+        }
+        let fade = 4096.min(total / 4);
+        for i in 0..fade {
+            let idx = total - fade + i;
+            wave[idx] *= 1.0 - (i as f64 + 1.0) / fade as f64;
+        }
+        wave
+    }
+
+    /// Left channel of a stereo render, restricted to `[start_s, end_s]`.
+    fn left_channel_window(stereo: &[f64], start_s: f64, end_s: f64) -> Vec<f64> {
+        let frames = stereo.len() / 2;
+        let start = ((start_s * 48000.0) as usize).min(frames);
+        let end = ((end_s * 48000.0) as usize).min(frames);
+        assert!(
+            end > start + 4096,
+            "analysis window too short: {start}..{end} of {frames} frames"
+        );
+        stereo[start * 2..end * 2].iter().step_by(2).copied().collect()
+    }
+
+    /// max |first difference| over its 99th percentile — ~1 for any smooth
+    /// (even amplitude-modulated) tone, >> 1 if there is a click.
+    fn seam_spike_ratio(mono: &[f64]) -> f64 {
+        let mut diffs: Vec<f64> = mono.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+        diffs.sort_by(|a, b| a.partial_cmp(b).expect("finite diffs"));
+        let p99 = diffs[diffs.len() * 99 / 100].max(1e-12);
+        diffs.last().expect("non-empty window") / p99
+    }
+
+    /// Residual of the exact single-tone recurrence
+    /// `x[n-1] + x[n+1] = 2 cos(ω) x[n]`, in dB relative to the signal.
+    /// Frequency-agnostic: zero for a pure tone of ANY frequency, phase, or
+    /// amplitude; aliasing images, noise bleed, and seam artifacts all raise
+    /// it.
+    fn tone_residual_db(mono: &[f64]) -> f64 {
+        let n = mono.len();
+        assert!(n > 16);
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for i in 1..n - 1 {
+            num += mono[i] * (mono[i - 1] + mono[i + 1]);
+            den += 2.0 * mono[i] * mono[i];
+        }
+        assert!(den > 1e-9, "analysis window must contain signal");
+        let c = num / den;
+        let mut resid = 0.0f64;
+        let mut sig = 0.0f64;
+        for i in 1..n - 1 {
+            let r = mono[i - 1] + mono[i + 1] - 2.0 * c * mono[i];
+            resid += r * r;
+            sig += mono[i] * mono[i];
+        }
+        10.0 * (resid / sig.max(1e-30)).log10()
+    }
+
+    /// Forward loop with an odd, non-power-of-two length and a full-scale
+    /// noise tail right after the loop end, rendered at downsampling ratios
+    /// that engage data mips 2-4 and their loop strips. The steady looped
+    /// output must stay a pure tone: blending across the loop boundary
+    /// during decimation (or a mis-aligned strip handoff) surfaces as noise
+    /// or seam clicks.
+    #[test]
+    fn aniso64_mip_loop_decimation_respects_loop_boundary() {
+        const LOOP_LEN: usize = 4801;
+        let wave = looped_sine_with_noise_tail(LOOP_LEN, 100, 2 * LOOP_LEN);
+        let loop_info = SampleLoopInfo::forward(0, LOOP_LEN as i64);
+        for ratio in [4.0f64, 8.0, 11.3137] {
+            let declared = (48000.0 * ratio).round() as i32;
+            let out = render_mip_fixture(&wave, &loop_info, declared, 6, None);
+            let mono = left_channel_window(&out, 1.0, 5.5);
+            let rms = rms_of(&mono);
+            assert!(
+                rms > 1e-3,
+                "looped tone must be audible at ratio {ratio} (rms={rms})"
+            );
+            let resid = tone_residual_db(&mono);
+            assert!(
+                resid < -40.0,
+                "looped output must stay tone-pure at ratio {ratio}: residual {resid:.1} dB"
+            );
+            let spike = seam_spike_ratio(&mono);
+            assert!(
+                spike < 4.0,
+                "no seam clicks at ratio {ratio}: spike ratio {spike:.2}"
+            );
+        }
+    }
+
+    /// Same fixture with a ping-pong loop. The reflection legitimately adds
+    /// harmonics of the doubled period (a derivative kink at each bounce), so
+    /// only click-freeness and audibility are asserted — this validates the
+    /// reflected periodizer in the strip builder.
+    #[test]
+    fn aniso64_mip_pingpong_loop_has_no_seam_clicks() {
+        const LOOP_LEN: usize = 4801;
+        let wave = looped_sine_with_noise_tail(LOOP_LEN, 100, 2 * LOOP_LEN);
+        let loop_info = SampleLoopInfo::ping_pong(0, LOOP_LEN as i64);
+        let declared = (48000.0 * 11.3137) as i32;
+        let out = render_mip_fixture(&wave, &loop_info, declared, 6, None);
+        let mono = left_channel_window(&out, 1.0, 5.5);
+        assert!(rms_of(&mono) > 1e-3, "ping-pong loop must stay audible");
+        let spike = seam_spike_ratio(&mono);
+        assert!(
+            spike < 4.0,
+            "ping-pong seams must be click-free: spike ratio {spike:.2}"
+        );
+    }
+
+    /// Sustain loop with a phase-continuous chirp tail and a key-off
+    /// mid-note: the release must actually leave the sustain loop (audible
+    /// frequency change) and the crossing over the sustain end must be
+    /// click-free — this validates that mip BODIES hold the true signal
+    /// (play-through) while only the strips are periodized.
+    #[test]
+    fn aniso64_mip_sustain_release_plays_through_seamlessly() {
+        const LOOP_LEN: usize = 4801;
+        let wave = sustain_sine_with_chirp_tail(LOOP_LEN, 100, 80 * LOOP_LEN);
+        let loop_info = SampleLoopInfo::with_loops(
+            SampleLoopRegion::none(),
+            SampleLoopRegion::forward(0, LOOP_LEN as i64),
+        );
+        let declared = (48000.0 * 8.0) as i32;
+        // The fixture pins 16.667 rows/s (row 0 itself takes ~0.227 s), so
+        // the keyoff at row 16 lands ~1.13 s in; the chirp tail lasts ~1 s
+        // after it.
+        let out = render_mip_fixture(&wave, &loop_info, declared, 4, Some(16));
+
+        // Hop through the render in 100 ms windows, tracking zero-crossing
+        // rates of audible hops: release into the chirp must raise the rate.
+        // Stay within pattern 0 (~3.5 s) so later song content is excluded.
+        let frames = (out.len() / 2).min(3 * 48000);
+        let hop = 4800usize;
+        let mut rates = Vec::new();
+        let mut start = 24000usize; // skip note start ramp
+        while start + hop <= frames {
+            let mono: Vec<f64> = out[start * 2..(start + hop) * 2]
+                .iter()
+                .step_by(2)
+                .copied()
+                .collect();
+            if rms_of(&mono) > 1e-3 {
+                let zc = mono
+                    .windows(2)
+                    .filter(|w| (w[0] <= 0.0) != (w[1] <= 0.0))
+                    .count();
+                rates.push(zc);
+            }
+            start += hop;
+        }
+        assert!(rates.len() >= 4, "render must contain audible content");
+        let first = rates[0] as f64;
+        let max = *rates.iter().max().expect("rates non-empty") as f64;
+        assert!(
+            max > first * 1.4,
+            "key-off must release the sustain loop into the chirp tail \
+             (zero-crossing rate {first} -> max {max})"
+        );
+
+        let mono = left_channel_window(&out, 0.3, frames as f64 / 48000.0);
+        let spike = seam_spike_ratio(&mono);
+        assert!(
+            spike < 4.0,
+            "sustain release crossing must be click-free: spike ratio {spike:.2}"
+        );
+    }
+
+    /// A 100-frame chip loop transposed ~4.6 octaves up: the loop is only a
+    /// few frames long at the deepest engaged mips, so the (fully
+    /// periodized) end strip serves the entire loop body. Must stay finite,
+    /// audible, and level-sane. (seam_spike_ratio is NOT meaningful here: at
+    /// ratio 24 the loop repeats every ~4 output samples, so any per-seam
+    /// click would dominate the p99 normalizer and the ratio would sit near
+    /// 1 regardless — don't be tempted to assert on it.)
+    #[test]
+    fn aniso64_mip_tiny_loop_extreme_transpose_is_stable() {
+        const LOOP_LEN: usize = 100;
+        let wave: Vec<f64> = (0..LOOP_LEN)
+            .map(|i| 0.8 * (2.0 * std::f64::consts::PI * i as f64 / LOOP_LEN as f64).sin())
+            .collect();
+        let loop_info = SampleLoopInfo::forward(0, LOOP_LEN as i64);
+        let declared = (48000.0 * 24.0) as i32;
+        let out = render_mip_fixture(&wave, &loop_info, declared, 4, None);
+        let mono = left_channel_window(&out, 0.5, 3.5);
+        assert!(
+            mono.iter().all(|x| x.is_finite()),
+            "tiny loop at extreme transpose must stay finite"
+        );
+        let rms = rms_of(&mono);
+        assert!(rms > 1e-4, "tiny loop must stay audible (rms={rms})");
+        assert!(rms < 1.0, "tiny loop must not blow up (rms={rms})");
+    }
+
+    /// Two-tone source: a low tone that stays in-band after 8x transposition
+    /// plus a strong high tone far above the output Nyquist at that ratio.
+    /// With the data pyramid engaged, the halfband cascade removes the high
+    /// tone before it can fold back; the level-0 fallback gather (one-octave
+    /// kernel over full-rate data) passes it and it aliases into the audible
+    /// band at nearly full amplitude. This is the canary for the pyramid
+    /// silently not engaging (nMipLevelsBuilt == 0) — the other mip tests
+    /// use sub-Nyquist tones and would still pass in that state.
+    #[test]
+    fn aniso64_mip_pyramid_attenuates_aliased_content() {
+        const LOOP_LEN: usize = 4800;
+        // 12 cycles -> 0.0025 cyc/frame (0.02 cyc/output sample at 8x);
+        // 960 cycles -> 0.2 cyc/frame (folds to 0.4 cyc/output sample = 19.2
+        // kHz if not bandlimited). Both exactly periodic over the loop.
+        let mut wave = vec![0.0f64; 2 * LOOP_LEN];
+        for i in 0..LOOP_LEN {
+            let t = i as f64 / LOOP_LEN as f64;
+            wave[i] = 0.6 * (2.0 * std::f64::consts::PI * 12.0 * t).sin()
+                + 0.4 * (2.0 * std::f64::consts::PI * 960.0 * t).sin();
+        }
+        let loop_info = SampleLoopInfo::forward(0, LOOP_LEN as i64);
+        let out = render_mip_fixture(&wave, &loop_info, 48000 * 8, 6, None);
+        let mono = left_channel_window(&out, 1.0, 5.5);
+        assert!(rms_of(&mono) > 1e-3, "looped tone must be audible");
+        let resid = tone_residual_db(&mono);
+        assert!(
+            resid < -30.0,
+            "above-Nyquist source content must be attenuated, not aliased: \
+             residual {resid:.1} dB"
+        );
+    }
+
+    /// Full-scale noise BEFORE the loop start (an "attack"), exactly periodic
+    /// sine inside the loop. After every wrap the level-j kernel window keeps
+    /// crossing the loop start for 32*2^j source frames, so the loop-START
+    /// strips must keep serving those reads for as long as the window
+    /// crosses (CHN_WRAPPED_LOOP lifetime in Fastmix) — otherwise the noise
+    /// attack leaks into every loop pass at kernel-sidelobe weight.
+    #[test]
+    fn aniso64_mip_loop_start_does_not_bleed_preloop_content() {
+        const LOOP_LEN: usize = 4801;
+        let total = 3 * LOOP_LEN;
+        let mut wave = vec![0.0f64; total];
+        let mut state = 0xD1B54A32D192ED03u64;
+        for value in wave.iter_mut().take(LOOP_LEN) {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *value = ((state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) * 0.9;
+        }
+        // Periodic over LOOP_LEN from the loop start onward (the tail past
+        // the loop end is the seamless continuation; only the START boundary
+        // is under test here).
+        for i in LOOP_LEN..total {
+            let k = (i - LOOP_LEN) as f64;
+            wave[i] =
+                0.8 * (2.0 * std::f64::consts::PI * 100.0 * k / LOOP_LEN as f64).sin();
+        }
+        let loop_info = SampleLoopInfo::forward(LOOP_LEN as i64, 2 * (LOOP_LEN as i64));
+        // Measured margins: with the widened CHN_WRAPPED_LOOP lifetime the
+        // residual sits at -76..-83 dB across these ratios; with the narrow
+        // (level-0) lifetime it degrades to -48 dB at 16.97x and -30 dB at
+        // 24x. The -60 dB floor cleanly separates the two. (Higher ratios
+        // would push the tone itself past the output Nyquist.)
+        for ratio in [8.0f64, 11.3137, 16.9706, 24.0] {
+            let declared = (48000.0 * ratio).round() as i32;
+            let out = render_mip_fixture(&wave, &loop_info, declared, 6, None);
+            let mono = left_channel_window(&out, 1.0, 5.5);
+            assert!(rms_of(&mono) > 1e-3, "looped tone must be audible");
+            let resid = tone_residual_db(&mono);
+            assert!(
+                resid < -60.0,
+                "pre-loop attack must not bleed into the loop at ratio {ratio}: \
+                 residual {resid:.1} dB"
+            );
+        }
+    }
+
     #[test]
     fn test_xm_vibrato_pitch_stays_centered_after_48khz_replace() {
         let data = std::fs::read(XM_FIXTURE).expect("Failed to read XM fixture");
@@ -4628,8 +5098,8 @@ mod tests {
         );
 
         // Set and read back
-        module.set_aniso64_k_beta(0.8);
-        module.set_aniso64_k_beta2(0.25);
+        assert!(module.set_aniso64_k_beta(0.8));
+        assert!(module.set_aniso64_k_beta2(0.25));
         assert!(
             (module.aniso64_k_beta() - 0.8).abs() < 1e-10,
             "k_beta round-trip failed"
@@ -4653,8 +5123,8 @@ mod tests {
         let default_output = {
             let mut module = Module::from_memory(&data).expect("load module");
             configure_quinlight_render(&mut module, 75, 64, true);
-            module.set_aniso64_k_beta(0.0);
-            module.set_aniso64_k_beta2(0.0);
+            assert!(module.set_aniso64_k_beta(0.0));
+            assert!(module.set_aniso64_k_beta2(0.0));
             render_module_output_capped(&mut module, 10)
         };
 
@@ -4662,8 +5132,8 @@ mod tests {
         let extreme_shear_output = {
             let mut module = Module::from_memory(&data).expect("load module");
             configure_quinlight_render(&mut module, 75, 64, true);
-            module.set_aniso64_k_beta(2.0);
-            module.set_aniso64_k_beta2(2.0);
+            assert!(module.set_aniso64_k_beta(2.0));
+            assert!(module.set_aniso64_k_beta2(2.0));
             render_module_output_capped(&mut module, 10)
         };
 

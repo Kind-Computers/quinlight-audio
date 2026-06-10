@@ -1805,6 +1805,7 @@ std::pair<const module_impl::ctl_info *, const module_impl::ctl_info *> module_i
 		{ "render.opl.volume_factor", ctl_type::floatingpoint },
 		{ "render.resampler.aniso64_k_beta", ctl_type::floatingpoint },
 		{ "render.resampler.aniso64_k_beta2", ctl_type::floatingpoint },
+		{ "render.resampler.aniso64_k_r", ctl_type::floatingpoint },
 		{ "dither", ctl_type::integer }
 	};
 	return std::make_pair(std::begin(ctl_infos), std::end(ctl_infos));
@@ -1990,6 +1991,8 @@ double module_impl::ctl_get_floatingpoint( std::string_view ctl, bool throw_if_u
 		return m_sndFile->m_Resampler.m_Settings.aniso64_k_beta;
 	} else if ( ctl == "render.resampler.aniso64_k_beta2" ) {
 		return m_sndFile->m_Resampler.m_Settings.aniso64_k_beta2;
+	} else if ( ctl == "render.resampler.aniso64_k_r" ) {
+		return m_sndFile->m_Resampler.m_Settings.aniso64_k_r;
 	} else {
 		MPT_ASSERT_NOTREACHED();
 		return 0.0;
@@ -2242,6 +2245,13 @@ void module_impl::ctl_set_floatingpoint( std::string_view ctl, double value, boo
 		}
 		auto settings = m_sndFile->m_Resampler.m_Settings;
 		settings.aniso64_k_beta2 = value;
+		m_sndFile->SetResamplerSettings( settings );
+	} else if ( ctl == "render.resampler.aniso64_k_r" ) {
+		if ( value < 0.0 || value > 4.0 ) {
+			throw openmpt::exception("invalid aniso64_k_r value (range: 0.0-4.0)");
+		}
+		auto settings = m_sndFile->m_Resampler.m_Settings;
+		settings.aniso64_k_r = value;
 		m_sndFile->SetResamplerSettings( settings );
 	} else {
 		MPT_ASSERT_NOTREACHED();

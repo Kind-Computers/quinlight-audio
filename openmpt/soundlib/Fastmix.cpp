@@ -216,7 +216,15 @@ struct MixLoopState
 		int32 nPosDest = (nPos + incSamples).GetInt();
 
 		const bool isAtLoopStart = (nPosInt >= chn.nLoopStart && nPosInt < chn.nLoopStart + InterpolationLookaheadBufferSize);
-		if(!isAtLoopStart)
+		// The Aniso-64 data-mip gather keeps reading kernel windows that cross
+		// the loop start until the position is 32·2^level frames past it, so
+		// CHN_WRAPPED_LOOP (which gates its loop-start strip windows) must
+		// outlive the widest such window. isAtLoopStart itself stays at the
+		// level-0 width: it also bounds the wrap-around buffer reads below.
+		SmpLength wrappedLoopWindow = InterpolationLookaheadBufferSize;
+		if(chn.pModSample != nullptr)
+			wrappedLoopWindow <<= std::min(static_cast<int>(chn.pModSample->nMipLevelsBuilt), SampleMip::MaxLevels(chn.pModSample->nLength));
+		if(!(nPosInt >= chn.nLoopStart && nPosInt < chn.nLoopStart + wrappedLoopWindow))
 		{
 			chn.dwFlags.reset(CHN_WRAPPED_LOOP);
 		}

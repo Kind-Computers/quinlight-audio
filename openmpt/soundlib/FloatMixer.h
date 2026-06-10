@@ -13,7 +13,9 @@
 #include "openmpt/all/BuildSettings.hpp"
 
 #include "MixerInterface.h"
+#include "ModSample.h"
 #include "Resampler.h"
+#include "mpt/base/arithmetic_shift.hpp"
 
 OPENMPT_NAMESPACE_BEGIN
 
@@ -612,78 +614,185 @@ extern "C" double aniso64_dot_mono_avx512(const double * __restrict__ kernel, co
 extern "C" void aniso64_dot_stereo_avx512(const double * __restrict__ kernel, const double * __restrict__ samples, double * __restrict__ outL, double * __restrict__ outR);
 
 
-// 64-tap anisotropic sinc interpolation with AVX2 SIMD acceleration.
-// Enhanced β-shear with 2nd-order acceleration tracking.
-// See: "Anisotropic Audio Filters" (Quinlight paper, March 2026).
+// 64-tap anisotropic sinc interpolation with SIMD acceleration — the full
+// sheared-separable gather of "Anisotropic Audio Filters" (Quinlight paper,
+// March 2026), Eq. 13/14, over TRUE DATA MIPS (the paper's W[q,m]):
+//
+//   * Each sample carries an octave-decimated data pyramid (see
+//     SampleMipChain.cpp), exactly like a GPU texture mip chain. Slice j
+//     reads mip level j by absolute position (position raw >> j — dyadic,
+//     so 64 taps at level j span 64·2^j original samples: properly
+//     bandlimited at any downsampling ratio).
+//   * The footprint spans up to MaxSlices mip levels around the continuous
+//     level μ, widened by R = 1 + k_r·|μ̇| (Eq. 15) when the pitch is moving.
+//     Slice weights are a stretched tent w_j ∝ max(0, 1 − |j−μ|/R),
+//     normalized — at R = 1 this reduces EXACTLY to the classic (1−ε, ε)
+//     trilinear blend, i.e. ordinary GPU-style interpolation at steady pitch.
+//   * Each slice's kernel is picked from a fractional one-octave family by
+//     its residual ratio r_j = ratio / 2^j ∈ [0.5, 2) (nearest eighth-octave
+//     cutoff; the data-mip blend covers the octave axis).
+//   * Each slice's phase taps are sheared by β·(j−μ) where
+//     β = k_β·İ + k_β²·Ï (tempo-invariant per-output-sample derivatives of
+//     the increment, computed in Sndmix.cpp) — the per-slice tap tilt of
+//     Eq. 14. The shear is added in mip-0 raw units BEFORE the >> j shift,
+//     so its effective magnitude scales correctly per level.
+//   * Near designated loop boundaries, mip slices switch to per-level strip
+//     windows holding the decimation of the periodically extended signal —
+//     the mip-level analog of the level-0 loop wrap-around buffers — so
+//     loop seams stay continuous and key-off tails never bleed into loops.
 template<class Traits>
 struct Aniso64Interpolation
 {
-	const typename Traits::output_t *sincA;
-	const typename Traits::output_t *sincB;
-	typename Traits::output_t blendFactor;
-	int32 betaPhaseShift;
+	static constexpr int MaxSlices = 4;
+	// Per-slice gather state. Level-0 slices read through the inBuffer
+	// pointer handed in by the caller, leaving Fastmix's loop-lookahead
+	// pointer swap (and its quirks) fully intact; slices at level >= 1 read
+	// the data mip pyramid by absolute position.
+	const typename Traits::output_t *sliceKernel[MaxSlices];
+	typename Traits::output_t sliceWeight[MaxSlices];
+	int64 sliceShearRaw[MaxSlices];  // β·(j−μ) in mip-0 32.32 raw units
+	const typename Traits::input_t *sliceBody[MaxSlices];        // mip body, indexable by int_j (level >= 1)
+	const typename Traits::input_t *sliceStripEnd[MaxSlices];    // loop-end strip, bias-adjusted to int_j
+	const typename Traits::input_t *sliceStripStart[MaxSlices];  // loop-start strip, bias-adjusted to int_j
+	int32 sliceEndLo[MaxSlices];     // engage end strip when int_j >= this (int32_max = never)
+	int32 sliceStartHi[MaxSlices];   // engage start strip when int_j < this (int32_min = never)
+	uint8 sliceLevel[MaxSlices];
+	int numSlices;
+	int64 posRaw;  // absolute 32.32 position, advanced in lockstep with SampleLoop's smpPos
+	int64 incRaw;
 	bool useAVX512;
 	bool useAVX2;
 	bool useAVX;
 
+	// Kernel level for the residual ratio r = ratio / 2^level ∈ [0.5, 2):
+	// nearest eighth-octave step. r only exceeds 2 when the slice range was
+	// clamped at the sample's deepest built mip — the lowest-cutoff kernel
+	// is then the best (if under-bandlimited) choice available.
+	static MPT_FORCEINLINE int KernelIndex(double ratio, int level)
+	{
+		const double r = ratio / static_cast<double>(int64(1) << level);
+		if(r <= 1.0)
+			return 0;
+		const int idx = static_cast<int>(8.0 * std::log2(r) + 0.5);
+		return std::min(idx, MIP_LEVELS - 1);
+	}
+
 	MPT_FORCEINLINE Aniso64Interpolation(const ModChannel &chn, const CResampler &resampler, unsigned int)
 	{
-		// Mipmap-style anti-aliasing: select octave-spaced sinc tables via log2(ratio).
-		// Trilinear blend between adjacent mip levels — zero aliasing at any ratio.
-		//
-		//   ratio = increment / unity  (>1 = downsampling, <1 = upsampling)
-		//   mipLevel = log2(ratio)     (0.0 = unity, 1.0 = 2x, 5.13 = 35x, etc.)
-		//   sincA = mip[floor(level)], sincB = mip[ceil(level)]
-		//   blendFactor = frac(level)
-		//
+		static_assert(SampleMip::kMaxLevels == MIP_LEVELS - 1);
+
+		// Continuous mip level: ratio = increment / unity (>1 = downsampling).
 		const int64 absInc = std::abs(chn.increment.GetRaw());
 		const double ratio = std::max(1.0, static_cast<double>(absInc) / 4294967296.0);
-		const double mipLevel = std::log2(ratio);
-		int mipA = static_cast<int>(mipLevel);
-		if(mipA < 0) mipA = 0;
-		if(mipA >= MIP_LEVELS - 1)
-		{
-			mipA = MIP_LEVELS - 1;
-			sincA = resampler.gAniso64Mip[mipA];
-			sincB = sincA;
-			blendFactor = 0;
-		}
-		else
-		{
-			sincA = resampler.gAniso64Mip[mipA];
-			sincB = resampler.gAniso64Mip[mipA + 1];
-			blendFactor = static_cast<typename Traits::output_t>(mipLevel - mipA);
-		}
 
-		// Enhanced anisotropic β-shear: 2nd-order (acceleration-aware)
-		// k_beta raised from 0.5 to 0.65 — the 64-tap kernel resolves finer time structure
-		// k_beta2 = 0.15 adds acceleration term for rapid pitch bends
-		betaPhaseShift = 0;
-		if(!chn.prevIncrement.IsZero())
-		{
-			const int64 dInc = chn.increment.GetRaw() - chn.prevIncrement.GetRaw();
-			const int64 d2Inc = dInc - chn.prevDeltaIncrement.GetRaw();
+		// Absolute-position tracking: the ctor runs before SampleLoop copies
+		// c.position, and smpPos advances by one raw add per output sample —
+		// posRaw += incRaw in operator() replicates it bit-exactly.
+		posRaw = chn.position.GetRaw();
+		incRaw = chn.increment.GetRaw();
 
-			if(dInc != 0 || d2Inc != 0)
+		// Depth of the data mip pyramid built for this sample. 0 (no
+		// pyramid yet) degrades to a level-0-only gather.
+		const ModSample *smp = chn.pModSample;
+		const int maxLevel = (smp != nullptr && smp->HasSampleData())
+			? std::min(static_cast<int>(smp->nMipLevelsBuilt), SampleMip::MaxLevels(smp->nLength))
+			: 0;
+		const double mu = std::min(std::log2(ratio), static_cast<double>(maxLevel));
+
+		const double k_beta = resampler.m_Settings.aniso64_k_beta;
+		const double k_beta2 = resampler.m_Settings.aniso64_k_beta2;
+		const double k_r = resampler.m_Settings.aniso64_k_r;
+
+		// chn.anisoIncDot/anisoIncDotDot are per-output-sample; the legacy
+		// defaults (k_β = 0.65, k_β² = 0.15) were tuned against raw per-tick
+		// deltas at ≈1024-sample ticks, so velNorm restores those magnitudes
+		// while keeping the shear tempo-invariant.
+		constexpr double velNorm = 1024.0;
+		constexpr double maxShift = 1073741824.0; // ±0x40000000 = ±0.25 sample
+		const double shear = k_beta * chn.anisoIncDot * velNorm
+			+ k_beta2 * chn.anisoIncDotDot * velNorm * velNorm;
+		const double beta = std::clamp(shear, -maxShift, maxShift);
+
+		// Footprint width R = 1 + k_r·|μ̇| (Eq. 15). μ̇ is mip-levels per
+		// output sample — tiny — so scale to per-4096-samples to keep the ctl
+		// O(1). R is clamped to [1, 2] (at most 4 slices).
+		const double muDotScaled = chn.anisoMuDot * 4096.0;
+		const double r = std::clamp(1.0 + k_r * std::abs(muDotScaled), 1.0, 2.0);
+
+		int lo = static_cast<int>(std::floor(mu - (r - 1.0)));
+		int hi = static_cast<int>(std::ceil(mu + (r - 1.0)));
+		lo = std::clamp(lo, 0, maxLevel);
+		hi = std::clamp(hi, lo, maxLevel);
+		if(hi - lo >= MaxSlices)
+			lo = hi - (MaxSlices - 1); // keep the most-bandlimited end (§10.3)
+
+		// Strip gating, mirroring MixLoopState::UpdateLookaheadPointers: the
+		// strips describe the sample's stored loop, so they only apply when
+		// the channel's active loop matches it (no custom-loop preview).
+		bool stripsOk = false, useSustainStrips = false, wrapped = false;
+		SmpLength loopStart = 0, loopEnd = 0;
+		if(smp != nullptr && chn.dwFlags[CHN_LOOP])
+		{
+			const bool inSustain = chn.InSustainLoop() && chn.nLoopStart == smp->nSustainStart && chn.nLoopEnd == smp->nSustainEnd;
+			if(inSustain || (chn.nLoopStart == smp->nLoopStart && chn.nLoopEnd == smp->nLoopEnd))
 			{
-				const double k_beta = resampler.m_Settings.aniso64_k_beta;
-				const double k_beta2 = resampler.m_Settings.aniso64_k_beta2;
-				constexpr double maxShift = 1073741824.0;              // 0x40000000
-				constexpr double blendCeiling = 0.6;                   // Higher ceiling — 64-tap makes blend smoother
-				constexpr double blendSensitivity = 1.0 / 0x04000000;
+				stripsOk = true;
+				useSustainStrips = inSustain;
+				loopStart = chn.nLoopStart;
+				loopEnd = chn.nLoopEnd;
+				wrapped = chn.dwFlags[CHN_WRAPPED_LOOP];
+			}
+		}
 
-				const double dIncD = static_cast<double>(dInc);
-				const double d2IncD = static_cast<double>(d2Inc);
-				const double shear = k_beta * dIncD + k_beta2 * d2IncD;
-				betaPhaseShift = static_cast<int32>(
-					std::clamp(shear, -maxShift, maxShift));
+		numSlices = 0;
+		double weights[MaxSlices];
+		double wsum = 0.0;
+		for(int j = lo; j <= hi && numSlices < MaxSlices; j++)
+		{
+			const double w = std::max(0.0, 1.0 - std::abs(static_cast<double>(j) - mu) / r);
+			if(w <= 0.0)
+				continue;
+			weights[numSlices] = w;
+			InitSlice(numSlices, j, KernelIndex(ratio, j),
+				static_cast<int64>(std::clamp(beta * (static_cast<double>(j) - mu), -maxShift, maxShift)),
+				resampler, smp, loopStart, loopEnd, stripsOk, useSustainStrips, wrapped);
+			wsum += w;
+			numSlices++;
+		}
+		if(numSlices == 0)
+		{
+			// Unreachable (the slice nearest μ always has w > 0), but never
+			// leave the gather empty.
+			const int j = std::clamp(static_cast<int>(mu + 0.5), 0, maxLevel);
+			InitSlice(0, j, KernelIndex(ratio, j), 0, resampler, smp, loopStart, loopEnd, stripsOk, useSustainStrips, wrapped);
+			sliceWeight[0] = static_cast<typename Traits::output_t>(1);
+			numSlices = 1;
+			wsum = 0.0; // weights already final
+		}
+		if(wsum > 0.0)
+		{
+			for(int s = 0; s < numSlices; s++)
+				sliceWeight[s] = static_cast<typename Traits::output_t>(weights[s] / wsum);
+		}
 
-				if(blendFactor == 0)
-				{
-					sincB = sincA;
-					blendFactor = static_cast<typename Traits::output_t>(
-						std::min(blendCeiling, std::abs(dIncD) * blendSensitivity * blendCeiling));
-				}
+		// Velocity blur at an integral mip level with R = 1 (typically mip 0
+		// during upsampled playback, where μ̇ == 0 by construction because the
+		// log is floored at unity ratio): blend toward a sheared copy of the
+		// SAME slice so fast linear pitch motion still widens the effective
+		// phase footprint — the §9.1 behavior this gather grew out of.
+		if(numSlices == 1 && beta != 0.0)
+		{
+			constexpr double blendCeiling = 0.6;
+			constexpr double blendSensitivity = 1.0 / 0x04000000;
+			const double blend = std::min(
+				blendCeiling, std::abs(chn.anisoIncDot * velNorm) * blendSensitivity * blendCeiling);
+			if(blend > 0.0)
+			{
+				CopySlice(1, 0);
+				sliceShearRaw[1] = static_cast<int64>(beta);
+				sliceWeight[0] = static_cast<typename Traits::output_t>(1.0 - blend);
+				sliceWeight[1] = static_cast<typename Traits::output_t>(blend);
+				numSlices = 2;
 			}
 		}
 
@@ -692,113 +801,164 @@ struct Aniso64Interpolation
 		useAVX = resampler.m_hasAVX;
 	}
 
+	MPT_FORCEINLINE void InitSlice(int s, int level, int kernelIdx, int64 shearRaw, const CResampler &resampler,
+		const ModSample *smp, SmpLength loopStart, SmpLength loopEnd, bool stripsOk, bool useSustainStrips, bool wrapped)
+	{
+		sliceKernel[s] = resampler.gAniso64Mip[kernelIdx];
+		sliceShearRaw[s] = shearRaw;
+		sliceLevel[s] = static_cast<uint8>(level);
+		sliceBody[s] = nullptr;
+		sliceStripEnd[s] = nullptr;
+		sliceStripStart[s] = nullptr;
+		sliceEndLo[s] = int32_max;
+		sliceStartHi[s] = int32_min;
+		if(level < 1)
+			return;
+		const SmpLength len = smp->nLength;
+		constexpr int nch = Traits::numChannelsIn;
+		const auto *base = static_cast<const typename Traits::input_t *>(smp->samplev());
+		sliceBody[s] = base + SampleMip::BodyOffsetFrames(len, level) * nch;
+		if(stripsOk)
+		{
+			const int endWin = useSustainStrips ? SampleMip::kStripSustainEnd : SampleMip::kStripLoopEnd;
+			const int32 endC = static_cast<int32>(loopEnd >> level);
+			const int32 startC = static_cast<int32>(loopStart >> level);
+			// Strip frame i holds mip-level position C - 128 + i; bias-adjust
+			// the pointers so they are indexable by int_j directly.
+			sliceStripEnd[s] = base + SampleMip::StripOffsetFrames(len, level, endWin) * nch - static_cast<int64>(endC - 128) * nch;
+			sliceStripStart[s] = base + SampleMip::StripOffsetFrames(len, level, endWin + 1) * nch - static_cast<int64>(startC - 128) * nch;
+			// Mirror Fastmix's lookaheadStart = max(loopStart, loopEnd - 64):
+			// inside tiny loops the (fully periodized) end strip serves the
+			// whole loop body.
+			sliceEndLo[s] = std::max(startC, endC - static_cast<int32>(SampleMip::kLookahead));
+			if(wrapped)
+				sliceStartHi[s] = startC + static_cast<int32>(SampleMip::kLookahead);
+		}
+	}
+
+	MPT_FORCEINLINE void CopySlice(int dst, int src)
+	{
+		sliceKernel[dst] = sliceKernel[src];
+		sliceShearRaw[dst] = sliceShearRaw[src];
+		sliceLevel[dst] = sliceLevel[src];
+		sliceBody[dst] = sliceBody[src];
+		sliceStripEnd[dst] = sliceStripEnd[src];
+		sliceStripStart[dst] = sliceStripStart[src];
+		sliceEndLo[dst] = sliceEndLo[src];
+		sliceStartHi[dst] = sliceStartHi[src];
+	}
+
+	// Resolve the data pointer and kernel phase for a level >= 1 slice at
+	// the given (shear-adjusted) absolute raw position: mip body, or one of
+	// the loop strips near a designated boundary. The end strip has
+	// priority — for tiny loops both zones overlap and the end strip (fully
+	// periodized on both sides) is the correct one.
+	MPT_FORCEINLINE const typename Traits::input_t *SliceData(int s, int64 raw, uint32 &phase) const
+	{
+		const int j = sliceLevel[s];
+		const int32 intk = static_cast<int32>(mpt::rshift_signed(raw, 32 + j));
+		const uint32 frac = static_cast<uint32>(static_cast<uint64>(raw) >> j);
+		phase = ((frac >> (32 - SINC_PHASES_64_BITS)) & SINC_MASK_64) * SINC_WIDTH_64;
+		constexpr int nch = Traits::numChannelsIn;
+		if(intk >= sliceEndLo[s])
+			return sliceStripEnd[s] + intk * nch;
+		if(intk < sliceStartHi[s])
+			return sliceStripStart[s] + intk * nch;
+		return sliceBody[s] + intk * nch;
+	}
+
 	MPT_FORCEINLINE void operator() (typename Traits::outbuf_t &outSample, const typename Traits::input_t * const inBuffer, const uint32 posLo)
 	{
 		static_assert(static_cast<int>(Traits::numChannelsIn) <= static_cast<int>(Traits::numChannelsOut), "Too many input channels");
-		const uint32 phase = ((posLo >> (32 - SINC_PHASES_64_BITS)) & SINC_MASK_64) * SINC_WIDTH_64;
-		const typename Traits::output_t *lutA = sincA + phase;
+		MPT_ASSERT(static_cast<uint32>(static_cast<uint64>(posRaw) & 0xFFFFFFFFu) == posLo);
 
-		// SIMD stereo fast path: both channels computed simultaneously via deinterleave
-		// Dispatch cascade: AVX-512 → AVX2 → AVX → SSE2 → scalar
+		// SIMD stereo fast path: both channels computed simultaneously via
+		// deinterleave. Dispatch cascade: AVX-512 → AVX2 → AVX → SSE2.
 		if(std::is_same<typename Traits::input_t, double>::value && Traits::numChannelsIn == 2)
 		{
-			const double *samples = reinterpret_cast<const double *>(inBuffer) - 31 * 2;
-			double outL, outR;
-			if(useAVX512)
-				aniso64_dot_stereo_avx512(lutA, samples, &outL, &outR);
-			else if(useAVX2)
-				aniso64_dot_stereo_avx2(lutA, samples, &outL, &outR);
-			else if(useAVX)
-				aniso64_dot_stereo_avx(lutA, samples, &outL, &outR);
-			else
-				aniso64_dot_stereo_sse2(lutA, samples, &outL, &outR);
-
-			if(blendFactor != 0)
+			double accL = 0.0, accR = 0.0;
+			for(int s = 0; s < numSlices; s++)
 			{
-				const uint32 posLoB = static_cast<uint32>(static_cast<int32>(posLo) + betaPhaseShift);
-				const uint32 phaseB = ((posLoB >> (32 - SINC_PHASES_64_BITS)) & SINC_MASK_64) * SINC_WIDTH_64;
-				const typename Traits::output_t *lutB = sincB + phaseB;
-				double outBL, outBR;
+				const double *samples;
+				uint32 phase;
+				if(sliceLevel[s] == 0)
+				{
+					const uint32 posLoS = static_cast<uint32>(static_cast<int32>(posLo) + static_cast<int32>(sliceShearRaw[s]));
+					phase = ((posLoS >> (32 - SINC_PHASES_64_BITS)) & SINC_MASK_64) * SINC_WIDTH_64;
+					samples = reinterpret_cast<const double *>(inBuffer) - 31 * 2;
+				} else
+				{
+					samples = reinterpret_cast<const double *>(SliceData(s, posRaw + sliceShearRaw[s], phase)) - 31 * 2;
+				}
+				const typename Traits::output_t *lut = sliceKernel[s] + phase;
+				double outL, outR;
 				if(useAVX512)
-					aniso64_dot_stereo_avx512(lutB, samples, &outBL, &outBR);
+					aniso64_dot_stereo_avx512(lut, samples, &outL, &outR);
 				else if(useAVX2)
-					aniso64_dot_stereo_avx2(lutB, samples, &outBL, &outBR);
+					aniso64_dot_stereo_avx2(lut, samples, &outL, &outR);
 				else if(useAVX)
-					aniso64_dot_stereo_avx(lutB, samples, &outBL, &outBR);
+					aniso64_dot_stereo_avx(lut, samples, &outL, &outR);
 				else
-					aniso64_dot_stereo_sse2(lutB, samples, &outBL, &outBR);
-				outL = outL + static_cast<double>(blendFactor) * (outBL - outL);
-				outR = outR + static_cast<double>(blendFactor) * (outBR - outR);
+					aniso64_dot_stereo_sse2(lut, samples, &outL, &outR);
+				const double w = static_cast<double>(sliceWeight[s]);
+				accL += w * outL;
+				accR += w * outR;
 			}
-			outSample[0] = static_cast<typename Traits::output_t>(outL);
-			outSample[1] = static_cast<typename Traits::output_t>(outR);
+			outSample[0] = static_cast<typename Traits::output_t>(accL);
+			outSample[1] = static_cast<typename Traits::output_t>(accR);
+			posRaw += incRaw;
 			return;
 		}
 
 		for(int i = 0; i < Traits::numChannelsIn; i++)
 		{
-			typename Traits::output_t out;
-
-			// SIMD mono fast path: Float64 mono samples are contiguous doubles — zero conversion
-			// Dispatch cascade: AVX-512 → AVX2 → AVX → SSE2 → scalar
-			if(std::is_same<typename Traits::input_t, double>::value && Traits::numChannelsIn == 1)
+			typename Traits::output_t acc = 0;
+			for(int s = 0; s < numSlices; s++)
 			{
-				const double *samples = reinterpret_cast<const double *>(inBuffer + i) - 31;
-				if(useAVX512)
-					out = static_cast<typename Traits::output_t>(aniso64_dot_mono_avx512(lutA, samples));
-				else if(useAVX2)
-					out = static_cast<typename Traits::output_t>(aniso64_dot_mono_avx2(lutA, samples));
-				else if(useAVX)
-					out = static_cast<typename Traits::output_t>(aniso64_dot_mono_avx(lutA, samples));
-				else
-					out = static_cast<typename Traits::output_t>(aniso64_dot_mono_sse2(lutA, samples));
-			}
-			else
-			{
-				// Scalar fallback: non-double formats (int8, int16, float32) and stereo stride
-				out = 0;
-				for(int t = 0; t < SINC_WIDTH_64; t++)
+				uint32 phase;
+				const typename Traits::input_t *data;
+				if(sliceLevel[s] == 0)
 				{
-					out += lutA[t] * Traits::Convert(inBuffer[i + (t - 31) * Traits::numChannelsIn]);
+					const uint32 posLoS = static_cast<uint32>(static_cast<int32>(posLo) + static_cast<int32>(sliceShearRaw[s]));
+					phase = ((posLoS >> (32 - SINC_PHASES_64_BITS)) & SINC_MASK_64) * SINC_WIDTH_64;
+					data = inBuffer;
+				} else
+				{
+					data = SliceData(s, posRaw + sliceShearRaw[s], phase);
 				}
-			}
+				const typename Traits::output_t *lut = sliceKernel[s] + phase;
 
-			if(blendFactor != 0)
-			{
-				// Trilinear blend with β-sheared kernel B
-				const uint32 posLoB = static_cast<uint32>(static_cast<int32>(posLo) + betaPhaseShift);
-				const uint32 phaseB = ((posLoB >> (32 - SINC_PHASES_64_BITS)) & SINC_MASK_64) * SINC_WIDTH_64;
-				const typename Traits::output_t *lutB = sincB + phaseB;
-
-				typename Traits::output_t outB;
+				typename Traits::output_t out;
+				// SIMD mono fast path: Float64 mono samples are contiguous
+				// doubles — zero conversion.
 				if(std::is_same<typename Traits::input_t, double>::value && Traits::numChannelsIn == 1)
 				{
-					const double *samples = reinterpret_cast<const double *>(inBuffer + i) - 31;
+					const double *samples = reinterpret_cast<const double *>(data + i) - 31;
 					if(useAVX512)
-						outB = static_cast<typename Traits::output_t>(aniso64_dot_mono_avx512(lutB, samples));
+						out = static_cast<typename Traits::output_t>(aniso64_dot_mono_avx512(lut, samples));
 					else if(useAVX2)
-						outB = static_cast<typename Traits::output_t>(aniso64_dot_mono_avx2(lutB, samples));
+						out = static_cast<typename Traits::output_t>(aniso64_dot_mono_avx2(lut, samples));
 					else if(useAVX)
-						outB = static_cast<typename Traits::output_t>(aniso64_dot_mono_avx(lutB, samples));
+						out = static_cast<typename Traits::output_t>(aniso64_dot_mono_avx(lut, samples));
 					else
-						outB = static_cast<typename Traits::output_t>(aniso64_dot_mono_sse2(lutB, samples));
+						out = static_cast<typename Traits::output_t>(aniso64_dot_mono_sse2(lut, samples));
 				}
 				else
 				{
-					outB = 0;
+					// Scalar fallback: non-double formats and stereo stride.
+					out = 0;
 					for(int t = 0; t < SINC_WIDTH_64; t++)
 					{
-						outB += lutB[t] * Traits::Convert(inBuffer[i + (t - 31) * Traits::numChannelsIn]);
+						out += lut[t] * Traits::Convert(data[i + (t - 31) * Traits::numChannelsIn]);
 					}
 				}
-				out = out + blendFactor * (outB - out);
+				acc += sliceWeight[s] * out;
 			}
-
-			outSample[i] = out;
+			outSample[i] = acc;
 		}
+		posRaw += incRaw;
 	}
 };
-
 
 template<class Traits>
 struct FIRFilterInterpolation

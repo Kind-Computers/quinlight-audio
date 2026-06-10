@@ -570,6 +570,9 @@ void RefreshChannelsForSample(CSoundFile &sndFile, const ModSample &sample)
 		// the current increment and zero delta so the next tick starts flat.
 		chn.prevIncrement = chn.increment;
 		chn.prevDeltaIncrement.Set(0);
+		chn.anisoIncDot = 0.0;
+		chn.anisoIncDotDot = 0.0;
+		chn.anisoMuDot = 0.0;
 
 		// Output DC-offset buffer: residue from the old sample at the old rate.
 		chn.nROfs = 0;

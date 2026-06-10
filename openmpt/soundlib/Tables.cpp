@@ -837,23 +837,35 @@ void CResampler::InitializeTablesFromScratch(bool force)
 	{
 		blepTables.InitTables();
 
-		// Universal mip chains: every interpolation mode gets octave-spaced
-		// Kaiser sinc tables at its native tap width.  log2(ratio) selects
-		// adjacent levels; fractional part drives trilinear blend.
-		// β tapers with tap count (fewer taps = wider transition band).
+		// Universal mip chains: every interpolation mode gets Kaiser sinc
+		// tables at its native tap width.  For the kernel-mip modes
+		// (Polyphase/SINC8/4-tap/Linear) the levels are octave-spaced over
+		// 1x-128x; log2(ratio) selects adjacent levels and the fractional
+		// part drives trilinear blend.  Aniso-64 instead uses per-sample
+		// decimated DATA mips, so its family below spans one octave (see
+		// its comment).  β tapers with tap count (fewer taps = wider
+		// transition band).
 		struct MipParam { double cutoff; double beta; };
 
-		// Aniso-64 mip chain (64-tap, 65536 phases)
+		// Aniso-64 kernel family (64-tap, 65536 phases).
+		// Unlike the other chains, Aniso-64 reads per-sample decimated DATA
+		// mips (see SampleMipChain.cpp): the octave axis is handled by the
+		// data pyramid, so the gather only ever sees a residual ratio
+		// r = ratio / 2^level in [0.5, 2).  These tables therefore span a
+		// single octave at eighth-octave steps — level i matches
+		// r = 2^(i/8), cutoff = 0.995 * 2^(-i/8) — and the gather picks the
+		// nearest level per slice (no kernel blending; the data-mip blend
+		// covers the octave axis).
 		{
 			static const MipParam aniso64[MIP_LEVELS] = {
-				{ 0.995, 14.0 },   // Level 0: upsampling / near-unity
-				{ 0.46,  11.0 },   // Level 1: 2x downsample
-				{ 0.23,  10.5 },   // Level 2: 4x
-				{ 0.115, 10.0 },   // Level 3: 8x
-				{ 0.058,  9.5 },   // Level 4: 16x
-				{ 0.029,  9.0 },   // Level 5: 32x
-				{ 0.015,  8.5 },   // Level 6: 64x
-				{ 0.008,  8.0 },   // Level 7: 128x
+				{ 0.995, 14.0 },   // r = 1.00 (also used for all upsampling)
+				{ 0.913, 13.5 },   // r = 1.09
+				{ 0.837, 13.0 },   // r = 1.19
+				{ 0.768, 12.5 },   // r = 1.30
+				{ 0.704, 12.0 },   // r = 1.41
+				{ 0.646, 11.7 },   // r = 1.54
+				{ 0.592, 11.4 },   // r = 1.68
+				{ 0.543, 11.0 },   // r = 1.83
 			};
 			for(int i = 0; i < MIP_LEVELS; i++)
 				getsinc_n(gAniso64Mip[i], aniso64[i].beta, aniso64[i].cutoff, SINC_WIDTH_64, SINC_PHASES_64);
