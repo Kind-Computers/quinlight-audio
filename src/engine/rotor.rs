@@ -73,6 +73,10 @@ pub fn shortest_arc(from: f64, to: f64) -> f64 {
 /// attenuation in that one bin (which is unavoidable: a 180° phase flip
 /// really is destructive interference).
 pub fn polar_slerp(a: Complex<f64>, b: Complex<f64>, t: f64) -> Complex<f64> {
+    // Interpolation only — extrapolation through the magnitude-floor branches
+    // below would produce a negative radius, which `from_polar` renders as a
+    // silent pi phase flip.
+    let t = t.clamp(0.0, 1.0);
     let r_a = a.norm();
     let r_b = b.norm();
 
@@ -136,6 +140,8 @@ pub fn polar_slerp(a: Complex<f64>, b: Complex<f64>, t: f64) -> Complex<f64> {
 /// no signal at a bin: geometric mean of `(r, 0+ε)` collapses to ≈ 0 and
 /// kills the dominant side.
 pub fn polar_lerp(a: Complex<f64>, b: Complex<f64>, t: f64) -> Complex<f64> {
+    // Interpolation only — see `polar_slerp`.
+    let t = t.clamp(0.0, 1.0);
     let r_a = a.norm();
     let r_b = b.norm();
 

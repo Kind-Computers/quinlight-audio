@@ -21,10 +21,12 @@ use crate::remaster::{
 };
 
 struct RemasterOutcome {
+    /// Samples where an AI result was applied. Every applied result is a
+    /// consensus mix of two or more engines by construction
+    /// (`should_apply_final_result` filters the kept-original markers), so
+    /// there is no separate "consensus" counter.
     replaced: usize,
     total: usize,
-    /// Samples where AI consensus was reached (2+ engines above score floor) and applied.
-    consensus_replaced: usize,
     /// Sample indices where no AI engine produced any output at all.
     no_output_indices: Vec<i32>,
     /// Sample indices where AI ran but consensus was not reached (< 2 usable engines).
@@ -40,16 +42,19 @@ struct RemasterOutcome {
 ///
 /// `Fatal` → exit 1 (engine/subprocess broken, stop the batch script).
 /// `QualityGate` → exit 2 (mod not remastered, but engine is OK — script may continue).
+/// `Cancelled` → exit 130 (user interrupt; the batch is incomplete, not failed).
 #[derive(Debug)]
 pub enum ConvertError {
     Fatal(String),
     QualityGate(String),
+    Cancelled,
 }
 
 impl std::fmt::Display for ConvertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Fatal(msg) | Self::QualityGate(msg) => f.write_str(msg),
+            Self::Cancelled => f.write_str("cancelled by user"),
         }
     }
 }
@@ -294,7 +299,7 @@ pub(crate) fn detect_remaster_engine(
 
     let detected = RemasterEngine::detect();
     let enabled = resolve_requested_engines(requested_engines, &detected.available_engine_names())?;
-    let engine = RemasterEngine::detect_with_fallback(&enabled);
+    let engine = RemasterEngine::detect_enabled(&enabled);
     if engine.is_available() {
         Ok(engine)
     } else {
@@ -356,7 +361,6 @@ fn remaster_module_in_place(
         return Ok(RemasterOutcome {
             replaced: 0,
             total: 0,
-            consensus_replaced: 0,
             no_output_indices: vec![],
             no_consensus_indices: vec![],
             engines_available,
@@ -377,7 +381,6 @@ fn remaster_module_in_place(
 
     let engine_ref = engine;
     let mut replaced = 0;
-    let mut consensus_replaced = 0;
     let mut no_output_indices = Vec::new();
     let mut no_consensus_indices = Vec::new();
     std::thread::scope(|s| {
@@ -451,7 +454,6 @@ fn remaster_module_in_place(
                 );
             } else {
                 replaced += 1;
-                consensus_replaced += 1;
             }
         }
 
@@ -467,7 +469,6 @@ fn remaster_module_in_place(
     Ok(RemasterOutcome {
         replaced,
         total,
-        consensus_replaced,
         no_output_indices,
         no_consensus_indices,
         engines_available,
@@ -668,6 +669,13 @@ pub fn run_convert(
                 shutdown_flag,
             ) {
                 Ok(outcome) => {
+                    // Mirrors the Err branch: a Ctrl-C mid-remaster closes the
+                    // result channel early, so missing finals here mean
+                    // CANCELLED, not a broken engine — exiting 1 would tell
+                    // scripts to stop treating the engine as usable.
+                    if shutdown_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if !outcome.no_output_indices.is_empty() {
                         eprintln!(
                             "  FATAL: engine(s) produced no output for sample(s) {}",
@@ -679,12 +687,12 @@ pub fn run_convert(
                     let mixing_engine_qualifies =
                         outcome.engines_available >= 2 && outcome.existing_hifi_samples >= 1;
                     if !outcome.no_consensus_indices.is_empty() {
-                        if outcome.consensus_replaced > 0 {
+                        if outcome.replaced > 0 {
                             eprintln!(
                                 "  Note: sample(s) {} kept the original sample \
                                  (consensus not reached), {}/{} samples AI-remastered",
                                 format_indices(&outcome.no_consensus_indices),
-                                outcome.consensus_replaced,
+                                outcome.replaced,
                                 outcome.total,
                             );
                         } else if mixing_engine_qualifies {
@@ -727,9 +735,22 @@ pub fn run_convert(
                 ))
             })?;
         }
+        let mut render_fatal = false;
         for fmt in formats {
-            let render_rate =
-                sample_rate_override.unwrap_or_else(|| output_kind.effective_rate(fmt));
+            // Cap the override per format BEFORE deriving the filename: AAC
+            // can't exceed 96 kHz, and the encoder silently resamples — so an
+            // uncapped 192 kHz request used to produce a 96 kHz file named
+            // "...192Khz.m4a".
+            let render_rate = {
+                let requested =
+                    sample_rate_override.unwrap_or_else(|| output_kind.effective_rate(fmt));
+                if fmt == "m4a" && requested > 96_000 {
+                    eprintln!("  Note: AAC max sample rate is 96 kHz; capping from {requested} Hz");
+                    96_000
+                } else {
+                    requested
+                }
+            };
 
             let out_path =
                 sub_dir.join(converted_output_name(&stem, fmt, output_kind, render_rate));
@@ -758,9 +779,16 @@ pub fn run_convert(
                 Err(e) => {
                     eprintln!("  FATAL: Error rendering {fmt}: {e}");
                     fatal_count += 1;
+                    render_fatal = true;
                     break;
                 }
             }
+        }
+        if render_fatal {
+            // Consistent with remaster fatals: a render failure means the
+            // toolchain is broken — stop the batch, and don't also count the
+            // failed module as converted.
+            break;
         }
 
         succeeded += 1;
@@ -778,6 +806,10 @@ pub fn run_convert(
         Err(ConvertError::QualityGate(format!(
             "{gate_count} file(s) failed AI quality gate"
         )))
+    } else if shutdown_flag.load(Ordering::Relaxed) {
+        // An interrupted batch is incomplete, not successful — exit 130 so
+        // scripts can distinguish it from a clean exit 0.
+        Err(ConvertError::Cancelled)
     } else {
         Ok(())
     }

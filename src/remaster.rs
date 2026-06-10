@@ -84,8 +84,38 @@ pub(crate) fn ensure_not_cancelled(cancel_flag: &AtomicBool) -> Result<(), Strin
 }
 
 fn kill_child_best_effort(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Engines run in their own process group (see
+        // `engine::apply_pytorch_env`); kill the whole group so Python
+        // multiprocessing/dataloader workers don't survive as orphans.
+        unsafe {
+            libc::killpg(child.id() as i32, libc::SIGKILL);
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Wait for an engine child with cancellation: poll `try_wait` at 100 ms and
+/// kill the child (and its process group) when cancellation is requested.
+/// A bare `child.wait()` here used to make Cancel hang forever whenever an
+/// engine hung in teardown after writing its last output.
+fn wait_child_cancellable(
+    child: &mut std::process::Child,
+    cancel_flag: &AtomicBool,
+) -> Result<std::process::ExitStatus, String> {
+    loop {
+        if cancellation_requested(cancel_flag) {
+            kill_child_best_effort(child);
+            return Err(cancelled_error());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => return Err(format!("Engine wait: {e}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -261,21 +291,25 @@ impl RemasterEngine {
         }
     }
 
-    /// Detect engines and partition into primary (names in `enabled`) and
-    /// fallback (installed but not in `enabled`). The fallback set is run
-    /// automatically for any sample where a primary engine scores below
-    /// `QUINLIGHT_USABLE_SCORE_FLOOR`, strengthening consensus on the samples
-    /// that need it without burning compute on samples where primaries pass.
-    pub fn detect_with_fallback(enabled: &[String]) -> Self {
+    /// Detect engines and keep only those whose names are in `enabled`.
+    /// An explicit engine selection (CLI `--engine`, GUI checkboxes) is a
+    /// hard restriction, matching its documented contract: engines the user
+    /// did not select do not run at all. (They were previously demoted to an
+    /// always-run second wave, which still loaded their models and joined
+    /// the consensus the user had opted out of.)
+    pub fn detect_enabled(enabled: &[String]) -> Self {
         let all = engine::detect_engines();
-        let (engines, fallback_engines): (Vec<_>, Vec<_>) = all.into_iter().partition(|e| {
-            enabled
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(e.name()))
-        });
+        let engines: Vec<_> = all
+            .into_iter()
+            .filter(|e| {
+                enabled
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(e.name()))
+            })
+            .collect();
         RemasterEngine {
             engines,
-            fallback_engines,
+            fallback_engines: Vec::new(),
         }
     }
 
@@ -283,9 +317,12 @@ impl RemasterEngine {
     /// Raw per-engine candidates stream immediately. When `progressive` is
     /// true (GUI), a Quinlight `Final` is emitted as soon as 2 engines have
     /// produced candidates per sample and again if a 3rd candidate refines
-    /// the set. When `progressive` is false (CLI), `Final` is emitted exactly
-    /// once per sample after all eligible engines complete, so the spectral
-    /// intersection runs only once per sample.
+    /// the set. When `progressive` is false (CLI), registered mode emits
+    /// `Final` exactly once per sample — second-wave engine counts are folded
+    /// into the totals before wave 1, so the consensus runs once per sample
+    /// even with a second wave. The legacy score-gated path cannot know its
+    /// wave-2 set upfront and may emit a second, refined `Final`; consumers
+    /// dedupe (later result wins at equal rate).
     ///
     /// Two-wave architecture: the primary wave runs `self.engines` (enabled by
     /// the user). The second wave runs `self.fallback_engines` (installed but
@@ -360,6 +397,30 @@ impl RemasterEngine {
 
         let pass1_dir = work_dir.path().join("pass1");
 
+        // In non-progressive (CLI) registered mode the second wave is known
+        // UPFRONT to run every fallback engine on every eligible sample, so
+        // fold those engines into each job's engine total before wave 1.
+        // Wave-1 completions then never fire a premature Final for samples
+        // that wave 2 will extend — the expensive consensus runs exactly once
+        // per sample, as the doc contract promises. (Progressive mode emits
+        // incremental Finals by design; the legacy score-gated path can't know
+        // the failing set upfront and keeps its dedup-at-the-consumer double
+        // emission.)
+        let registered = registration_default_active();
+        let precounted_second_wave =
+            registered && !progressive && !self.fallback_engines.is_empty();
+        let wave1_engine_totals: Vec<i32> = if precounted_second_wave {
+            jobs.iter()
+                .enumerate()
+                .map(|(idx, job)| {
+                    primary_counts_by_job[idx]
+                        + count_eligible_engines_for_job(job, &self.fallback_engines)
+                })
+                .collect()
+        } else {
+            primary_counts_by_job.clone()
+        };
+
         run_engine_wave(
             &self.engines,
             &jobs,
@@ -370,7 +431,7 @@ impl RemasterEngine {
             &progress_counter,
             primary_progress_total,
             &pending_outputs,
-            &primary_counts_by_job,
+            &wave1_engine_totals,
             mode,
             cancel_flag,
             ddim_steps,
@@ -386,9 +447,14 @@ impl RemasterEngine {
         // runs the installed-but-disabled engines for samples where a primary
         // scored below the usability floor, to minimize extra compute.
         if !self.fallback_engines.is_empty() && !cancellation_requested(cancel_flag) {
-            let registered = registration_default_active();
             let fallback_info = if registered {
-                bump_all_samples_for_full_dispatch(&pending_outputs, &jobs, &self.fallback_engines)
+                bump_all_samples_for_full_dispatch(
+                    &pending_outputs,
+                    &jobs,
+                    &self.fallback_engines,
+                    // Totals were already folded into wave 1's counts above.
+                    !precounted_second_wave,
+                )
             } else {
                 snapshot_failing_samples_and_bump_totals(
                     &pending_outputs,
@@ -443,7 +509,7 @@ impl RemasterEngine {
                 });
 
                 let pass2_dir = work_dir.path().join("pass2");
-                run_engine_wave(
+                if let Err(e) = run_engine_wave(
                     &self.fallback_engines,
                     &jobs,
                     restrict_set.as_ref(),
@@ -459,13 +525,75 @@ impl RemasterEngine {
                     ddim_steps,
                     progressive,
                     full_parallel,
-                )?;
+                ) {
+                    if is_cancelled_error(&e) {
+                        return Err(e);
+                    }
+                    // A second-wave engine is additive: its failure must not
+                    // destroy a run whose primary wave fully succeeded.
+                    // (Primary-wave failures remain fatal.) Samples left
+                    // waiting on the failed engine's completions are flushed
+                    // below so every sample still gets its Final.
+                    let msg =
+                        format!("Quinlight Audio: second-wave engine failure (non-fatal): {e}");
+                    eprintln!("{msg}");
+                    let _ = progress_tx.send(RemasterStatus::Log(msg));
+                    flush_pending_finals(&jobs, &pending_outputs, result_tx, cancel_flag);
+                }
             }
         }
 
         ensure_not_cancelled(cancel_flag)?;
         let _ = progress_tx.send(RemasterStatus::Complete);
         Ok(())
+    }
+}
+
+/// Emit a `Final` for every pending sample whose engine total can no longer
+/// be reached (an additive second-wave engine failed mid-run), using the
+/// candidates collected so far. Without this, CLI consumers would wait for a
+/// Final that never comes and report the sample as missing.
+fn flush_pending_finals(
+    jobs: &[SampleJob],
+    pending_outputs: &PendingOutputMap,
+    result_tx: &Sender<RemasterOutput>,
+    cancel_flag: &AtomicBool,
+) {
+    if cancellation_requested(cancel_flag) {
+        return;
+    }
+    let to_flush: Vec<(i32, Vec<SampleResult>, i32)> = {
+        let mut pending = pending_outputs.lock().unwrap();
+        pending
+            .iter_mut()
+            .filter_map(|(&index, sample)| {
+                let unfinished = sample.engines_done < sample.engines_total;
+                let has_new = sample.candidates.len() > sample.last_emitted_candidate_count
+                    && !sample.candidates.is_empty();
+                if unfinished && has_new {
+                    sample.last_emitted_candidate_count = sample.candidates.len();
+                    Some((index, sample.candidates.clone(), sample.engines_total))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    for (index, candidates, engines_total) in to_flush {
+        let Some(job) = jobs.iter().find(|j| j.index == index) else {
+            continue;
+        };
+        match build_quinlight_result(job, &candidates, engines_total as usize) {
+            Ok(final_result) => {
+                let _ = result_tx.send(RemasterOutput::Final(final_result));
+            }
+            Err(e) => {
+                eprintln!(
+                    "quinlight: flush consensus failed for {}: {e}",
+                    job.display_name()
+                );
+            }
+        }
     }
 }
 
@@ -666,6 +794,14 @@ fn run_single_engine(
     let engine_label = format!("{} ({}/{})", engine.name(), eng_idx + 1, num_engines);
     eprintln!("{tag} starting {engine_label}");
 
+    // Engines that ignore ddim_steps are cached under 0 so changing the knob
+    // doesn't invalidate their entries.
+    let cache_ddim_steps: u16 = if engine.uses_ddim_steps() {
+        ddim_steps as u16
+    } else {
+        0
+    };
+
     let success_counter = AtomicI32::new(0);
     let mut eligible_job_indices: Vec<usize> = Vec::new();
     let mut eng_uncached: Vec<usize> = Vec::new();
@@ -697,7 +833,10 @@ fn run_single_engine(
             &job.pcm_sha256,
             engine.cache_id(),
             &ecache_key,
+            cache_ddim_steps,
             ddim_steps as u16,
+            &variant_key_for_job(job),
+            legacy_cache_adoption_safe(job),
             engine.name(),
             job.index,
             job.output_sample_rate_hz,
@@ -937,12 +1076,11 @@ fn run_single_engine(
                             progressive,
                         )?;
 
-                        if cancellation_requested(cancel_flag) {
-                            kill_child_best_effort(&mut child);
-                            return Err(cancelled_error());
-                        }
-
-                        let status = child.wait().map_err(|e| format!("Engine wait: {e}"))?;
+                        // Cancellable wait: the watcher returns as soon as all
+                        // outputs are processed, possibly while the child is
+                        // still tearing down (PyTorch hangs observed) — a bare
+                        // wait() here was the one place Cancel couldn't reach.
+                        let status = wait_child_cancellable(&mut child, cancel_flag)?;
                         ensure_not_cancelled(cancel_flag)?;
 
                         let stderr_tail = stderr_thread
@@ -1063,7 +1201,12 @@ fn candidate_fails_gate(job: &SampleJob, candidate_channels: i32, candidate_data
         candidate_channels as usize,
         job.looped,
     );
-    score < quinlight_usable_score_floor()
+    // Fail-closed: a NaN score counts as failing — matching the polarity of
+    // the main gate (`raw_score >= floor`) in `select_quinlight_mix_internal`.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    {
+        !(score >= quinlight_usable_score_floor())
+    }
 }
 
 /// True if any candidate stored for this sample scored below the usability
@@ -1193,10 +1336,15 @@ fn snapshot_failing_samples_and_bump_totals(
 /// eligible-fallback count. The returned `failing_sample_indices` lists every
 /// dispatched sample (used only for the progress count; the wave itself runs
 /// unrestricted).
+/// Prepare the registered-mode second wave. `bump_totals` adds each job's
+/// extra engine count to its pending `engines_total`; pass `false` when the
+/// caller already folded those counts into wave 1's totals (the
+/// non-progressive precounted path) so they aren't double-counted.
 fn bump_all_samples_for_full_dispatch(
     pending_outputs: &PendingOutputMap,
     jobs: &[SampleJob],
     fallback_engines: &[Box<dyn engine::UpsampleEngine>],
+    bump_totals: bool,
 ) -> FallbackWaveInfo {
     let mut info = FallbackWaveInfo {
         failing_sample_indices: Vec::new(),
@@ -1212,10 +1360,14 @@ fn bump_all_samples_for_full_dispatch(
         if extra == 0 {
             continue;
         }
-        let Some(sample) = pending.get_mut(&job.index) else {
-            continue;
-        };
-        sample.engines_total += extra;
+        if bump_totals {
+            // `or_default`, not `get_mut`: a job no primary engine processed
+            // has no entry yet — silently skipping it would leave its
+            // engines_total at 0 while the wave dispatches it anyway, so its
+            // Final would never fire in CLI mode.
+            let sample = pending.entry(job.index).or_default();
+            sample.engines_total += extra;
+        }
         info.failing_sample_indices.push(job.index);
         info.counts_by_job[job_idx] = extra;
         info.total_additional_tasks += extra;
@@ -3769,9 +3921,12 @@ pub(crate) fn pad_for_engine(
         let loop_body_len = loop_end_samp.saturating_sub(loop_start_samp);
 
         if loop_body_len == 0 {
-            // Degenerate loop — fall through to non-looped path
+            // Degenerate loop — fall through to non-looped path. Pad only:
+            // `resize` would TRUNCATE samples longer than `min_samples`.
             let mut padded = data.to_vec();
-            padded.resize(min_samples, 0.0);
+            if padded.len() < min_samples {
+                padded.resize(min_samples, 0.0);
+            }
             return (padded, None);
         }
 
@@ -3874,9 +4029,12 @@ fn build_mixed_padded(
     let normal_body_len = n_end.saturating_sub(n_start);
     if sustain_body_len == 0 || normal_body_len == 0 {
         // Degenerate body on either side — let the caller fall back to the
-        // non-looped / single-loop path.
+        // non-looped / single-loop path. Pad only: `resize` would TRUNCATE
+        // samples longer than `min_samples`.
         let mut padded = data.to_vec();
-        padded.resize(min_samples, 0.0);
+        if padded.len() < min_samples {
+            padded.resize(min_samples, 0.0);
+        }
         return (padded, None);
     }
 
@@ -5965,6 +6123,7 @@ fn maybe_finish_engine_job(
         &job.pcm_sha256,
         engine_cache_id,
         ddim_steps,
+        &variant_key_for_job(job),
         &result,
         job.target_rms,
     );
@@ -6081,17 +6240,60 @@ pub fn cache_dir() -> PathBuf {
         .join("quinlight-audio/sample-cache")
 }
 
-/// Structured cache filename: `Quinlight-{pcm_hex}-{engine_id}-ddim{steps}.flac`
+/// Structured cache filename:
+/// `Quinlight-{pcm_hex}-{engine_id}-ddim{steps}-k{variant}.flac`.
+/// `variant_key` (see [`engine_cache_variant_key`]) folds in everything that
+/// changes the cached *extracted* candidate beyond the PCM bytes — loop
+/// metadata, rates, bit depth, and the pipeline version — so distinct
+/// extractions never share an entry and a pipeline bump invalidates the
+/// current format (not just the legacy one).
 fn cache_flac_path(
     dir: &Path,
     pcm_sha256: &[u8; 32],
     engine_cache_id: &str,
     ddim_steps: u16,
+    variant_key: &str,
 ) -> PathBuf {
     let pcm = pcm_hex_prefix(pcm_sha256);
     dir.join(format!(
-        "Quinlight-{pcm}-{engine_cache_id}-ddim{ddim_steps}.flac"
+        "Quinlight-{pcm}-{engine_cache_id}-ddim{ddim_steps}-k{variant_key}.flac"
     ))
+}
+
+/// Short hash folded into the active cache filename. Covers every input that
+/// changes the extracted candidate besides the conditioning PCM itself:
+/// source rate and bit depth, both loop regions (tiling layout and loop-aware
+/// extraction depend on them — including the sustain loop, which even the
+/// legacy spec key omitted), the output rate, and
+/// [`ENGINE_PIPELINE_VERSION`]. Engines that ignore `ddim_steps` are keyed
+/// with 0 by the caller.
+fn engine_cache_variant_key(
+    source_rate_hz: i32,
+    bits_per_sample: u8,
+    loop_info: SampleLoopInfo,
+    output_rate_hz: i32,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source_rate_hz.to_le_bytes());
+    hasher.update([bits_per_sample]);
+    for region in [loop_info.normal, loop_info.sustain] {
+        hasher.update(region.start_frames.to_le_bytes());
+        hasher.update(region.end_frames.to_le_bytes());
+        hasher.update(region.mode.to_raw().to_le_bytes());
+    }
+    hasher.update(output_rate_hz.to_le_bytes());
+    hasher.update([ENGINE_PIPELINE_VERSION]);
+    let digest = hasher.finalize();
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn variant_key_for_job(job: &SampleJob) -> String {
+    engine_cache_variant_key(
+        job.rate,
+        job.bits_per_sample,
+        job.loop_info,
+        job.output_sample_rate_hz,
+    )
 }
 
 /// Old opaque-hash filename for backward-compatible reads.
@@ -6254,11 +6456,59 @@ fn parse_wav_f64(wav: &[u8]) -> Option<(Vec<f64>, u16, u32)> {
 /// Look up a cached upscaled sample.
 /// Tries the FLAC format first, then legacy zstd WAV formats.
 /// Returns `None` immediately if `--no-cache` is active.
+/// True when today's extraction pipeline produces the same audio the legacy
+/// (loop-blind, pre-variant-key) cache entry was built with, so the entry can
+/// be safely adopted under the new key instead of recomputed:
+///
+/// * Non-looped samples use the `Repeated` layout — the cached audio is a
+///   valid extracted copy regardless of which copy today's selector would
+///   prefer.
+/// * Plain forward loops: extraction changed only in the per-boundary tile
+///   scaling. A phase-rotated loop BODY is harmless (the content is periodic
+///   and loop points are re-searched), so adoption is refused only when a
+///   real key-off tail exists and the old accumulated rounding could have
+///   shifted its slice audibly.
+/// * Ping-pong loops are never adopted (the old selector could splice a
+///   time-reversed body copy) and neither are sustain loops (mixed-layout
+///   selection changed the same way).
+///
+/// Adopting also re-keys the entry against the CURRENT job's loop metadata,
+/// which removes the loop-collision blindness the old key suffered from.
+fn legacy_cache_adoption_safe(job: &SampleJob) -> bool {
+    let normal = job.loop_info.normal;
+    if job.loop_info.sustain.has_loop() {
+        return false;
+    }
+    if !normal.has_loop() {
+        return true;
+    }
+    if normal.mode == SampleLoopMode::PingPong {
+        return false;
+    }
+    let tail_frames = job.source_length_frames - normal.end_frames;
+    if tail_frames <= 0 {
+        return true; // loop runs to the sample end: nothing after the body to misplace
+    }
+    // Real key-off tail: the old accumulated rounding shifted the tail slice
+    // by up to ~1 output frame per body copy. Adopt only while the worst-case
+    // shift stays inaudible (~32 frames ≈ 0.7 ms at 48 kHz).
+    let body = (normal.end_frames - normal.start_frames).max(1) as f64;
+    let estimated_copies = (5.12 * job.rate.max(1) as f64 / body).ceil();
+    estimated_copies <= 32.0
+}
+
 fn cache_lookup(
     pcm_sha256: &[u8; 32],
     engine_cache_id: &str,
     engine_cache_key: &str,
     ddim_steps: u16,
+    // The run's RAW ddim value: legacy filenames embedded it for every engine
+    // (the old key didn't normalize engines that ignore the knob to 0), so
+    // the legacy probes below must use it or they'd miss all non-AudioSR
+    // entries.
+    legacy_ddim_steps: u16,
+    variant_key: &str,
+    adopt_legacy: bool,
     engine_name: &str,
     index: i32,
     sample_rate_hz: i32,
@@ -6268,15 +6518,40 @@ fn cache_lookup(
     }
     let dir = cache_dir();
 
-    // Current: Quinlight-{pcm_hex}-{engine_id}-ddim{steps}.flac
-    let flac = cache_flac_path(&dir, pcm_sha256, engine_cache_id, ddim_steps);
+    // Current: Quinlight-{pcm_hex}-{engine_id}-ddim{steps}-k{variant}.flac.
+    let flac = cache_flac_path(&dir, pcm_sha256, engine_cache_id, ddim_steps, variant_key);
     if let Some(result) = read_flac_cache(&flac, engine_name, index, sample_rate_hz) {
+        return Some(result);
+    }
+
+    // Older keyless names were blind to loop metadata and the pipeline
+    // version, so a hit could return audio extracted under a mismatched
+    // tiling. They are read only when `adopt_legacy` certifies the current
+    // job's loop shape as extraction-equivalent (see
+    // `legacy_cache_adoption_safe`) — and on success the entry is RENAMED to
+    // the new key, re-anchoring it to this job's loop metadata.
+    if !adopt_legacy {
+        return None;
+    }
+
+    // Legacy FLAC: Quinlight-{pcm_hex}-{engine_id}-ddim{steps}.flac
+    let old_flac = dir.join(format!(
+        "Quinlight-{}-{engine_cache_id}-ddim{legacy_ddim_steps}.flac",
+        pcm_hex_prefix(pcm_sha256)
+    ));
+    if let Some(result) = read_flac_cache(&old_flac, engine_name, index, sample_rate_hz) {
+        if std::fs::rename(&old_flac, &flac).is_ok() {
+            eprintln!(
+                "Cache: adopted legacy entry as {}",
+                flac.file_name().unwrap_or_default().to_string_lossy()
+            );
+        }
         return Some(result);
     }
 
     // Legacy: Quinlight-{pcm_hex}-{engine_id}-ddim{steps}.wav.zst
     let wav_zst = dir.join(format!(
-        "Quinlight-{}-{engine_cache_id}-ddim{ddim_steps}.wav.zst",
+        "Quinlight-{}-{engine_cache_id}-ddim{legacy_ddim_steps}.wav.zst",
         pcm_hex_prefix(pcm_sha256)
     ));
     if let Some(result) = read_wav_zst_cache(&wav_zst, engine_name, index, sample_rate_hz) {
@@ -6344,10 +6619,16 @@ fn read_wav_zst_cache(
         }
     };
     let (data, channels, wav_rate) = parse_wav_f64(&wav)?;
-    debug_assert_eq!(
-        wav_rate, sample_rate_hz as u32,
-        "WAV header rate {wav_rate} != expected {sample_rate_hz}"
-    );
+    if wav_rate != sample_rate_hz as u32 {
+        // A stale or foreign legacy cache entry is a miss, not a crash
+        // (this used to be a debug_assert, panicking debug builds on any
+        // mismatched leftover file).
+        eprintln!(
+            "Cache: ignoring legacy entry {} (rate {wav_rate} != expected {sample_rate_hz})",
+            path.display()
+        );
+        return None;
+    }
     let ch = channels as i32;
     let frames = if ch > 0 {
         data.len() as i64 / ch as i64
@@ -6370,6 +6651,7 @@ fn cache_store(
     pcm_sha256: &[u8; 32],
     engine_cache_id: &str,
     ddim_steps: u16,
+    variant_key: &str,
     result: &SampleResult,
     target_rms: f64,
 ) {
@@ -6386,11 +6668,14 @@ fn cache_store(
     normalize_sample(&mut normalized, target_rms);
 
     let pcm = pcm_hex_prefix(pcm_sha256);
+    // PID + thread id: two processes sharing the cache dir can both be
+    // ThreadId(N), so the thread id alone could race the same tmp file.
     let tmp_path = dir.join(format!(
-        "Quinlight-{pcm}-{engine_cache_id}-ddim{ddim_steps}.{:?}.flac.tmp",
+        "Quinlight-{pcm}-{engine_cache_id}-ddim{ddim_steps}-k{variant_key}.{}.{:?}.flac.tmp",
+        std::process::id(),
         std::thread::current().id()
     ));
-    let final_path = cache_flac_path(&dir, pcm_sha256, engine_cache_id, ddim_steps);
+    let final_path = cache_flac_path(&dir, pcm_sha256, engine_cache_id, ddim_steps, variant_key);
 
     let flac = match build_flac_i32(
         &normalized.data,
@@ -7178,6 +7463,34 @@ fn module_uses_xm_offsets(module: &Module) -> bool {
     module.info().format_type.eq_ignore_ascii_case("xm")
 }
 
+/// True when pattern rows must be resolved to samples through the
+/// instrument note map. XM always works this way; IT does too whenever the
+/// module defines instruments (instrument mode). The `instrument ==
+/// sample + 1` shortcut is only valid for plain S3M / sample-mode IT — using
+/// it on an instrument-mode IT patched the wrong rows (offsets for the
+/// remastered sample went unpatched, and rows of a different sample sharing
+/// the instrument number got wrongly scaled).
+fn module_uses_note_mapped_offsets(module: &Module) -> bool {
+    module_uses_xm_offsets(module) || module.num_instruments() > 0
+}
+
+/// Rescale an `Oxx` offset parameter (units of 256 source frames) for a new
+/// sample rate. The ×256 quantum commutes with the rate ratio, so the param
+/// scales directly; floor rounding keeps the offset at-or-before the original
+/// position.
+fn scale_offset_param(param: u8, old_r: u32, new_r: u32) -> u8 {
+    ((param as u32) * new_r / old_r).min(255) as u8
+}
+
+/// Rescale an `SAx` high-offset nibble (units of 65 536 source frames). The
+/// quantum commutes with the rate ratio exactly like `Oxx`. (The previous
+/// `(v << 16) * new_r` form overflowed `u32` for any nibble >= 2 at
+/// 48 kHz targets: silent wraparound in release, panic in debug.)
+fn scale_sax_param(param: u8, old_r: u32, new_r: u32) -> u8 {
+    let old_val = (param & 0x0F) as u32;
+    0xA0 | (old_val * new_r / old_r).min(15) as u8
+}
+
 fn patch_sample_offsets_non_xm(
     module: &mut Module,
     sample_index: i32,
@@ -7212,13 +7525,9 @@ fn patch_sample_offsets_non_xm(
                 let param = module.get_pattern_command(pat, row, ch, COMMAND_PARAMETER);
 
                 let new_param = match effect {
-                    CMD_OFFSET if param > 0 => {
-                        Some(((param as u32) * new_r / old_r).min(255) as u8)
-                    }
+                    CMD_OFFSET if param > 0 => Some(scale_offset_param(param, old_r, new_r)),
                     CMD_S3MCMDEX if (param & 0xF0) == 0xA0 => {
-                        let old_val = (param & 0x0F) as u32;
-                        let new_val = ((old_val << 16) * new_r / old_r) >> 16;
-                        Some(0xA0 | new_val.min(15) as u8)
+                        Some(scale_sax_param(param, old_r, new_r))
                     }
                     _ => None,
                 };
@@ -7231,7 +7540,12 @@ fn patch_sample_offsets_non_xm(
     }
 }
 
-fn patch_sample_offsets_xm(module: &mut Module, sample_index: i32, old_rate: i32, new_rate: i32) {
+fn patch_sample_offsets_note_mapped(
+    module: &mut Module,
+    sample_index: i32,
+    old_rate: i32,
+    new_rate: i32,
+) {
     let num_patterns = module.num_patterns();
     let num_channels = module.num_channels();
     let old_r = old_rate as u32;
@@ -7268,9 +7582,15 @@ fn patch_sample_offsets_xm(module: &mut Module, sample_index: i32, old_rate: i32
 
                 let effect = module.get_pattern_command(pat, row, ch, COMMAND_EFFECT);
                 let param = module.get_pattern_command(pat, row, ch, COMMAND_PARAMETER);
-                if effect == CMD_OFFSET && param > 0 {
-                    let new_param = ((param as u32) * new_r / old_r).min(255) as u8;
-                    module.set_pattern_command(pat, row, ch, COMMAND_PARAMETER, new_param);
+                let new_param = match effect {
+                    CMD_OFFSET if param > 0 => Some(scale_offset_param(param, old_r, new_r)),
+                    CMD_S3MCMDEX if (param & 0xF0) == 0xA0 => {
+                        Some(scale_sax_param(param, old_r, new_r))
+                    }
+                    _ => None,
+                };
+                if let Some(p) = new_param {
+                    module.set_pattern_command(pat, row, ch, COMMAND_PARAMETER, p);
                 }
             }
         }
@@ -7285,8 +7605,8 @@ pub fn patch_sample_offsets(module: &mut Module, sample_index: i32, old_rate: i3
     if old_rate <= 0 || new_rate <= 0 || old_rate == new_rate {
         return;
     }
-    if module_uses_xm_offsets(module) {
-        patch_sample_offsets_xm(module, sample_index, old_rate, new_rate);
+    if module_uses_note_mapped_offsets(module) {
+        patch_sample_offsets_note_mapped(module, sample_index, old_rate, new_rate);
     } else {
         patch_sample_offsets_non_xm(module, sample_index, old_rate, new_rate);
     }
@@ -7333,7 +7653,7 @@ fn save_effect_params_non_xm(module: &Module, sample_index: i32) -> Vec<SavedEff
     saved
 }
 
-fn save_effect_params_xm(module: &Module, sample_index: i32) -> Vec<SavedEffectParam> {
+fn save_effect_params_note_mapped(module: &Module, sample_index: i32) -> Vec<SavedEffectParam> {
     let num_patterns = module.num_patterns();
     let num_channels = module.num_channels();
     let mut saved = Vec::new();
@@ -7369,7 +7689,9 @@ fn save_effect_params_xm(module: &Module, sample_index: i32) -> Vec<SavedEffectP
 
                 let effect = module.get_pattern_command(pat, row, ch, COMMAND_EFFECT);
                 let param = module.get_pattern_command(pat, row, ch, COMMAND_PARAMETER);
-                if effect == CMD_OFFSET && param > 0 {
+                let dominated = (effect == CMD_OFFSET && param > 0)
+                    || (effect == CMD_S3MCMDEX && (param & 0xF0) == 0xA0);
+                if dominated {
                     saved.push((pat, row, ch, param));
                 }
             }
@@ -7382,8 +7704,8 @@ fn save_effect_params_xm(module: &Module, sample_index: i32) -> Vec<SavedEffectP
 /// Snapshot all pattern params that `patch_sample_offsets` would modify.
 /// Call this BEFORE the first patch to preserve original values for lossless restore.
 pub fn save_effect_params(module: &Module, sample_index: i32) -> Vec<SavedEffectParam> {
-    if module_uses_xm_offsets(module) {
-        save_effect_params_xm(module, sample_index)
+    if module_uses_note_mapped_offsets(module) {
+        save_effect_params_note_mapped(module, sample_index)
     } else {
         save_effect_params_non_xm(module, sample_index)
     }
@@ -7884,6 +8206,14 @@ fn watch_batch_outputs(
     use inotify::{Inotify, WatchMask};
     use std::time::Duration;
 
+    // Engines that ignore ddim_steps are cached under 0 (matches the lookup
+    // normalization in run_single_engine).
+    let cache_ddim_steps: u16 = if engine.uses_ddim_steps() {
+        ddim_steps as u16
+    } else {
+        0
+    };
+
     // Build a map from per-channel output stem to the owning sample job.
     // Include both hold and release stems for sustain-packed samples so that
     // either output file appearing triggers the extraction attempt.
@@ -8009,12 +8339,12 @@ fn watch_batch_outputs(
                     match extract_channel_result(job, channel_index, &main_path, None, None) {
                         Ok(channel_result) => {
                             store_channel_result(&mut pending_channels, job_idx, channel_result);
-                            let _ = maybe_finish_engine_job(
+                            if let Err(e) = maybe_finish_engine_job(
                                 job_idx,
                                 jobs,
                                 engine.name(),
                                 engine.cache_id(),
-                                ddim_steps as u16,
+                                cache_ddim_steps,
                                 engine_label,
                                 progress_counter,
                                 total_jobs,
@@ -8027,7 +8357,13 @@ fn watch_batch_outputs(
                                 success_counter,
                                 cancel_flag,
                                 progressive,
-                            );
+                            ) {
+                                eprintln!(
+                                    "quinlight: [{}] candidate assembly failed for {}: {e}",
+                                    engine_label,
+                                    job.display_name()
+                                );
+                            }
                         }
                         Err(e) => {
                             eprintln!("inotify: extract failed for {}: {e}", job.display_name());
@@ -8085,12 +8421,12 @@ fn watch_batch_outputs(
                 }
             }
         }
-        let _ = maybe_finish_engine_job(
+        if let Err(e) = maybe_finish_engine_job(
             job_idx,
             jobs,
             engine.name(),
             engine.cache_id(),
-            ddim_steps as u16,
+            cache_ddim_steps,
             engine_label,
             progress_counter,
             total_jobs,
@@ -8103,7 +8439,13 @@ fn watch_batch_outputs(
             success_counter,
             cancel_flag,
             progressive,
-        );
+        ) {
+            eprintln!(
+                "quinlight: [{}] candidate assembly failed for {}: {e}",
+                engine_label,
+                jobs[job_idx].display_name()
+            );
+        }
     }
     Ok(())
 }
@@ -8173,9 +8515,45 @@ fn tiled_offsets_with_index(
         head_frames: head,
         body_frames: body,
         tail_frames: tail,
-        selected_body_start: head + idx * body,
-        tail_start: head + layout.body_copies * body,
+        // Per-boundary scaling, NOT `head + k·body`: the tiled buffer is
+        // materialized at native rate and resampled as one continuous
+        // signal, so copy k's true start is the native boundary
+        // `head_native + k·body_native` mapped through the same two-step
+        // path. Accumulating k copies of the rounded body length instead
+        // drifts by up to a frame per copy — for tiny chip loops (3-frame
+        // bodies, thousands of copies to reach the 5.12 s minimum) the tail
+        // slice landed ~0.2 s inside wrong content.
+        selected_body_start: tiled_copy_start_out(
+            loop_native,
+            native_rate,
+            cond_rate,
+            output_rate,
+            idx,
+        ),
+        tail_start: tiled_copy_start_out(
+            loop_native,
+            native_rate,
+            cond_rate,
+            output_rate,
+            layout.body_copies,
+        ),
     }
+}
+
+/// True start of tiled body copy `k` (or, at `k == body_copies`, the tail) in
+/// the engine-output domain, scaled from its exact native-rate position
+/// through the same native→cond→output two-step path the audio itself takes.
+fn tiled_copy_start_out(
+    loop_native: SampleLoopRegion,
+    native_rate: u32,
+    cond_rate: u32,
+    output_rate: u32,
+    k: usize,
+) -> usize {
+    let head_native = loop_native.start_frames.max(0) as usize;
+    let body_native = (loop_native.end_frames - loop_native.start_frames).max(0) as usize;
+    let cond = scaled_frame_count(head_native + k * body_native, native_rate, cond_rate);
+    scaled_frame_count(cond, cond_rate, output_rate)
 }
 
 /// Result of FFT cross-correlation based best-copy selection over a tiled
@@ -8266,8 +8644,7 @@ fn select_best_body_copy(
         channel_index,
         tmpl_start,
         tmpl_end,
-        0,
-        off.head_frames,
+        &|k| tiled_copy_start_out(loop_native, native_rate, cond_rate, output_rate, k),
         off.body_frames,
         layout.body_copies,
         is_ping_pong,
@@ -8278,10 +8655,10 @@ fn select_best_body_copy(
 /// template from `ref_data[tmpl_start..tmpl_end]` (frame-indexed), then
 /// scores each tiled copy in `raw_data` via FFT cross-correlation.
 ///
-/// `block_offset_frames` is where the tiled block (the `[head][N×body]`
-/// region) starts in `raw_data`. `head_frames` is the pre-body head length
-/// within that block, so copy `k` starts at
-/// `block_offset_frames + head_frames + k * body_frames`.
+/// `copy_start_out(k)` returns the frame where tiled copy `k` starts in
+/// `raw_data`. Callers anchored to native-rate tiling pass per-boundary
+/// scaled positions (see `tiled_copy_start_out`) so the search window does
+/// not drift across many copies.
 ///
 /// `ref_channel_index` picks which channel of the (possibly stereo)
 /// reference is correlated against `raw_data`. Stereo source samples are
@@ -8299,8 +8676,7 @@ fn select_best_body_copy_in_block(
     ref_channel_index: usize,
     tmpl_start_frames: usize,
     tmpl_end_frames: usize,
-    block_offset_frames: usize,
-    head_frames: usize,
+    copy_start_out: &dyn Fn(usize) -> usize,
     body_frames: usize,
     body_copies: usize,
     is_ping_pong: bool,
@@ -8377,7 +8753,7 @@ fn select_best_body_copy_in_block(
 
         let mut scores = Vec::with_capacity(body_copies);
         for k in 0..body_copies {
-            let copy_start = block_offset_frames + head_frames + k * body_frames;
+            let copy_start = copy_start_out(k);
             let lo = copy_start.saturating_sub(tolerance);
             let hi = (copy_start + tolerance).min(corr_fwd.len().saturating_sub(1));
             let corr = if is_ping_pong && k % 2 == 1 {
@@ -8431,9 +8807,16 @@ fn select_best_body_copy_in_block(
         *s /= per_channel_scores.len().max(1) as f64;
     }
 
+    // Ping-pong blocks alternate F,B,F,B,…: odd copies are time-REVERSED
+    // content. The extractor slices the winner without reversing, so only
+    // forward (even) copies are eligible — splicing a backward copy after the
+    // forward head puts a content discontinuity at the head→body junction
+    // that the seam crossfade cannot reconcile. Backward copies are still
+    // scored (`all_scores`) for diagnostics.
     let (best_index, &best_score) = avg_scores
         .iter()
         .enumerate()
+        .filter(|(i, _)| !is_ping_pong || i % 2 == 0)
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))?;
 
     if best_score < BEST_COPY_SCORE_FLOOR {
@@ -8635,15 +9018,17 @@ fn extract_single_channel_output(
         }
     }
     let off = tiled_offsets_with_index(job, layout, trim_frames, input_rate_hz, copy_index);
-    debug_assert_eq!(
-        off.head_frames + off.body_frames + off.tail_frames,
-        trim_frames,
-        "tiled offsets do not sum to original_length_48k_frames ({} + {} + {} vs {})",
-        off.head_frames,
-        off.body_frames,
-        off.tail_frames,
-        trim_frames,
-    );
+    // Two-step rounding can legitimately give `head + body > trim` for a
+    // tiny head plus a loop running to the sample end (e.g. head_n = 1,
+    // body_n = 10 at 8363→24000: 6 + 58 > 63) — a normal chip-sample shape,
+    // so this is reconciled, not asserted: shrink the body slice to fit and
+    // let the tail collapse to 0. The emitted channel then always sums to
+    // exactly `trim_frames`.
+    let mut off = off;
+    if off.head_frames + off.body_frames > trim_frames {
+        off.body_frames = trim_frames.saturating_sub(off.head_frames);
+        off.tail_frames = 0;
+    }
 
     let raw_frames = raw_data.len() / new_channels.max(1);
     let head_end = off.head_frames.min(raw_frames);
@@ -8780,8 +9165,22 @@ fn extract_mixed_channel_output(
             channel_index,
             s_start_out,
             s_start_out + s_body_out,
-            s_block_offset_out,
-            s_start_out,
+            // Per-boundary scaling, NOT `start + k·body_out`: the block was
+            // tiled at NATIVE rate and resampled continuously, so copy k's
+            // true start within the block is the native boundary
+            // `s_start_native + k·s_body_native` mapped through the same
+            // native→cond→output path. Accumulating the rounded body length
+            // drifts by up to a frame per copy (see `tiled_offsets`).
+            &|k| {
+                s_block_offset_out
+                    + tiled_copy_start_out(
+                        job.loop_info.sustain,
+                        native_rate,
+                        cond_rate,
+                        output_rate,
+                        k,
+                    )
+            },
             s_body_out,
             layout.sustain_block.body_copies,
             job.loop_info.sustain.mode == SampleLoopMode::PingPong,
@@ -8805,8 +9204,17 @@ fn extract_mixed_channel_output(
             channel_index,
             n_start_out,
             n_start_out + n_body_out,
-            n_block_offset_out,
-            n_start_out,
+            // Per-boundary scaling — same rationale as the sustain block.
+            &|k| {
+                n_block_offset_out
+                    + tiled_copy_start_out(
+                        job.loop_info.normal,
+                        native_rate,
+                        cond_rate,
+                        output_rate,
+                        k,
+                    )
+            },
             n_body_out,
             layout.normal_block.body_copies,
             job.loop_info.normal.mode == SampleLoopMode::PingPong,
@@ -8817,8 +9225,26 @@ fn extract_mixed_channel_output(
         n_middle_idx
     };
 
-    let s_middle_body_start = s_block_offset_out + s_start_out + s_best_idx * s_body_out;
-    let n_middle_body_start = n_block_offset_out + n_start_out + n_best_idx * n_body_out;
+    // Anchor the selected copy per-boundary too (same mapping as the
+    // closures above); `start + idx·body_out` accumulates rounding error —
+    // with a tiny loop body the middle index is in the thousands and the
+    // slice landed ~0.2 s inside wrong content.
+    let s_middle_body_start = s_block_offset_out
+        + tiled_copy_start_out(
+            job.loop_info.sustain,
+            native_rate,
+            cond_rate,
+            output_rate,
+            s_best_idx,
+        );
+    let n_middle_body_start = n_block_offset_out
+        + tiled_copy_start_out(
+            job.loop_info.normal,
+            native_rate,
+            cond_rate,
+            output_rate,
+            n_best_idx,
+        );
 
     // Pre-compute normal-exclusive ranges so we can suppress sustain seams
     // that would double-blend with a normal seam at the same position.
@@ -8936,8 +9362,10 @@ fn replace_span_with_middle_body(
 }
 
 /// Extract the best-matching copy from a non-looped tiled engine output.
-/// The conditioning buffer was `[copy_0][copy_1]...[copy_{N-1}]`, so each
-/// copy starts at `k * copy_frames_out` in the output-rate timeline. FFT
+/// The conditioning buffer was `[copy_0][copy_1]...[copy_{N-1}]`, tiled at
+/// NATIVE rate by `pad_for_engine` (one full source waveform per copy) and
+/// resampled as one continuous signal, so copy k starts at the native
+/// boundary `k·copy_native` mapped native→cond→output. FFT
 /// cross-correlation against `reference_48k` picks the copy whose content
 /// best preserves the original. Falls back to copy 0 if the template is
 /// too short or reference_48k is missing.
@@ -8951,9 +9379,21 @@ fn extract_repeated_channel_output(
     channel_index: usize,
 ) -> Vec<f64> {
     let output_rate = job.output_sample_rate_hz.max(0) as u32;
+    let native_rate = job.rate.max(0) as u32;
     let cond_rate = input_rate_hz;
     let copy_frames_out = scaled_frame_count(layout.copy_frames, cond_rate, output_rate);
     let raw_frames = raw_data.len() / new_channels.max(1);
+
+    // Per-boundary scaling, NOT `k·copy_frames_out`: accumulating the
+    // rounded per-copy length drifts by up to a frame per copy against the
+    // continuously-resampled buffer (see `tiled_copy_start_out`). The
+    // native per-copy length is the full source waveform `pad_for_engine`
+    // tiled (`source_length_frames` frames at native rate).
+    let copy_native = job.source_length_frames.max(0) as usize;
+    let copy_start_out = |k: usize| {
+        let cond = scaled_frame_count(k * copy_native, native_rate, cond_rate);
+        scaled_frame_count(cond, cond_rate, output_rate)
+    };
 
     let ref_channels = job.channels.max(0) as usize;
     let copy_index = if copy_frames_out >= BEST_COPY_MIN_TEMPLATE_FRAMES
@@ -8974,8 +9414,7 @@ fn extract_repeated_channel_output(
             channel_index,
             0,
             tmpl_end,
-            0,
-            0,
+            &copy_start_out,
             body_frames,
             layout.copies,
             false,
@@ -8999,7 +9438,7 @@ fn extract_repeated_channel_output(
         0
     };
 
-    let start = copy_index * copy_frames_out;
+    let start = copy_start_out(copy_index);
     let end = (start + trim_frames).min(raw_frames);
     let start = start.min(end);
     let mut out = raw_data[start * new_channels..end * new_channels].to_vec();
@@ -9209,6 +9648,89 @@ mod tests {
     use std::ffi::OsString;
     use std::process::{Child, Command, Stdio};
     use std::sync::{Mutex, OnceLock};
+
+    /// Regression: the SAx rescale used to compute `(v << 16) * new_r`, which
+    /// overflows u32 for any nibble >= 2 with a 48 kHz target — wrapping to a
+    /// wrong (smaller) offset in release builds and panicking in debug.
+    #[test]
+    fn sax_rescale_does_not_overflow() {
+        // 8363 Hz -> 48 kHz: 2 * 48000 / 8363 = 11 (the wrapped result was 3).
+        assert_eq!(scale_sax_param(0xA2, 8363, 48_000), 0xAB);
+        // Largest nibble clamps at 0xF instead of overflowing.
+        assert_eq!(scale_sax_param(0xAF, 8363, 48_000), 0xAF);
+        // Downscale direction floors toward zero.
+        assert_eq!(scale_sax_param(0xAB, 48_000, 8363), 0xA1);
+        // Nibble 0 stays 0.
+        assert_eq!(scale_sax_param(0xA0, 8363, 48_000), 0xA0);
+    }
+
+    #[test]
+    fn oxx_rescale_scales_and_clamps() {
+        assert_eq!(scale_offset_param(0x10, 8363, 48_000), 0x5B);
+        assert_eq!(scale_offset_param(0xFF, 8363, 48_000), 0xFF);
+        assert_eq!(scale_offset_param(0x5B, 48_000, 8363), 0x0F);
+    }
+
+    /// Regression: the active FLAC cache key used to be PCM+engine+ddim only.
+    /// The cached payload is the post-extraction candidate, whose content
+    /// depends on loop tiling — so identical PCM with different loop metadata
+    /// must never share an entry.
+    #[test]
+    fn cache_variant_key_distinguishes_loop_metadata() {
+        use crate::openmpt::SampleLoopRegion;
+        let base = engine_cache_variant_key(8363, 8, SampleLoopInfo::none(), 48_000);
+        let looped = engine_cache_variant_key(
+            8363,
+            8,
+            SampleLoopInfo {
+                normal: SampleLoopRegion::forward(100, 400),
+                sustain: SampleLoopRegion::none(),
+            },
+            48_000,
+        );
+        let sustain = engine_cache_variant_key(
+            8363,
+            8,
+            SampleLoopInfo {
+                normal: SampleLoopRegion::forward(100, 400),
+                sustain: SampleLoopRegion::forward(50, 90),
+            },
+            48_000,
+        );
+        let ping_pong = engine_cache_variant_key(
+            8363,
+            8,
+            SampleLoopInfo {
+                normal: SampleLoopRegion::ping_pong(100, 400),
+                sustain: SampleLoopRegion::none(),
+            },
+            48_000,
+        );
+        assert_ne!(base, looped, "loop presence must change the key");
+        assert_ne!(looped, sustain, "sustain loop must change the key");
+        assert_ne!(looped, ping_pong, "loop mode must change the key");
+        assert_ne!(
+            engine_cache_variant_key(8363, 8, SampleLoopInfo::none(), 48_000),
+            engine_cache_variant_key(22_050, 8, SampleLoopInfo::none(), 48_000),
+            "source rate must change the key"
+        );
+        // Deterministic for identical inputs.
+        assert_eq!(
+            base,
+            engine_cache_variant_key(8363, 8, SampleLoopInfo::none(), 48_000)
+        );
+        assert_eq!(base.len(), 8, "short hex prefix");
+    }
+
+    #[test]
+    fn cache_flac_path_embeds_variant_key() {
+        let dir = Path::new("/tmp/qa-cache-test");
+        let pcm = [0u8; 32];
+        let a = cache_flac_path(dir, &pcm, "audiosr-v0.1", 50, "aabbccdd");
+        let b = cache_flac_path(dir, &pcm, "audiosr-v0.1", 50, "11223344");
+        assert_ne!(a, b);
+        assert!(a.to_string_lossy().ends_with("-kaabbccdd.flac"));
+    }
 
     #[test]
     fn max_parallel_from_memory_zero_memory_trusts_user() {
@@ -9700,7 +10222,8 @@ mod tests {
         cache_store(
             &job.pcm_sha256,
             "audiosr-v0.1",
-            50,
+            0,
+            &variant_key_for_job(&job),
             &SampleResult {
                 index: 0,
                 data: audio,
@@ -9715,7 +10238,8 @@ mod tests {
         cache_store(
             &job.pcm_sha256,
             "lavasr-v0.1",
-            50,
+            0,
+            &variant_key_for_job(&job),
             &SampleResult {
                 index: 0,
                 data: lava,
@@ -9850,7 +10374,8 @@ mod tests {
             cache_store(
                 &job.pcm_sha256,
                 cache_id,
-                50,
+                0,
+                &variant_key_for_job(&job),
                 &SampleResult {
                     index: 0,
                     data,
@@ -10733,7 +11258,8 @@ mod tests {
         cache_store(
             &job.pcm_sha256,
             "audiosr-v0.1",
-            50,
+            0,
+            &variant_key_for_job(&job),
             &SampleResult {
                 index: 0,
                 data: job.reference_48k.clone(),
@@ -10748,7 +11274,8 @@ mod tests {
         cache_store(
             &job.pcm_sha256,
             "ratelimited-v0.1",
-            50,
+            0,
+            &variant_key_for_job(&job),
             &SampleResult {
                 index: 0,
                 data: job.reference_48k.clone(),
@@ -10957,6 +11484,152 @@ mod tests {
         assert!(result_rx.try_recv().is_err());
     }
 
+    fn adoption_job(loop_info: SampleLoopInfo, rate: i32, source_frames: i64) -> SampleJob {
+        SampleJob {
+            index: 0,
+            name: "AdoptTest".into(),
+            original_data: Vec::new(),
+            rate,
+            output_sample_rate_hz: 48_000,
+            channels: 1,
+            bits_per_sample: 8,
+            source_length_frames: source_frames,
+            looped: loop_info.normal.has_loop() || loop_info.sustain.has_loop(),
+            loop_info,
+            conditioning_inputs: Vec::new(),
+            conditioning_rate_hz: 24_000,
+            pcm_sha256: [0u8; 32],
+            target_rms: 0.0,
+            reference_48k: Vec::new(),
+            original_length_48k_frames: 0,
+            engine_input_layout: None,
+            native_inputs: Vec::new(),
+            native_rate_hz: 0,
+            native_input_layout: None,
+        }
+    }
+
+    #[test]
+    fn legacy_adoption_predicate_matches_extraction_equivalence() {
+        use crate::openmpt::SampleLoopRegion;
+        // Non-looped: Repeated layout, old audio is a valid copy — adopt.
+        assert!(legacy_cache_adoption_safe(&adoption_job(
+            SampleLoopInfo::none(),
+            8363,
+            10_000
+        )));
+        // Forward loop to the sample end: body phase rotation only — adopt.
+        assert!(legacy_cache_adoption_safe(&adoption_job(
+            SampleLoopInfo::forward(100, 10_000),
+            8363,
+            10_000
+        )));
+        // Big forward loop with a tail: few copies, drift sub-millisecond — adopt.
+        assert!(legacy_cache_adoption_safe(&adoption_job(
+            SampleLoopInfo::forward(0, 8_000),
+            8363,
+            10_000
+        )));
+        // Tiny chip loop with a real tail: thousands of copies, the old
+        // accumulated rounding shifted the tail audibly — recompute.
+        assert!(!legacy_cache_adoption_safe(&adoption_job(
+            SampleLoopInfo::forward(1, 4),
+            8363,
+            10_000
+        )));
+        // Ping-pong: the old selector could splice a reversed copy — recompute.
+        assert!(!legacy_cache_adoption_safe(&adoption_job(
+            SampleLoopInfo::ping_pong(100, 10_000),
+            8363,
+            10_000
+        )));
+        // Sustain loop present: mixed-layout selection changed — recompute.
+        let mut sustain = SampleLoopInfo::forward(100, 10_000);
+        sustain.sustain = SampleLoopRegion::forward(50, 90);
+        assert!(!legacy_cache_adoption_safe(&adoption_job(
+            sustain, 8363, 10_000
+        )));
+    }
+
+    /// A legacy (pre-variant-key) FLAC entry is adopted — read AND renamed to
+    /// the new keyed filename — when the job's loop shape certifies it, and
+    /// ignored otherwise.
+    #[test]
+    fn legacy_flac_entry_is_adopted_and_rekeyed() {
+        let _guard = env_lock().lock().unwrap();
+        let temp_home = tempfile::tempdir().expect("Should create temp home");
+        let _home = HomeGuard::set(temp_home.path());
+        let dummy_pcm = [7u8; 32];
+        let original = vec![-0.5, -0.25, 0.0, 0.25, 0.5];
+
+        // Plant an OLD-format entry (no -k suffix), as the previous code
+        // wrote it: raw ddim in the name even for engines that ignore it.
+        let dir = cache_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_path = dir.join(format!(
+            "Quinlight-{}-lavasr-v0.1-ddim50.flac",
+            pcm_hex_prefix(&dummy_pcm)
+        ));
+        let flac = build_flac_i32(&original, 48_000, 1).unwrap();
+        std::fs::write(&old_path, &flac).unwrap();
+
+        let vkey = engine_cache_variant_key(8363, 8, SampleLoopInfo::none(), 48_000);
+        // Adoption disabled: the legacy entry must NOT be served.
+        assert!(
+            cache_lookup(
+                &dummy_pcm,
+                "lavasr-v0.1",
+                "",
+                0,
+                50,
+                &vkey,
+                false,
+                "LavaSR",
+                0,
+                48_000
+            )
+            .is_none(),
+            "loop-unsafe jobs must not read the legacy entry"
+        );
+        assert!(old_path.exists());
+
+        // Adoption enabled: served AND renamed to the new keyed filename.
+        let adopted = cache_lookup(
+            &dummy_pcm,
+            "lavasr-v0.1",
+            "",
+            0,
+            50,
+            &vkey,
+            true,
+            "LavaSR",
+            0,
+            48_000,
+        )
+        .expect("legacy entry should be adopted");
+        assert_eq!(adopted.data.len(), original.len());
+        assert!(!old_path.exists(), "legacy file should be renamed away");
+        let new_path = cache_flac_path(&dir, &dummy_pcm, "lavasr-v0.1", 0, &vkey);
+        assert!(new_path.exists(), "entry should now live under the new key");
+
+        // Subsequent lookups hit the new-format entry directly.
+        assert!(
+            cache_lookup(
+                &dummy_pcm,
+                "lavasr-v0.1",
+                "",
+                0,
+                50,
+                &vkey,
+                false,
+                "LavaSR",
+                0,
+                48_000
+            )
+            .is_some()
+        );
+    }
+
     #[test]
     fn cache_roundtrip_preserves_samples_within_int32_precision() {
         let _guard = env_lock().lock().unwrap();
@@ -10966,10 +11639,12 @@ mod tests {
         let original = vec![-0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75];
         let rms = simd::rms_f64(&original);
 
+        let vkey = engine_cache_variant_key(22_050, 16, SampleLoopInfo::none(), 48_000);
         cache_store(
             &dummy_pcm,
             "audiosr-test",
             50,
+            &vkey,
             &SampleResult {
                 index: 3,
                 data: original.clone(),
@@ -10982,8 +11657,19 @@ mod tests {
             rms,
         );
 
-        let cached = cache_lookup(&dummy_pcm, "audiosr-test", "", 50, "AudioSR", 3, 48_000)
-            .expect("cache entry should exist");
+        let cached = cache_lookup(
+            &dummy_pcm,
+            "audiosr-test",
+            "",
+            50,
+            50,
+            &vkey,
+            false,
+            "AudioSR",
+            3,
+            48_000,
+        )
+        .expect("cache entry should exist");
 
         // 32-bit integer FLAC: quantization error < 1e-9 per sample.
         assert_eq!(cached.data.len(), original.len());
@@ -12291,9 +12977,54 @@ mod tests {
         assert_eq!(off.body_frames, expected_body);
         // Tail derived by subtraction absorbs all rounding.
         assert_eq!(off.tail_frames, trim_frames - expected_head - expected_body);
+        // Copy positions are scaled PER BOUNDARY from the exact native
+        // position (the tiled buffer is materialized at native rate and
+        // resampled continuously), not accumulated as `head + k·rounded_body`
+        // — accumulation drifts by up to a frame per copy.
+        let expect_boundary = |k: usize| -> usize {
+            let native_pos = loop_start_native as usize + k * (loop_end_native - loop_start_native) as usize;
+            let cond_pos = scaled_frame_count(native_pos, native_rate, cond_rate);
+            scaled_frame_count(cond_pos, cond_rate, output_rate)
+        };
         // Middle body is index 2 of 5 copies (forward in FBFBF).
-        assert_eq!(off.selected_body_start, expected_head + 2 * expected_body);
-        assert_eq!(off.tail_start, expected_head + 5 * expected_body);
+        assert_eq!(off.selected_body_start, expect_boundary(2));
+        assert_eq!(off.tail_start, expect_boundary(5));
+        // Within a frame of the accumulated estimate at this small copy count…
+        assert!(off.selected_body_start.abs_diff(expected_head + 2 * expected_body) <= 2);
+        // …and the boundary positions never drift: the error vs the exact
+        // continuous mapping stays sub-frame for ANY copy index.
+        for k in [0usize, 2, 5, 100, 10_000] {
+            let exact = (loop_start_native as f64
+                + k as f64 * (loop_end_native - loop_start_native) as f64)
+                * output_rate as f64
+                / native_rate as f64;
+            let got = expect_boundary(k) as f64;
+            assert!(
+                (got - exact).abs() <= 2.0,
+                "boundary {k}: got {got}, exact {exact}"
+            );
+        }
+    }
+
+    /// Regression (M13): tiny chip-loop bodies tile into thousands of copies;
+    /// the old `head + k·rounded_body` accumulation put the tail slice
+    /// ~0.2 s into wrong content. Per-boundary scaling keeps every boundary
+    /// within a frame of the exact continuous position.
+    #[test]
+    fn tiled_offsets_tiny_loop_tail_does_not_drift() {
+        let native_rate = 8_363u32;
+        let cond_rate = 24_000u32;
+        let output_rate = 48_000u32;
+        let loop_native = crate::openmpt::SampleLoopRegion::forward(1, 4); // 3-frame body
+        let copies = 14_000usize; // ≈ 5 s at 8363 Hz with a 3-frame body
+
+        let tail = tiled_copy_start_out(loop_native, native_rate, cond_rate, output_rate, copies);
+        let exact = (1.0 + copies as f64 * 3.0) * output_rate as f64 / native_rate as f64;
+        assert!(
+            (tail as f64 - exact).abs() <= 2.0,
+            "tail boundary drifted: got {tail}, exact {exact:.1} (old code gave ~{:.0})",
+            exact + copies as f64 * 0.78 * 2.0,
+        );
     }
 
     /// Build a mono SampleJob at 48kHz with a synthetic reference and the
@@ -12491,6 +13222,62 @@ mod tests {
             "clean backward copy score {} should exceed corrupted backward copy {}",
             score_clean_b,
             score_corrupted_b,
+        );
+    }
+
+    /// Regression (M12): a backward (odd) ping-pong copy must never WIN the
+    /// selection even when it scores best — the extractor slices the winner
+    /// without reversing, so a backward winner splices time-reversed content
+    /// after the forward head.
+    #[test]
+    fn select_best_body_copy_never_picks_backward_ping_pong_copy() {
+        let loop_start = 50usize;
+        let loop_end = 250usize;
+        let total = 400usize;
+        let reference: Vec<f64> = (0..total).map(|i| (i as f64 * 0.2).sin()).collect();
+        let mut loop_info = SampleLoopInfo::forward(loop_start as i64, loop_end as i64);
+        loop_info.normal.mode = SampleLoopMode::PingPong;
+
+        let head = reference[..loop_start].to_vec();
+        let body: Vec<f64> = reference[loop_start..loop_end].to_vec();
+        let body_reversed: Vec<f64> = body.iter().copied().rev().collect();
+        let tail = reference[loop_end..].to_vec();
+
+        // Make every FORWARD copy slightly noisy and both backward copies
+        // pristine, so a naive max would pick an odd index.
+        let noisy_body: Vec<f64> = body
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| x + if i % 2 == 0 { 0.05 } else { -0.05 })
+            .collect();
+        let copies = 5;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&head);
+        raw.extend_from_slice(&noisy_body); // F (noisy)
+        raw.extend_from_slice(&body_reversed); // B (pristine)
+        raw.extend_from_slice(&noisy_body); // F (noisy)
+        raw.extend_from_slice(&body_reversed); // B (pristine)
+        raw.extend_from_slice(&noisy_body); // F (noisy)
+        raw.extend_from_slice(&tail);
+
+        let job = mono_job_for_best_copy_test(reference, loop_info, copies);
+        let layout = TilingLayout {
+            body_copies: copies,
+            loop_source: TiledLoopSource::Normal,
+        };
+        let result = select_best_body_copy(&raw, 1, &job, layout, total, 48_000, 0).unwrap();
+        assert_eq!(
+            result.best_index % 2,
+            0,
+            "winner must be a forward (even) copy, got index {} (scores: {:?})",
+            result.best_index,
+            result.all_scores,
+        );
+        // Sanity: the backward copies really did score best, i.e. the filter
+        // (not luck) kept them out.
+        assert!(
+            result.all_scores[1] > result.all_scores[result.best_index],
+            "test premise: backward copy should outscore the noisy forward ones"
         );
     }
 
@@ -12916,6 +13703,133 @@ mod tests {
         assert!(
             mean_abs_diff < 0.01,
             "extracted (post-fade) should match reference (got {mean_abs_diff})"
+        );
+    }
+
+    /// Regression: repeated-layout copy starts must scale each native tile
+    /// boundary independently (native→cond→output), like the single-loop
+    /// path's `tiled_copy_start_out`. The old `k · copy_frames_out`
+    /// accumulation drifted ~0.26 output frames per copy at 8363 Hz; with
+    /// 150 copies the selected late copy landed ~38 frames before its true
+    /// position — outside the selector's ±32-frame search window and far
+    /// enough that the extracted slice carried phase-shifted content.
+    #[test]
+    fn extract_repeated_channel_output_late_copy_does_not_drift_at_odd_native_rate() {
+        let native_rate = 8_363u32;
+        let cond_rate = 24_000u32;
+        let output_rate = 48_000u32;
+        let source_frames = 600usize;
+
+        let data: Vec<f64> = (0..source_frames).map(|i| (i as f64 * 0.1).sin()).collect();
+        let loop_info = SampleLoopInfo {
+            normal: SampleLoopRegion::none(),
+            sustain: SampleLoopRegion::none(),
+        };
+        // min_samples sized for 150 copies — enough that the old accumulated
+        // start drifts well past the selector's search tolerance.
+        let (mut padded, layout) = pad_for_engine(&data, 1, 150 * source_frames, loop_info);
+        let repeated_native = layout.expect("repeated").expect_repeated();
+        assert_eq!(repeated_native.copy_frames, source_frames);
+        let copies = repeated_native.copies;
+        assert!(
+            copies >= 150,
+            "test setup precondition: need enough copies ({copies}) that the old \
+             accumulated start drifts past the selector tolerance",
+        );
+
+        // Corrupt every copy except one near the end in the NATIVE-rate
+        // buffer, so FFT selection must pick the clean late copy and the
+        // extracted slice must start exactly on its (drift-prone) boundary.
+        let clean_idx = copies - 3;
+        for k in 0..copies {
+            if k == clean_idx {
+                continue;
+            }
+            for (i, v) in padded[k * source_frames..(k + 1) * source_frames]
+                .iter_mut()
+                .enumerate()
+            {
+                *v = if i % 2 == 0 { 0.8 } else { -0.8 };
+            }
+        }
+
+        // Simulate the engine path: the native buffer is resampled as one
+        // continuous signal, so output frame j carries the content at native
+        // position j · native/output.
+        let cond_frames = scaled_frame_count(padded.len(), native_rate, cond_rate);
+        let raw_frames = scaled_frame_count(cond_frames, cond_rate, output_rate);
+        let resample = |src: &[f64], j: usize| {
+            let pos = (j as f64 * native_rate as f64 / output_rate as f64) as usize;
+            src[pos.min(src.len() - 1)]
+        };
+        let raw_data: Vec<f64> = (0..raw_frames).map(|j| resample(&padded, j)).collect();
+
+        let repeated_cond = scale_engine_layout(
+            Some(EngineInputLayout::Repeated(repeated_native)),
+            native_rate,
+            cond_rate,
+        )
+        .expect("layout")
+        .expect_repeated();
+        let trim_frames = scaled_frame_count(
+            scaled_frame_count(source_frames, native_rate, cond_rate),
+            cond_rate,
+            output_rate,
+        );
+        let reference_48k: Vec<f64> = (0..trim_frames).map(|j| resample(&data, j)).collect();
+
+        let job = SampleJob {
+            index: 0,
+            name: "RepeatedDrift".into(),
+            original_data: data.clone(),
+            rate: native_rate as i32,
+            output_sample_rate_hz: output_rate as i32,
+            channels: 1,
+            bits_per_sample: 16,
+            source_length_frames: source_frames as i64,
+            looped: false,
+            loop_info,
+            conditioning_inputs: Vec::new(),
+            conditioning_rate_hz: cond_rate,
+            pcm_sha256: [0u8; 32],
+            target_rms: 0.0,
+            reference_48k: reference_48k.clone(),
+            original_length_48k_frames: trim_frames as i64,
+            engine_input_layout: Some(EngineInputLayout::Repeated(repeated_cond)),
+            native_inputs: Vec::new(),
+            native_rate_hz: 0,
+            native_input_layout: None,
+        };
+
+        let extracted = extract_repeated_channel_output(
+            &raw_data,
+            1,
+            &job,
+            repeated_cond,
+            trim_frames,
+            cond_rate,
+            0,
+        );
+        assert_eq!(extracted.len(), trim_frames);
+
+        // The clean copy is identical content to the source, so the slice
+        // must match the reference apart from nearest-neighbor jitter and
+        // the fade-in window applied when copy_index > 0. The old
+        // accumulated start was ~38 frames early, which both shifts the
+        // sine's phase (mean diff ≫ 0.1) and pulls in corrupted neighbor
+        // frames.
+        let skip = REPEATED_COPY_FADE_FRAMES;
+        let mean_abs_diff: f64 = extracted
+            .iter()
+            .zip(reference_48k.iter())
+            .skip(skip)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f64>()
+            / (trim_frames - skip) as f64;
+        assert!(
+            mean_abs_diff < 0.05,
+            "extracted (post-fade) drifted off the clean copy boundary \
+             (mean abs diff {mean_abs_diff})"
         );
     }
 
@@ -15345,6 +16259,112 @@ mod tests {
         }
     }
 
+    /// Regression: mixed-layout copy anchors must scale each native tile
+    /// boundary independently (native→cond→output), like the single-loop
+    /// path's `tiled_copy_start_out`. The old `block + start + idx·body_out`
+    /// accumulation drifted ~0.6 output frames per copy at 8363 Hz; with a
+    /// tiny sustain body tiled into hundreds of copies the selected middle
+    /// copy landed tens of frames before its true position and the sustain
+    /// span was filled with wrong content.
+    #[test]
+    fn extract_mixed_channel_output_middle_copy_does_not_drift_with_tiny_body() {
+        let native_rate = 8_363u32;
+        let cond_rate = 24_000u32;
+        let output_rate = 48_000u32;
+        let source_frames = 600usize;
+
+        // Tiny 13-frame sustain body; the 2-frame normal body keeps the grow
+        // loop feeding copies into the sustain block.
+        let s_loop = (100usize, 113usize);
+        let loop_info = SampleLoopInfo::with_loops(
+            SampleLoopRegion::forward(400, 402),
+            SampleLoopRegion::forward(s_loop.0 as i64, s_loop.1 as i64),
+        );
+        let data = vec![0.25f64; source_frames];
+        let (mut padded, layout) = pad_for_engine(&data, 1, 4_500, loop_info);
+        let mixed_native = layout.expect("mixed").expect_mixed();
+        let copies = mixed_native.sustain_block.body_copies;
+        assert!(
+            copies >= 150,
+            "test setup precondition: need enough copies ({copies}) that the old \
+             accumulated anchor would drift past the whole loop body",
+        );
+
+        // Mark the middle sustain copy in the NATIVE-rate buffer — the
+        // extractor falls back to the middle index when reference_48k is
+        // empty, so this is exactly the copy it must slice out.
+        let s_body = s_loop.1 - s_loop.0;
+        let marker_start =
+            mixed_native.sustain_block.offset_frames as usize + s_loop.0 + (copies / 2) * s_body;
+        for v in &mut padded[marker_start..marker_start + s_body] {
+            *v = 1.0;
+        }
+
+        // Simulate the engine path: the native buffer is resampled as one
+        // continuous signal, so output frame j carries the content at native
+        // position j · native/output.
+        let cond_frames = scaled_frame_count(padded.len(), native_rate, cond_rate);
+        let raw_frames = scaled_frame_count(cond_frames, cond_rate, output_rate);
+        let raw_data: Vec<f64> = (0..raw_frames)
+            .map(|j| {
+                let pos = (j as f64 * native_rate as f64 / output_rate as f64) as usize;
+                padded[pos.min(padded.len() - 1)]
+            })
+            .collect();
+
+        let mixed_cond = scale_engine_layout(
+            Some(EngineInputLayout::Mixed(mixed_native)),
+            native_rate,
+            cond_rate,
+        )
+        .expect("layout")
+        .expect_mixed();
+        let trim_frames = scaled_frame_count(source_frames, native_rate, output_rate);
+
+        let job = SampleJob {
+            index: 0,
+            name: "TinyBodyMixed".into(),
+            original_data: data.clone(),
+            rate: native_rate as i32,
+            output_sample_rate_hz: output_rate as i32,
+            channels: 1,
+            bits_per_sample: 16,
+            source_length_frames: source_frames as i64,
+            looped: true,
+            loop_info,
+            conditioning_inputs: Vec::new(),
+            conditioning_rate_hz: cond_rate,
+            pcm_sha256: [0u8; 32],
+            target_rms: 0.0,
+            reference_48k: Vec::new(),
+            original_length_48k_frames: trim_frames as i64,
+            engine_input_layout: Some(EngineInputLayout::Mixed(mixed_cond)),
+            native_inputs: Vec::new(),
+            native_rate_hz: 0,
+            native_input_layout: None,
+        };
+
+        let extracted =
+            extract_mixed_channel_output(&raw_data, 1, &job, mixed_cond, trim_frames, cond_rate, 0);
+
+        // The sustain span in the output must carry the marked middle copy.
+        // Check the clean interior (away from the 16-frame seam fades and a
+        // few frames of per-boundary rounding slack at each edge).
+        let s_start_out = scaled_frame_count(
+            scaled_frame_count(s_loop.0, native_rate, cond_rate),
+            cond_rate,
+            output_rate,
+        );
+        for d in 30..45 {
+            let v = extracted[s_start_out + d];
+            assert!(
+                v > 0.9,
+                "sustain span frame {d} = {v}: middle-copy anchor drifted off the \
+                 marked copy (old `start + idx·body_out` accumulation)",
+            );
+        }
+    }
+
     #[test]
     fn detect_with_fallback_partitions_engines_correctly() {
         let engine = RemasterEngine::from_test_engines_with_fallback(
@@ -15526,7 +16546,8 @@ mod tests {
             cache_store(
                 &job.pcm_sha256,
                 cache_id,
-                50,
+                0,
+                &variant_key_for_job(&job),
                 &SampleResult {
                     index: 0,
                     data: job.reference_48k.clone(),
@@ -15618,7 +16639,8 @@ mod tests {
         cache_store(
             &job.pcm_sha256,
             "audiosr-v0.1",
-            50,
+            0,
+            &variant_key_for_job(&job),
             &SampleResult {
                 index: 0,
                 data: low_score_data,
@@ -15634,7 +16656,8 @@ mod tests {
             cache_store(
                 &job.pcm_sha256,
                 cache_id,
-                50,
+                0,
+                &variant_key_for_job(&job),
                 &SampleResult {
                     index: 0,
                     data: job.reference_48k.clone(),
@@ -15738,7 +16761,8 @@ mod tests {
         cache_store(
             &job.pcm_sha256,
             "audiosr-v0.1",
-            50,
+            0,
+            &variant_key_for_job(&job),
             &SampleResult {
                 index: 0,
                 data: low_score_data,
@@ -15753,7 +16777,8 @@ mod tests {
         cache_store(
             &job.pcm_sha256,
             "lavasr-v0.1",
-            50,
+            0,
+            &variant_key_for_job(&job),
             &SampleResult {
                 index: 0,
                 data: job.reference_48k.clone(),
@@ -15850,7 +16875,8 @@ mod tests {
         cache_store(
             &job.pcm_sha256,
             "audiosr-v0.1",
-            50,
+            0,
+            &variant_key_for_job(&job),
             &SampleResult {
                 index: 0,
                 data: low_score_data,

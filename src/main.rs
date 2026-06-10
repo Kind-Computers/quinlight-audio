@@ -521,6 +521,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(match e {
                         batch::ConvertError::Fatal(_) => 1,
                         batch::ConvertError::QualityGate(_) => 2,
+                        // 128 + SIGINT: standard interrupted-process code.
+                        batch::ConvertError::Cancelled => 130,
                     });
                 }
             }
@@ -1297,8 +1299,10 @@ fn probe_metadata(path: &std::path::Path) -> Result<(), Box<dyn std::error::Erro
     let num_samples = module.num_samples();
     let num_instruments = module.num_instruments();
 
+    // libopenmpt sample/instrument indices are 0-based; iterating 1..=count
+    // used to drop the first name and query one past the end.
     let collect_names = |count: i32, get: &dyn Fn(i32) -> String| -> Vec<String> {
-        (1..=count)
+        (0..count)
             .map(get)
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.trim_end().to_string())

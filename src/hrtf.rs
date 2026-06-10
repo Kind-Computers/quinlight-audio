@@ -54,8 +54,19 @@ pub struct HrtfProcessor {
     out_buf: Vec<f64>,
     out_len: usize,
 
-    // Safety peak limiter: tracks all-time peak, never releases
+    // Safety peak limiter envelope: instant attack, slow (~-12 dB/s) release
+    // so one loud transient doesn't attenuate the rest of the session.
     peak_env: f64,
+    /// Per-sample release factor derived from the sample rate.
+    limiter_release: f64,
+    /// Total interleaved samples of startup latency injected as zero-fill
+    /// (non-partition-multiple callback sizes only). Constant after the
+    /// startup transient; the player delays its dry path by this much so the
+    /// wet/dry mix stays phase-aligned.
+    latency_samples: usize,
+    /// Latched when the renderer reports an error: `process` becomes a dry
+    /// passthrough (never desyncs L/R or grows the input unbounded).
+    failed: bool,
 }
 
 /// Apply HRTF binaural processing to a complete buffer of interleaved f64 stereo
@@ -149,16 +160,35 @@ impl HrtfProcessor {
             out_buf: vec![0.0; max_out],
             out_len: 0,
             peak_env: 0.0,
+            // -12 dB/s: 10^(-12 / (20 * rate)) per sample.
+            limiter_release: 10f64.powf(-12.0 / (20.0 * sample_rate.max(1) as f64)),
+            latency_samples: 0,
+            failed: false,
         })
+    }
+
+    /// Interleaved samples of wet-path startup latency (see `latency_samples`).
+    pub fn latency_samples(&self) -> usize {
+        self.latency_samples
+    }
+
+    /// True once a renderer error latched the processor into dry passthrough.
+    pub fn is_failed(&self) -> bool {
+        self.failed
     }
 
     /// Process interleaved f64 stereo audio in-place.
     /// Bridges between arbitrary callback buffer sizes and the fixed partition size.
     pub fn process(&mut self, data: &mut [f64]) {
         let plen = self.partition_len;
+        if self.failed {
+            return; // dry passthrough — see `failed`
+        }
 
-        // Deinterleave f64 stereo → mono f32 channels, accumulate
-        let frames = data.len() / 2;
+        // Deinterleave f64 stereo → mono f32 channels, accumulate. The input
+        // buffers are sized for MAX_CALLBACK_FRAMES + one partition; clamp so
+        // an oversized caller buffer can't index out of bounds.
+        let frames = (data.len() / 2).min(self.in_left.len().saturating_sub(self.in_len));
         for i in 0..frames {
             self.in_left[self.in_len + i] = data[i * 2] as f32;
             self.in_right[self.in_len + i] = data[i * 2 + 1] as f32;
@@ -168,6 +198,10 @@ impl HrtfProcessor {
         // Process complete partition blocks
         while self.in_len >= plen {
             // Left virtual speaker: left channel → binaural L/R
+            // A renderer error latches dry passthrough: continuing after a
+            // one-sided failure would advance one renderer's overlap state
+            // and permanently skew L vs R, and the unconsumed input would
+            // grow until it indexed out of bounds inside an audio callback.
             if self
                 .left_renderer
                 .process_block(
@@ -177,7 +211,8 @@ impl HrtfProcessor {
                 )
                 .is_err()
             {
-                break;
+                self.failed = true;
+                return;
             }
 
             // Right virtual speaker: right channel → binaural L/R
@@ -190,7 +225,8 @@ impl HrtfProcessor {
                 )
                 .is_err()
             {
-                break;
+                self.failed = true;
+                return;
             }
 
             // Sum, interleave, and peak-limit output
@@ -201,7 +237,9 @@ impl HrtfProcessor {
 
                 let peak = l.abs().max(r.abs());
                 if peak > self.peak_env {
-                    self.peak_env = peak;
+                    self.peak_env = peak; // instant attack
+                } else {
+                    self.peak_env *= self.limiter_release; // ~-12 dB/s release
                 }
 
                 let gain = if self.peak_env > 1.0 {
@@ -224,7 +262,10 @@ impl HrtfProcessor {
         let avail = self.out_len.min(data.len());
         data[..avail].copy_from_slice(&self.out_buf[..avail]);
 
-        // Zero-fill deficit (one-partition startup latency)
+        // Zero-fill deficit (startup latency only — once the output backlog
+        // covers a full callback this never runs again). Track the injected
+        // amount so the player can delay its dry path to match.
+        self.latency_samples += data.len() - avail;
         for s in &mut data[avail..] {
             *s = 0.0;
         }

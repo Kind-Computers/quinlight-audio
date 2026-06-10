@@ -1634,20 +1634,32 @@ const INTERPOLATION_CHOICES: &[InterpolationChoice] = &[
     InterpolationChoice::Aniso64,
 ];
 
-fn render_save_name(stem: &str, extension: &str, render_rate_hz: u32) -> String {
+fn render_save_name(stem: &str, extension: &str, render_rate_hz: u32, remastered: bool) -> String {
     let rate = crate::batch::format_rate_khz(render_rate_hz);
-    format!("{stem}-Quinlight-Audio-Remastered-{rate}.{extension}")
+    // Labeling integrity: "Remastered" only when AI-remastered samples are
+    // actually applied to the module being exported.
+    if remastered {
+        format!("{stem}-Quinlight-Audio-Remastered-{rate}.{extension}")
+    } else {
+        format!("{stem}-Quinlight-Audio-{rate}.{extension}")
+    }
 }
 
 fn default_render_rate(device_rate: u32) -> u32 {
     if device_rate > 0 { device_rate } else { 48_000 }
 }
 
-fn default_render_save_name(orig_path: &Path, ext: &str, device_rate: u32) -> String {
+fn default_render_save_name(
+    orig_path: &Path,
+    ext: &str,
+    device_rate: u32,
+    remastered: bool,
+) -> String {
     render_save_name(
         &orig_path.file_stem().unwrap_or_default().to_string_lossy(),
         ext,
         default_render_rate(device_rate),
+        remastered,
     )
 }
 
@@ -2411,8 +2423,14 @@ impl Quinlight {
                 let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
                 self.last_tick = now;
 
-                // Auto-grow audio buffer on underrun
-                if let Some(new_frames) = self.player.check_and_grow_buffer() {
+                // Auto-grow audio buffer on underrun — but never while a
+                // render export holds the player mutex: the stalled callback's
+                // gap is lock contention, not a device underrun, and growing
+                // here falsely ratcheted the buffer (and bounced the device)
+                // after every export.
+                if self.render_progress_rx.is_none()
+                    && let Some(new_frames) = self.player.check_and_grow_buffer()
+                {
                     self.remaster_notice = Some(format!(
                         "Audio buffer underrun — increased to {new_frames} frames"
                     ));
@@ -2455,6 +2473,15 @@ impl Quinlight {
                     self.player.refresh_visual_state();
                 }
                 self.player_state = self.player.state();
+                if self.player_state.hrtf_failed && self.hrtf_enabled {
+                    self.hrtf_enabled = false;
+                    self.remaster_notice = Some(
+                        self.player_state
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "HRTF disabled (init failed)".into()),
+                    );
+                }
                 self.waveform = self.player.waveform();
                 // Push spectrogram at 250 Hz — one column per frame on 240 Hz displays
                 const SPECTRO_INTERVAL_MS: u64 = 4;
@@ -2677,7 +2704,7 @@ impl Quinlight {
                 return Task::perform(
                     async move {
                         // Engine detection + heavy processing runs off GUI thread
-                        let engine = RemasterEngine::detect_with_fallback(&enabled_engines);
+                        let engine = RemasterEngine::detect_enabled(&enabled_engines);
                         let work_dir = match tempfile::tempdir() {
                             Ok(d) => d,
                             Err(e) => return RemasterStatus::Failed(e.to_string()),
@@ -2802,7 +2829,12 @@ impl Quinlight {
             }
             Message::SetHrtfEnabled(enabled) => {
                 self.hrtf_enabled = enabled;
-                self.player.send(PlayerCommand::SetHrtfEnabled(enabled));
+                // Applied synchronously rather than through the command
+                // queue (which only drains on the next audio callback) so
+                // the off-thread processor build sees the enable and the
+                // failure latch clears; the audio callback never parses
+                // the SOFA file itself.
+                self.player.set_hrtf_enabled(enabled);
             }
             Message::SetHrtfMix(percent) => {
                 self.hrtf_mix = percent;
@@ -4928,8 +4960,17 @@ impl Quinlight {
             // Already rendering
             return Task::none();
         }
-        let render_rate = default_render_rate(self.player.current_playback_rate());
-        let default_name = default_render_save_name(orig_path, ext, render_rate);
+        // Cap the AAC filename rate to what the encoder will actually
+        // produce, and only claim "Remastered" when AI samples are applied.
+        let render_rate = {
+            let r = default_render_rate(self.player.current_playback_rate());
+            if ext == "m4a" { r.min(96_000) } else { r }
+        };
+        let remastered = self
+            .sample_slots
+            .iter()
+            .any(|slot| matches!(slot.mode, SampleMode::Engine(_) | SampleMode::Reference48k));
+        let default_name = default_render_save_name(orig_path, ext, render_rate, remastered);
         let default_dir = dirs::audio_dir()
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -5031,6 +5072,10 @@ impl Quinlight {
     fn finish_render_export(&mut self, result: Result<PathBuf, String>) {
         self.render_progress_rx = None;
         self.render_progress_pct = 0.0;
+        // The render held the player mutex for seconds; the audio callback's
+        // measured gap is contention, not a device underrun. Clear it before
+        // the next Tick's growth check.
+        self.player.clear_stall_underrun();
         match result {
             Ok(path) => {
                 self.remaster_notice = Some(format!(
@@ -5041,8 +5086,20 @@ impl Quinlight {
             }
             Err(e) if e == "Cancelled" => {}
             Err(e) => {
-                self.remaster_notice = None;
-                self.remaster_status = RemasterStatus::Failed(format!("Render failed: {e}"));
+                // A failed EXPORT must not clobber an in-flight remaster's
+                // state machine (that hid the Cancel button and orphaned the
+                // worker). Surface it as a notice instead when one is active.
+                if self.remaster_result_rx.is_some()
+                    || matches!(
+                        self.remaster_status,
+                        RemasterStatus::Processing { .. } | RemasterStatus::Cancelling
+                    )
+                {
+                    self.remaster_notice = Some(format!("Render failed: {e}"));
+                } else {
+                    self.remaster_notice = None;
+                    self.remaster_status = RemasterStatus::Failed(format!("Render failed: {e}"));
+                }
             }
         }
     }
@@ -5379,20 +5436,30 @@ mod tests {
     #[test]
     fn render_save_name_uses_render_rate() {
         assert_eq!(
-            render_save_name("2ND_PM", "flac", 96_000),
+            render_save_name("2ND_PM", "flac", 96_000, true),
             "2ND_PM-Quinlight-Audio-Remastered-96Khz.flac"
         );
         assert_eq!(
-            render_save_name("2ND_PM", "m4a", 48_000),
+            render_save_name("2ND_PM", "m4a", 48_000, true),
             "2ND_PM-Quinlight-Audio-Remastered-48Khz.m4a"
         );
         assert_eq!(
-            render_save_name("2ND_PM", "flac", 192_000),
+            render_save_name("2ND_PM", "flac", 192_000, true),
             "2ND_PM-Quinlight-Audio-Remastered-192Khz.flac"
         );
         assert_eq!(
-            render_save_name("2ND_PM", "flac", 44_100),
+            render_save_name("2ND_PM", "flac", 44_100, true),
             "2ND_PM-Quinlight-Audio-Remastered-44.1Khz.flac"
+        );
+    }
+
+    /// Labeling integrity: an export of a never-remastered module must not
+    /// default to a filename claiming it was remastered.
+    #[test]
+    fn render_save_name_omits_remastered_claim_without_applied_samples() {
+        assert_eq!(
+            render_save_name("2ND_PM", "flac", 96_000, false),
+            "2ND_PM-Quinlight-Audio-96Khz.flac"
         );
     }
 
@@ -5400,7 +5467,7 @@ mod tests {
     fn default_render_save_name_uses_playback_rate() {
         let path = Path::new("/tmp/2ND_PM.S3M");
         assert_eq!(
-            default_render_save_name(path, "flac", 96_000),
+            default_render_save_name(path, "flac", 96_000, true),
             "2ND_PM-Quinlight-Audio-Remastered-96Khz.flac"
         );
     }

@@ -116,7 +116,7 @@ def lowpass_filtering_prepare_with_cutoff(dl_output, cutoff_freq):
     if waveform.size(-1) <= filtered_audio.size(-1):
         filtered_audio = filtered_audio[..., : waveform.size(-1)]
     else:
-        filtered_audio = torch.functional.pad(
+        filtered_audio = torch.nn.functional.pad(
             filtered_audio, (0, waveform.size(-1) - filtered_audio.size(-1))
         )
 
@@ -183,12 +183,16 @@ with open(manifest_path, "r", encoding="utf-8") as fh:
 
 audiosr = build_model(model_name="basic", device=device)
 
+failures = 0
 for item in manifest["items"]:
     stem = item["stem"]
     input_file = item["conditioning_wav_path"]
     conditioning_rate_hz = int(item["conditioning_rate_hz"])
     cutoff_hz = float(item["conditioning_lowpass_hz"])
 
+    # Per-item isolation (like the other engine wrappers): one bad sample
+    # must not abort the rest of the batch — that forced a full re-run of
+    # already-succeeded items on the CPU retry path.
     try:
         waveform = super_resolution_with_cutoff(
             audiosr,
@@ -209,9 +213,15 @@ for item in manifest["items"]:
             subtype="DOUBLE",
         )
         print(f"DONE: {stem}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"FAILED: {stem}: {e}", file=sys.stderr, flush=True)
     finally:
         waveform = None
         _release_memory()
+
+if failures:
+    sys.exit(1)
 "#;
 
 pub struct AudioSrEngine {
@@ -312,6 +322,10 @@ impl UpsampleEngine for AudioSrEngine {
 
     fn output_rate(&self) -> u32 {
         48000
+    }
+
+    fn uses_ddim_steps(&self) -> bool {
+        true
     }
 
     fn max_batch_size(&self) -> usize {

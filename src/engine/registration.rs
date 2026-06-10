@@ -648,18 +648,29 @@ pub fn robust_mean_per_sample(stack: &[&[f64]], winsor_k: f64, winsor_abs: f64) 
 /// narrow guard — the body reduction still excludes it. No-op for
 /// `radius == 0`.
 fn apply_seam_master_blend(out: &mut [f64], master: &[f64], radius: usize) {
-    let n = out.len().min(master.len());
-    if radius == 0 || n < 3 {
+    let n = out.len();
+    if radius == 0 || n < 3 || master.len() < 3 {
         return;
     }
     // Cap so the two endpoint guards never overlap.
     let r = radius.min(n / 2);
+    // Anchor both guards on the OUTPUT's endpoints — the loop seam lives at
+    // out[0] / out[n-1]. When the master is shorter than the output (resampler
+    // rounding can leave it a frame short), blending against master indices
+    // near the master's own end would inject master samples mid-buffer while
+    // leaving the true seam unguarded — so the tail guard requires full
+    // coverage, and the head guard stops where the master ends.
+    let tail_covered = master.len() >= n;
     for k in 0..r {
         let beta = 0.5 * (1.0 + (std::f64::consts::PI * k as f64 / r as f64).cos());
         let head = k;
-        out[head] = (1.0 - beta) * out[head] + beta * master[head];
-        let tail = n - 1 - k;
-        out[tail] = (1.0 - beta) * out[tail] + beta * master[tail];
+        if head < master.len() {
+            out[head] = (1.0 - beta) * out[head] + beta * scrub1(master[head]);
+        }
+        if tail_covered {
+            let tail = n - 1 - k;
+            out[tail] = (1.0 - beta) * out[tail] + beta * scrub1(master[tail]);
+        }
     }
 }
 
@@ -670,7 +681,8 @@ fn apply_seam_master_blend(out: &mut [f64], master: &[f64], radius: usize) {
 /// the (unwarped) master is *also* pushed as a self-regulating member (see
 /// [`LkParams::include_master_in_reduction`]); in **mean**/**robust** mode it
 /// is excluded. The stack is reduced per-sample by `mode`. `K == 1` returns the
-/// lone engine unchanged (no warp, no master mixing); `K == 0` returns empty.
+/// lone engine scrubbed but otherwise unchanged (no warp, no master mixing);
+/// `K == 0` returns empty.
 /// Output length is the minimum engine length. Production code calls this with
 /// the runtime winsor knobs; tests use a default-param `registration_consensus_1d`
 /// helper.
@@ -687,7 +699,9 @@ pub fn registration_consensus_1d_with(
     }
     let out_len = engines.iter().map(|e| e.len()).min().unwrap_or(0);
     if k == 1 {
-        return engines[0][..out_len].to_vec();
+        // Passthrough, but still honor the scrub contract: a lone engine's
+        // NaN/Inf must not reach the output verbatim.
+        return engines[0][..out_len].iter().copied().map(scrub1).collect();
     }
 
     // Alignment is bounded by the master too; if the master is shorter than
@@ -734,7 +748,9 @@ pub fn registration_consensus_1d_with(
     // shared across all engines and restore exact loop continuity. Body samples
     // are untouched. Inert unless looped and the radius is set.
     if params.seam_guard_radius > 0 && looped && align_n >= 3 {
-        apply_seam_master_blend(&mut reduced, &master[..align_n], params.seam_guard_radius);
+        // Full master, not `[..align_n]`: the blend anchors its guards on the
+        // OUTPUT endpoints and skips the tail when the master can't cover it.
+        apply_seam_master_blend(&mut reduced, master, params.seam_guard_radius);
     }
     reduced
 }
@@ -1130,6 +1146,62 @@ mod tests {
         let short = vec![0.1, 0.2];
         let out2 = registration_consensus_1d(&short, &[e1.as_slice(), e2.as_slice()], true, ReductionMode::Median);
         assert_eq!(out2.len(), n);
+    }
+
+    /// Regression: with a master slightly shorter than the output the seam
+    /// guard used to anchor on the truncated master length — replacing an
+    /// INTERIOR sample 100% with the master (a discontinuity mid-buffer)
+    /// while leaving the actual loop endpoint unguarded.
+    #[test]
+    fn seam_blend_short_master_guards_head_only_and_never_mid_buffer() {
+        let n = 64usize;
+        let master = vec![1.0f64; 60]; // one resampler-rounding short of n
+        let mut out = vec![0.0f64; n];
+        apply_seam_master_blend(&mut out, &master, 8);
+
+        // Head endpoint fully pulled to master (beta = 1 at k = 0)…
+        assert_eq!(out[0], 1.0);
+        assert!(out[1] > 0.0 && out[1] < 1.0);
+        // …and absolutely nothing else changes: the old code blended
+        // out[52..60] (interior!) toward the master and left out[63] alone.
+        for (i, &x) in out.iter().enumerate().skip(8) {
+            assert_eq!(x, 0.0, "sample {i} must be untouched with a short master");
+        }
+    }
+
+    #[test]
+    fn seam_blend_full_master_guards_both_endpoints() {
+        let n = 64usize;
+        let master = vec![1.0f64; n];
+        let mut out = vec![0.0f64; n];
+        apply_seam_master_blend(&mut out, &master, 8);
+        assert_eq!(out[0], 1.0);
+        assert_eq!(out[n - 1], 1.0);
+        for (i, &x) in out.iter().enumerate().take(n - 8).skip(8) {
+            assert_eq!(x, 0.0, "body sample {i} must be untouched");
+        }
+    }
+
+    /// K = 1 passthrough must still scrub non-finite samples (the scrub
+    /// contract: a single bad engine value can't reach the output).
+    #[test]
+    fn single_engine_passthrough_scrubs_non_finite() {
+        let mut engine: Vec<f64> = (0..32).map(|i| (i as f64 * 0.2).sin()).collect();
+        engine[7] = f64::NAN;
+        engine[20] = f64::INFINITY;
+        let master: Vec<f64> = vec![0.0; 32];
+        let out = registration_consensus_1d(
+            &master,
+            &[engine.as_slice()],
+            false,
+            ReductionMode::Median,
+        );
+        assert_eq!(out.len(), 32);
+        assert!(out.iter().all(|x| x.is_finite()));
+        assert_eq!(out[7], 0.0);
+        assert_eq!(out[20], 0.0);
+        // Finite samples pass through untouched.
+        assert_eq!(out[3], engine[3]);
     }
 
     #[test]

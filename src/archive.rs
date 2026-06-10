@@ -179,6 +179,13 @@ pub fn read_module_file(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 /// List all tracker module files inside an archive, sorted by name.
+///
+/// Known limitation: `compress_tools::list_archive_files` materializes the
+/// full entry-name list before our candidate cap applies, so a hostile
+/// archive with millions of entries inflates memory during the listing step
+/// (names only — extraction itself is bounded by `MAX_MODULE_BYTES` and the
+/// candidate cap). compress-tools exposes no streaming listing API to bound
+/// this without dropping to raw libarchive.
 pub fn list_modules_in_archive(path: &Path) -> Result<Vec<ArchiveEntry>, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open archive: {e}"))?;
     let entries = compress_tools::list_archive_files(file)

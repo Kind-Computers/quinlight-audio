@@ -30,7 +30,6 @@ pub enum PlayerCommand {
     SetStereoSeparation(i32),
     SetAgcEnabled(bool),
     SetVolume(f64),
-    SetHrtfEnabled(bool),
     SetHrtfMix(i32),
     PlaySample { data: Vec<f64>, rate_ratio: f64 },
 }
@@ -131,6 +130,9 @@ pub struct PlayerState {
     pub bpm: f64,
     pub speed: i32,
     pub load_generation: u64,
+    /// Set when background HRTF initialization failed; the GUI unchecks its
+    /// HRTF toggle and surfaces `error` instead of silently playing dry.
+    pub hrtf_failed: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -156,7 +158,15 @@ struct PlayerInner {
     hrtf_enabled: bool,
     hrtf_mix: i32,
     hrtf_processor: Option<crate::hrtf::HrtfProcessor>,
+    /// Sample rate the resident processor was built for; a device reopen at a
+    /// different rate triggers a rebuild.
+    hrtf_rate: u32,
+    /// True while a background `spawn_hrtf_init` thread is running.
+    hrtf_init_in_flight: bool,
     hrtf_dry_buf: Vec<f64>,
+    /// FIFO delaying the dry path by the wet path's startup latency so the
+    /// wet/dry mix stays phase-aligned for non-partition-multiple buffers.
+    hrtf_dry_delay: Vec<f64>,
     /// Pristine native (< 48 kHz) samples captured at load, each paired with the
     /// 48 kHz master now resident in the module. The GUI remaster sources its
     /// originals from here so the AI sees native input while live swaps stay at
@@ -184,7 +194,10 @@ impl PlayerInner {
             hrtf_enabled: true,
             hrtf_mix: 33,
             hrtf_processor: None,
+            hrtf_rate: 0,
+            hrtf_init_in_flight: false,
             hrtf_dry_buf: Vec::new(),
+            hrtf_dry_delay: Vec::new(),
             sample_stash: Vec::new(),
         }
     }
@@ -195,6 +208,11 @@ fn install_prepared_load(
     state: &mut PlayerState,
     prepared: PreparedModuleLoad,
 ) {
+    // The old module's keyjazz voices must not ring into the new module.
+    for voice in &mut player.keyjazz_voices {
+        voice.active = false;
+        voice.data = Vec::new();
+    }
     let PreparedModuleLoad {
         file_data,
         mut module,
@@ -313,9 +331,6 @@ fn process_audio_commands(inner: &Mutex<PlayerInner>, command_rx: &Receiver<Play
                     module.set_agc_enabled(enabled);
                 }
             }
-            PlayerCommand::SetHrtfEnabled(enabled) => {
-                player.hrtf_enabled = enabled;
-            }
             PlayerCommand::SetHrtfMix(percent) => {
                 player.hrtf_mix = percent.clamp(0, 100);
             }
@@ -395,6 +410,43 @@ fn mix_keyjazz_voices(data: &mut [f64], voices: &mut [KeyjazzVoice]) {
     }
 }
 
+/// Mix `dry` (delayed by `latency` samples through `delay_line`) into the wet
+/// signal already in `data`. The wet path acquires `latency` samples of
+/// startup zero-fill when callback sizes aren't partition multiples; mixing
+/// undelayed dry against it would comb-filter, so the dry path is delayed to
+/// match. With `latency == 0` and an empty line this is a direct mix.
+fn mix_delayed_dry(
+    data: &mut [f64],
+    dry: &[f64],
+    delay_line: &mut Vec<f64>,
+    latency: usize,
+    wet_gain: f64,
+    dry_gain: f64,
+) {
+    if latency == 0 && delay_line.is_empty() {
+        for (wet, d) in data.iter_mut().zip(dry.iter()) {
+            *wet = *d * dry_gain + *wet * wet_gain;
+        }
+        return;
+    }
+    delay_line.extend_from_slice(dry);
+    let take = delay_line.len().saturating_sub(latency).min(data.len());
+    let start = data.len() - take;
+    for i in 0..take {
+        data[start + i] = delay_line[i] * dry_gain + data[start + i] * wet_gain;
+    }
+    // Positions before `start` hold wet output whose delayed-dry
+    // counterparts are still queued in the filling delay line (the wet
+    // path's startup zero-fill lands at the tail of `data`, not here):
+    // scale by wet gain only since delayed dry history doesn't exist yet.
+    for s in &mut data[..start] {
+        *s *= wet_gain;
+    }
+    let remaining = delay_line.len() - take;
+    delay_line.copy_within(take.., 0);
+    delay_line.truncate(remaining);
+}
+
 fn render_audio_f64(
     data: &mut [f64],
     inner: &Mutex<PlayerInner>,
@@ -422,14 +474,18 @@ fn render_audio_f64(
             }
         }
         if vol != fade_target || vol < 1.0 {
+            // Advance the ramp once per FRAME (the step is in per-frame
+            // units); stepping per interleaved sample ran the fade twice as
+            // fast and gave L/R gains one step apart within each frame.
             let step = 1.0 / (rate as f64 * 0.15);
-            for sample in &mut data[..rendered * 2] {
+            for frame in data[..rendered * 2].chunks_exact_mut(2) {
                 if (vol - fade_target).abs() > step {
                     vol += if fade_target < vol { -step } else { step };
                 } else {
                     vol = fade_target;
                 }
-                *sample *= vol;
+                frame[0] *= vol;
+                frame[1] *= vol;
             }
         }
 
@@ -474,19 +530,15 @@ fn render_audio_f64(
 
     mix_keyjazz_voices(data, &mut player.keyjazz_voices);
 
-    // HRTF binaural spatialization (headphones mode)
+    // HRTF binaural spatialization (headphones mode). The processor is built
+    // OFF the audio thread (`spawn_hrtf_init` — parsing the multi-MB SOFA
+    // file here used to blow the very first callback's deadline and trigger
+    // a spurious buffer-growth/device-bounce at startup); until it lands we
+    // simply play dry.
     if player.hrtf_enabled {
-        if player.hrtf_processor.is_none() {
-            match crate::hrtf::HrtfProcessor::try_new(rate as u32) {
-                Ok(p) => player.hrtf_processor = Some(p),
-                Err(e) => {
-                    eprintln!("HRTF init failed: {e}");
-                    player.hrtf_enabled = false;
-                }
-            }
-        }
         let p = &mut *player; // reborrow for split field access
         let mix = p.hrtf_mix;
+        let mut hrtf_failed_now = false;
         if let Some(ref mut processor) = p.hrtf_processor {
             if mix < 100 {
                 // Save dry signal before HRTF (no alloc after first callback)
@@ -496,14 +548,37 @@ fn render_audio_f64(
                 }
                 p.hrtf_dry_buf[..len].copy_from_slice(data);
                 processor.process(data);
-                let wet_gain = mix as f64 / 100.0;
-                let dry_gain = 1.0 - wet_gain;
-                for (wet, dry) in data.iter_mut().zip(&p.hrtf_dry_buf[..len]) {
-                    *wet = *dry * dry_gain + *wet * wet_gain;
+                if processor.is_failed() {
+                    hrtf_failed_now = true;
+                    data.copy_from_slice(&p.hrtf_dry_buf[..len]);
+                } else {
+                    let wet_gain = mix as f64 / 100.0;
+                    let dry_gain = 1.0 - wet_gain;
+                    let latency = processor.latency_samples();
+                    mix_delayed_dry(
+                        data,
+                        &p.hrtf_dry_buf[..len],
+                        &mut p.hrtf_dry_delay,
+                        latency,
+                        wet_gain,
+                        dry_gain,
+                    );
                 }
             } else {
                 processor.process(data);
+                hrtf_failed_now = processor.is_failed();
             }
+        }
+        if hrtf_failed_now {
+            p.hrtf_enabled = false;
+            p.hrtf_processor = None;
+            // Drop the dry backlog with the processor; a future replacement
+            // starts its latency from zero. `clear` keeps the allocation, so
+            // this is safe on the audio thread.
+            p.hrtf_dry_delay.clear();
+            let mut s = state.lock().unwrap();
+            s.hrtf_failed = true;
+            s.error = Some("HRTF disabled: renderer error during playback".into());
         }
     }
 
@@ -698,6 +773,51 @@ impl RenderHandle {
     }
 }
 
+/// Build the HRTF processor on a background thread and install it into the
+/// player when ready. Parsing the embedded SOFA file takes far longer than an
+/// audio-callback deadline, so this must never run on the audio thread; the
+/// callback plays dry until the processor lands. On failure HRTF is disabled
+/// and the failure is surfaced through `PlayerState` so the GUI can uncheck
+/// its toggle.
+fn spawn_hrtf_init(
+    inner: Arc<Mutex<PlayerInner>>,
+    state: Arc<Mutex<PlayerState>>,
+    rate: u32,
+) {
+    {
+        let mut player = inner.lock().unwrap();
+        let already_ready = player.hrtf_processor.is_some() && player.hrtf_rate == rate;
+        if !player.hrtf_enabled || already_ready || player.hrtf_init_in_flight || rate == 0 {
+            return;
+        }
+        player.hrtf_init_in_flight = true;
+    }
+    std::thread::spawn(move || {
+        let result = crate::hrtf::HrtfProcessor::try_new(rate);
+        let mut player = inner.lock().unwrap();
+        player.hrtf_init_in_flight = false;
+        match result {
+            Ok(processor) => {
+                player.hrtf_processor = Some(processor);
+                player.hrtf_rate = rate;
+                // The replacement's startup latency restarts at zero, so any
+                // dry backlog delayed for the old processor would leave the
+                // wet/dry mix permanently mis-aligned (comb filtering).
+                player.hrtf_dry_delay.clear();
+            }
+            Err(e) => {
+                eprintln!("HRTF init failed: {e}");
+                player.hrtf_enabled = false;
+                player.hrtf_processor = None;
+                player.hrtf_dry_delay.clear();
+                let mut s = state.lock().unwrap();
+                s.hrtf_failed = true;
+                s.error = Some(format!("HRTF disabled: {e}"));
+            }
+        }
+    });
+}
+
 fn candidate_playback_rates(preferred: Option<u32>) -> Vec<u32> {
     match preferred {
         Some(rate) => std::iter::once(rate)
@@ -774,7 +894,10 @@ impl Player {
             }) {
                 Ok(dev) => {
                     dev.resume();
-                    initial_rate = rate;
+                    // Store the rate SDL actually negotiated, not the request
+                    // — downstream consumers (render-rate defaults, device
+                    // reopens) act on this value.
+                    initial_rate = dev.spec().freq.max(0) as u32;
                     device = Some(dev);
                     break;
                 }
@@ -784,6 +907,7 @@ impl Player {
             }
         }
         let device = device.ok_or(last_err)?;
+        spawn_hrtf_init(inner.clone(), state.clone(), initial_rate);
 
         Ok(Player {
             inner,
@@ -873,6 +997,28 @@ impl Player {
         interpolation_filter: i32,
         agc_enabled: bool,
     ) {
+        // Commands queued against the OLD module (seeks, keyjazz notes,
+        // transport) must not be applied to the new one by the next callback.
+        // Settings-style commands survive: they are intentional regardless of
+        // which module is loaded, so they're re-queued after the drain.
+        let mut keep: Vec<PlayerCommand> = Vec::new();
+        while let Ok(cmd) = self.command_rx.try_recv() {
+            match cmd {
+                PlayerCommand::SetInterpolation(_)
+                | PlayerCommand::SetStereoSeparation(_)
+                | PlayerCommand::SetAgcEnabled(_)
+                | PlayerCommand::SetVolume(_)
+                | PlayerCommand::SetHrtfMix(_) => keep.push(cmd),
+                PlayerCommand::Play
+                | PlayerCommand::Pause
+                | PlayerCommand::Stop
+                | PlayerCommand::Seek(_)
+                | PlayerCommand::PlaySample { .. } => {}
+            }
+        }
+        for cmd in keep {
+            let _ = self.command_tx.send(cmd);
+        }
         let mut player = self.inner.lock().unwrap();
         player.stereo_separation = stereo_separation;
         player.interpolation_filter = interpolation_filter;
@@ -922,12 +1068,49 @@ impl Player {
             })
             .ok()?;
 
+        let negotiated = device.spec().freq.max(0) as u32;
+        self.current_playback_rate.store(negotiated, Ordering::Relaxed);
         self.buffer_frames.store(frames, Ordering::Relaxed);
         *dev_guard = Some(device);
+        // The reopened device may have negotiated a different rate; rebuild
+        // the HRTF processor off-thread if so.
+        spawn_hrtf_init(self.inner.clone(), self.state.clone(), negotiated);
         if frames != current {
             eprintln!("Audio underrun detected — buffer increased to {frames} frames");
         }
         Some(frames)
+    }
+
+    /// Clear a pending underrun signal and reset the callback-gap baseline.
+    /// Called after an offline render releases the player mutex: the stalled
+    /// callback's measured gap is mutex contention, not a device underrun,
+    /// and must not trigger buffer growth.
+    pub fn clear_stall_underrun(&self) {
+        self.underrun_flag.store(false, Ordering::Relaxed);
+        self.last_callback_nanos.store(0, Ordering::Relaxed);
+    }
+
+    /// Enable or disable HRTF synchronously. This bypasses the command queue
+    /// on purpose: the queue is only drained by the audio callback, so a
+    /// queued enable would still read as disabled when `spawn_hrtf_init`
+    /// checks it and the init would silently no-op. An explicit enable also
+    /// clears the `hrtf_failed` latch so the user can retry after a
+    /// transient init/render error; a failure during that retry latches
+    /// again until the next explicit enable.
+    pub fn set_hrtf_enabled(&self, enabled: bool) {
+        self.inner.lock().unwrap().hrtf_enabled = enabled;
+        if enabled {
+            self.state.lock().unwrap().hrtf_failed = false;
+            self.ensure_hrtf_ready();
+        }
+    }
+
+    /// Kick (or re-kick) background HRTF initialization at the current
+    /// playback rate. Called when the user enables HRTF; the audio callback
+    /// itself never builds the processor.
+    pub fn ensure_hrtf_ready(&self) {
+        let rate = self.current_playback_rate.load(Ordering::Relaxed);
+        spawn_hrtf_init(self.inner.clone(), self.state.clone(), rate);
     }
 
     /// Open an SDL2 audio device and resume playback, returning the device and

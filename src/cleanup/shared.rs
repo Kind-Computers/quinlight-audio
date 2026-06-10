@@ -273,6 +273,25 @@ pub(crate) fn detect_clip_mask(samples: &[f64], params: ClipDetectParams) -> Vec
                 max_sample = max_sample.max(samples[i]);
                 i += 1;
             }
+            // If the run was cut by the length cap rather than by content,
+            // this is a legitimate sustained plateau (e.g. a full-scale
+            // square wave), not a clip transient: skip to its true end
+            // without flagging. Re-entering the same plateau used to leave a
+            // final `L mod (cap+1)` remainder chunk that passed both gates
+            // (genuine plateau-end edge, zero span) — so the last samples of
+            // every long plateau were "repaired", pitch-dependently.
+            let truncated_by_cap = i < len
+                && samples[i].abs() >= threshold
+                && (sign == 0.0 || samples[i].signum() == sign || samples[i] == 0.0);
+            if truncated_by_cap {
+                while i < len
+                    && samples[i].abs() >= threshold
+                    && (sign == 0.0 || samples[i].signum() == sign || samples[i] == 0.0)
+                {
+                    i += 1;
+                }
+                continue;
+            }
             let end = i;
             let region_len = end.saturating_sub(start);
             if region_len >= params.min_region_samples && region_len <= params.max_region_samples {
@@ -533,7 +552,10 @@ pub(crate) fn repair_gap_ar(samples: &mut [f64], start: usize, end: usize, param
         .iter()
         .map(|sample| sample.abs())
         .fold(0.0f64, f64::max);
-    let clamp_bound = left_bound.max(right_bound).max(1.0);
+    // Bound repairs to slightly above the local context level — never to full
+    // scale inside a quiet passage. The absolute floor keeps a near-silent
+    // context from pinning the repair to zero.
+    let clamp_bound = (1.5 * left_bound.max(right_bound)).clamp(1.0e-4, 1.0);
 
     for i in 0..gap {
         let t = (i + 1) as f64 / (gap + 1) as f64;
@@ -567,12 +589,15 @@ pub(crate) fn repair_gap_median(
 
     let left_median = median_of_slice(left);
     let right_median = median_of_slice(right);
-    let bound = left
-        .iter()
-        .chain(right.iter())
-        .map(|sample| sample.abs())
-        .fold(0.0f64, f64::max)
-        .max(1.0);
+    // Same context-relative bound as the AR path: never full scale in a
+    // quiet passage.
+    let bound = (1.5
+        * left
+            .iter()
+            .chain(right.iter())
+            .map(|sample| sample.abs())
+            .fold(0.0f64, f64::max))
+    .clamp(1.0e-4, 1.0);
     for i in 0..gap {
         let t = (i + 1) as f64 / (gap + 1) as f64;
         let bridged = left_median * (1.0 - t) + right_median * t;
@@ -632,11 +657,14 @@ pub(crate) fn burg_lpc(samples: &[f64], order: usize) -> Vec<f64> {
         updated[a.len()] = reflection;
         a = updated;
 
+        // Textbook Burg lattice update: b_m(t) = b_{m-1}(t-1) + k·f_{m-1}(t),
+        // stored at index t so the next stage's eb[t-1] read sees b_m(t-1).
+        // Descending t writes index t while reading t-1, so no overlap.
         for t in ((m + 1)..len).rev() {
             let ef_old = ef[t];
             let eb_old = eb[t - 1];
             ef[t] = ef_old + reflection * eb_old;
-            eb[t - 1] = eb_old + reflection * ef_old;
+            eb[t] = eb_old + reflection * ef_old;
         }
     }
 
@@ -708,6 +736,30 @@ mod tests {
         original
     }
 
+    /// Regression (M17): the plateau scan used to consume oversized plateaus
+    /// in `max_region + 1` chunks and re-enter the same plateau, leaving a
+    /// final remainder chunk that passed both gates — so the LAST samples of
+    /// every long plateau of a legitimate full-scale square wave got flagged
+    /// as clipping and "repaired", purely depending on pitch.
+    #[test]
+    fn square_wave_plateaus_are_not_flagged_as_clipping() {
+        // 8 kHz → max_region_samples = 2 → chunk stride 3. A 17-sample
+        // plateau leaves a 2-sample remainder ≥ min_region_samples = 2,
+        // which the old scan flagged on every plateau.
+        let plateau = 17usize;
+        let mut samples = Vec::with_capacity(plateau * 120);
+        for k in 0..120 {
+            let v = if k % 2 == 0 { 1.0 } else { -1.0 };
+            samples.extend(std::iter::repeat_n(v, plateau));
+        }
+        let mask = detect_clip_mask(&samples, ClipDetectParams::for_sample_rate(8_000));
+        let flagged = mask.iter().filter(|&&m| m).count();
+        assert_eq!(
+            flagged, 0,
+            "square-wave plateaus must not be flagged ({flagged} samples were)"
+        );
+    }
+
     #[test]
     fn clipped_plateaus_are_repaired_without_length_change() {
         let mut channels = vec![clipped_plateau_source()];
@@ -736,6 +788,95 @@ mod tests {
         assert!(samples[120..124].iter().all(|sample| sample.is_finite()));
         assert!((samples[120] - samples[119]).abs() < 0.2);
         assert!((samples[123] - samples[124]).abs() < 0.2);
+    }
+
+    /// Deterministic pseudo-noise (LCG) so the test never flakes.
+    fn noisy_two_tone(len: usize) -> Vec<f64> {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        (0..len)
+            .map(|i| {
+                let t = i as f64 / 16_000.0;
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let noise = ((state >> 11) as f64 / (1u64 << 53) as f64) - 0.5;
+                0.30 * (2.0 * PI * 330.0 * t).sin()
+                    + 0.15 * (2.0 * PI * 1234.0 * t).sin()
+                    + 0.005 * noise
+            })
+            .collect()
+    }
+
+    /// Regression: the Burg lattice used to store the updated backward error
+    /// at `t-1` (pairing f_m(t) with b_m(t) instead of b_m(t-1)). On any noisy
+    /// signal the reflection coefficients then locked near the ±0.9999 clamp,
+    /// the predictor diverged, and the gap was filled with a clamped
+    /// rectangular burst far louder than the surrounding audio.
+    #[test]
+    fn burg_coefficients_stay_tame_on_noisy_signal() {
+        let context = noisy_two_tone(1024);
+        let order = RepairParams::for_click().lpc_order;
+        let a = burg_lpc(&context, order);
+        let coeff_l1: f64 = a.iter().map(|c| c.abs()).sum();
+        // Textbook Burg on this signal gives Σ|a| ≈ 2.7; the broken recursion
+        // gave ≈ 5.5e3.
+        assert!(
+            coeff_l1 < 10.0,
+            "Burg polynomial has pathological gain: sum |a| = {coeff_l1}"
+        );
+    }
+
+    #[test]
+    fn ar_repair_stays_near_context_level_on_noisy_signal() {
+        for gap in [4usize, 16, 48] {
+            let mut samples = noisy_two_tone(2048);
+            let start = 1000;
+            let end = start + gap;
+            let context_peak = samples[start - 256..start]
+                .iter()
+                .chain(samples[end..end + 256].iter())
+                .map(|sample| sample.abs())
+                .fold(0.0f64, f64::max);
+            for sample in &mut samples[start..end] {
+                *sample = 0.0;
+            }
+
+            repair_gap_ar(&mut samples, start, end, RepairParams::for_click());
+
+            let repaired_peak = samples[start..end]
+                .iter()
+                .map(|sample| sample.abs())
+                .fold(0.0f64, f64::max);
+            assert!(
+                repaired_peak <= context_peak * 1.5 + 1.0e-6,
+                "gap {gap}: repair peak {repaired_peak} exceeds context peak {context_peak}"
+            );
+            assert!(samples[start..end].iter().all(|sample| sample.is_finite()));
+        }
+    }
+
+    #[test]
+    fn quiet_context_repairs_never_reach_full_scale() {
+        let mut samples: Vec<f64> = noisy_two_tone(1024)
+            .into_iter()
+            .map(|sample| sample * 0.1)
+            .collect();
+        for sample in &mut samples[500..508] {
+            *sample = 0.0;
+        }
+
+        repair_gap_ar(&mut samples, 500, 508, RepairParams::for_click());
+
+        let repaired_peak = samples[500..508]
+            .iter()
+            .map(|sample| sample.abs())
+            .fold(0.0f64, f64::max);
+        // Context peaks near 0.05; the old `max(…, 1.0)` clamp floor allowed
+        // repairs at digital full scale (+26 dB over the surroundings).
+        assert!(
+            repaired_peak < 0.2,
+            "repair peak {repaired_peak} is far above the quiet context"
+        );
     }
 
     #[test]

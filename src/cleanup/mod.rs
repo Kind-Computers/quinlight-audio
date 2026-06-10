@@ -111,9 +111,13 @@ pub(crate) enum RetiredCleanupPreset {
 
 impl RetiredCleanupPreset {
     pub(crate) fn hash_tag(self) -> u8 {
+        // 7/8, NOT 1/2: tags 1-6 belong to the active (mode, engine) pairs.
+        // `Archival` produces different audio from DeclickMedian/V1, so
+        // sharing tag 2 with it relied on the audio bytes also being hashed
+        // to avoid cache collisions — keep the tag space disjoint instead.
         match self {
-            Self::Light => 1,
-            Self::Archival => 2,
+            Self::Light => 7,
+            Self::Archival => 8,
         }
     }
 }
@@ -130,10 +134,19 @@ pub fn apply_cleanup(
     if settings.mode == CleanupMode::Off {
         return Ok(data.to_vec());
     }
-    match settings.engine_version {
-        CleanupEngineVersion::V1 => apply_cleanup_v1(data, sample_rate, channels, settings.mode),
-        CleanupEngineVersion::V21 => apply_cleanup_v21(data, sample_rate, channels, settings.mode),
-    }
+    // De/interleave works in whole frames; pass any trailing partial frame
+    // through untouched so the output length always equals the input length
+    // regardless of mode (Off already returns the full buffer).
+    let aligned_len = (data.len() / channels) * channels;
+    let (aligned, orphan) = data.split_at(aligned_len);
+    let mut out = match settings.engine_version {
+        CleanupEngineVersion::V1 => apply_cleanup_v1(aligned, sample_rate, channels, settings.mode),
+        CleanupEngineVersion::V21 => {
+            apply_cleanup_v21(aligned, sample_rate, channels, settings.mode)
+        }
+    }?;
+    out.extend_from_slice(orphan);
+    Ok(out)
 }
 
 pub(crate) fn apply_retired_cleanup_preset(

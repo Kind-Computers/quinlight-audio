@@ -47,6 +47,13 @@ pub trait UpsampleEngine: Send + Sync {
     #[allow(dead_code)]
     fn output_rate(&self) -> u32;
 
+    /// Whether `ddim_steps` affects this engine's output. Engines that ignore
+    /// the knob return `false`; the cache then keys their entries with 0 so
+    /// changing the setting doesn't needlessly invalidate them.
+    fn uses_ddim_steps(&self) -> bool {
+        false
+    }
+
     /// Maximum number of samples per subprocess invocation.
     fn max_batch_size(&self) -> usize;
 
@@ -108,23 +115,27 @@ pub(crate) static INTEL_GPU_GEN: OnceLock<IntelGpuGen> = OnceLock::new();
 pub(crate) static XPU_VRAM_MB: OnceLock<u64> = OnceLock::new();
 
 pub(crate) fn detect_gpu() -> GpuVendor {
-    if Command::new("nvidia-smi")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    if output_with_timeout(
+        Command::new("nvidia-smi")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        SMI_PROBE_TIMEOUT,
+    )
+    .is_ok_and(|o| o.status.success())
     {
         return GpuVendor::Nvidia;
     }
     if Path::new("/opt/rocm").is_dir() {
         return GpuVendor::Amd;
     }
-    if Command::new("xpu-smi")
-        .arg("discovery")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    if output_with_timeout(
+        Command::new("xpu-smi")
+            .arg("discovery")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        SMI_PROBE_TIMEOUT,
+    )
+    .is_ok_and(|o| o.status.success())
     {
         return GpuVendor::Intel;
     }
@@ -132,6 +143,40 @@ pub(crate) fn detect_gpu() -> GpuVendor {
         return GpuVendor::Intel;
     }
     GpuVendor::None
+}
+
+/// Detected AMD GPU ISA names (e.g. "gfx1100"), parsed once from `rocminfo`.
+/// Empty when rocminfo is unavailable or no agent reports a gfx ISA.
+pub(crate) static AMD_GFX_VERSIONS: OnceLock<Vec<String>> = OnceLock::new();
+
+pub(crate) fn detect_amd_gfx_versions() -> Vec<String> {
+    // rocminfo typically lives only in /opt/rocm/bin, which many ROCm
+    // installs never add to PATH (AMD detection itself checks /opt/rocm, not
+    // PATH). Try PATH first, then the canonical ROCm location, so the gfx11
+    // HSA spoof still engages on those systems.
+    let Some(output) = ["rocminfo", "/opt/rocm/bin/rocminfo"].iter().find_map(|bin| {
+        output_with_timeout(
+            Command::new(bin).stdout(Stdio::piped()).stderr(Stdio::null()),
+            SMI_PROBE_TIMEOUT,
+        )
+        .ok()
+    }) else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut versions: Vec<String> = text
+        .split_whitespace()
+        .filter(|tok| {
+            tok.starts_with("gfx") && tok.len() > 3 && tok[3..].chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        .map(|tok| tok.to_string())
+        .collect();
+    versions.sort();
+    versions.dedup();
+    versions
 }
 
 /// PyTorch device string for the detected GPU vendor.
@@ -430,8 +475,30 @@ pub(crate) fn detect_cpu_isa() -> CpuIsaLevel {
 /// process races for the whole CPU; any throttling policy (nice levels,
 /// affinity) is the caller's job, not this function's.
 pub(crate) fn apply_pytorch_env(cmd: &mut Command, device: &str, cpu_thread_budget: usize) {
+    #[cfg(unix)]
+    {
+        // Each engine gets its own process group so cancellation can
+        // `killpg` the whole tree — Python multiprocessing/dataloader
+        // workers included — not just the immediate child.
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     if device == "cuda" {
-        cmd.env("HSA_OVERRIDE_GFX_VERSION", "11.0.0");
+        // HSA_OVERRIDE_GFX_VERSION=11.0.0 is the well-known spoof that lets
+        // ROCm run on unlisted RDNA3 variants (gfx1101/1102/1103). It is ONLY
+        // valid for the gfx11 family: forcing it on gfx1030/gfx90a/RDNA4
+        // dispatches wrong-arch kernels and every engine run faults — the
+        // silent "GPU never works on AMD" failure. Set it only for detected
+        // AMD gfx11x hardware, and never override a value the user exported.
+        if *GPU_VENDOR.get_or_init(detect_gpu) == GpuVendor::Amd
+            && std::env::var_os("HSA_OVERRIDE_GFX_VERSION").is_none()
+            && AMD_GFX_VERSIONS
+                .get_or_init(detect_amd_gfx_versions)
+                .iter()
+                .any(|v| v.starts_with("gfx11"))
+        {
+            cmd.env("HSA_OVERRIDE_GFX_VERSION", "11.0.0");
+        }
         cmd.env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True");
         cmd.env("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True");
     } else if device == "xpu" {
@@ -465,7 +532,20 @@ pub(crate) fn apply_pytorch_env(cmd: &mut Command, device: &str, cpu_thread_budg
 /// Resolve `~/.local/share/quinlight-audio/`.
 pub fn quinlight_data_dir() -> PathBuf {
     dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
+        // Literal "~" is never expanded by the OS — fall back to a real path.
+        // Key it by uid and create it 0o700: a fixed /tmp name could be
+        // pre-created by another local user, who would then own the venv
+        // tree whose python we execute.
+        .unwrap_or_else(|| {
+            let uid = unsafe { libc::getuid() };
+            let base = PathBuf::from(format!("/tmp/quinlight-home-{uid}"));
+            if !base.exists() {
+                use std::os::unix::fs::DirBuilderExt;
+                let _ = std::fs::DirBuilder::new().mode(0o700).create(&base);
+            }
+            base.join(".local/share")
+        })
         .join("quinlight-audio")
 }
 
@@ -484,6 +564,79 @@ pub(crate) fn venv_python() -> PathBuf {
 /// Logs a one-line diagnostic to stderr on any failure so that an opaque
 /// "no engines found" error message can be traced back to a concrete cause
 /// (missing venv, missing package, broken torch install, etc.).
+/// Run a probe command to completion with a hard timeout, killing it if it
+/// wedges. Detection probes (`python -c "import torch"`, `nvidia-smi`) are
+/// notorious for hanging indefinitely on broken drivers / cold NFS — and they
+/// run before the GUI's first paint, so an unbounded wait hangs startup.
+pub(crate) fn output_with_timeout(
+    cmd: &mut Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    cmd.stdin(Stdio::null());
+    let mut child = cmd.spawn()?;
+    // Drain piped stdout/stderr on background threads while the child runs.
+    // Without this a child emitting more than the pipe buffer (~64 KiB)
+    // blocks on write() until the timeout kills it — e.g. rocminfo on
+    // many-agent machines, or a long Python traceback.
+    let stdout_thread = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_thread = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let join = |t: Option<std::thread::JoinHandle<Vec<u8>>>| {
+        t.and_then(|t| t.join().ok()).unwrap_or_default()
+    };
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The readers hit EOF once the child exits and closes its
+                // pipe ends, so these joins are bounded.
+                return Ok(std::process::Output {
+                    status,
+                    stdout: join(stdout_thread),
+                    stderr: join(stderr_thread),
+                });
+            }
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                join(stdout_thread);
+                join(stderr_thread);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("probe timed out after {}s", timeout.as_secs()),
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => {
+                // Don't leak the child if waiting on it fails.
+                let _ = child.kill();
+                let _ = child.wait();
+                join(stdout_thread);
+                join(stderr_thread);
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Probe timeout for Python imports (torch can be slow on cold caches, but a
+/// wedged driver hangs forever).
+pub(crate) const PYTHON_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Probe timeout for GPU management tools (nvidia-smi hangs on wedged drivers).
+pub(crate) const SMI_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(crate) fn venv_can_import(package: &str) -> bool {
     let python = venv_python();
     if !python.exists() {
@@ -493,16 +646,17 @@ pub(crate) fn venv_can_import(package: &str) -> bool {
         );
         return false;
     }
-    let output = match Command::new(&python)
-        .arg("-c")
-        .arg(format!("import {package}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-    {
+    let output = match output_with_timeout(
+        Command::new(&python)
+            .arg("-c")
+            .arg(format!("import {package}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+        PYTHON_PROBE_TIMEOUT,
+    ) {
         Ok(output) => output,
         Err(e) => {
-            eprintln!("quinlight: failed to spawn venv python for 'import {package}': {e}");
+            eprintln!("quinlight: probe 'import {package}' failed: {e}");
             return false;
         }
     };
@@ -535,28 +689,32 @@ pub(crate) fn venv_has_package(package: &str) -> bool {
     if !python.exists() {
         return false;
     }
-    Command::new(&python)
-        .arg("-c")
-        .arg(format!("import {package}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    output_with_timeout(
+        Command::new(&python)
+            .arg("-c")
+            .arg(format!("import {package}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        PYTHON_PROBE_TIMEOUT,
+    )
+    .is_ok_and(|o| o.status.success())
 }
 
 /// Query the installed version of a pip package in the shared venv.
 /// Returns the version string (e.g. "0.0.7") or None if unavailable.
 pub(crate) fn venv_package_version(package: &str) -> Option<String> {
     let python = venv_python();
-    let output = Command::new(&python)
-        .arg("-c")
-        .arg(format!(
-            "from importlib.metadata import version; print(version('{package}'))"
-        ))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let output = output_with_timeout(
+        Command::new(&python)
+            .arg("-c")
+            .arg(format!(
+                "from importlib.metadata import version; print(version('{package}'))"
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+        PYTHON_PROBE_TIMEOUT,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -570,15 +728,17 @@ pub(crate) fn venv_package_version(package: &str) -> Option<String> {
 
 /// Query the installed version of a pip package using a specific python binary.
 pub(crate) fn package_version_with_python(python: &Path, package: &str) -> Option<String> {
-    let output = Command::new(python)
-        .arg("-c")
-        .arg(format!(
-            "from importlib.metadata import version; print(version('{package}'))"
-        ))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let output = output_with_timeout(
+        Command::new(python)
+            .arg("-c")
+            .arg(format!(
+                "from importlib.metadata import version; print(version('{package}'))"
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+        PYTHON_PROBE_TIMEOUT,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }

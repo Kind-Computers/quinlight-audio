@@ -20,7 +20,7 @@
 //! Long inputs are split into overlapping ~20 s chunks (controlled by
 //! `CHUNK_*` constants) before being handed to the engine pipeline. Each
 //! chunk becomes its own `SampleJob` in the shared batch, and the 48 kHz
-//! engine outputs are equal-power crossfaded back together in
+//! engine outputs are equal-gain crossfaded back together in
 //! `stitch_chunks_48k` before being written as one FLAC per input. The
 //! pipeline's per-sample `target_rms` rescaling keeps levels consistent
 //! across chunks without any extra work here.
@@ -63,10 +63,14 @@ const CHUNK_THRESHOLD_SECS: f64 = 30.0;
 /// Target per-chunk duration when chunking kicks in.
 const CHUNK_DURATION_SECS: f64 = 20.0;
 
-/// Overlap between adjacent chunks, applied as an equal-power crossfade at
-/// 48 kHz during stitch. Long enough to mask stochastic engine-output
-/// differences at the seam, short enough that the extra compute is a
-/// rounding error on full-length jobs.
+/// Overlap between adjacent chunks, applied as an equal-GAIN (linear)
+/// crossfade at 48 kHz during stitch. The two overlap renders are the same
+/// input audio upsampled twice, i.e. highly correlated — an equal-power law
+/// (sin/cos) sums correlated content to +3 dB at mid-fade, and on hot
+/// material the seam bulge then forced a whole-file rescale in the 24-bit
+/// writer. Equal-gain weights sum to exactly 1.0 for correlated signals.
+/// Long enough to mask stochastic engine-output differences at the seam,
+/// short enough that the extra compute is a rounding error.
 const CHUNK_OVERLAP_SECS: f64 = 1.0;
 
 /// Inclusive-exclusive frame range of one chunk at the input sample rate.
@@ -138,8 +142,9 @@ fn plan_chunks(total_frames: usize, input_rate: u32) -> Vec<ChunkRange> {
 
 /// Stitch per-chunk 48 kHz engine outputs into one interleaved buffer.
 /// Each chunk is placed at its input-mapped 48 kHz position and its first
-/// `CHUNK_OVERLAP_SECS` worth of frames are equal-power crossfaded against
-/// the previous chunk's tail. The output length is derived from the
+/// `CHUNK_OVERLAP_SECS` worth of frames are equal-gain (linear) crossfaded
+/// against the previous chunk's tail (see `CHUNK_OVERLAP_SECS` for why not
+/// equal-power). The output length is derived from the
 /// original input frame count so cumulative rounding doesn't drift.
 fn stitch_chunks_48k(
     chunks: &[(ChunkRange, &SampleResult)],
@@ -150,6 +155,10 @@ fn stitch_chunks_48k(
     if chunks.is_empty() || channels == 0 || input_rate == 0 {
         return Vec::new();
     }
+    // NOTE: floor division — multi-chunk output is floor(input·48k/rate)
+    // frames, while the single-chunk path returns the engine's own resampler
+    // length; the two conventions can differ by one frame for the same
+    // duration. Callers treat output length as authoritative per path.
     let to_48k = |n: usize| (n as u64 * 48_000u64 / input_rate as u64) as usize;
     let total_out_frames = to_48k(input_frames);
     let overlap_out_frames = (CHUNK_OVERLAP_SECS * 48_000.0).round() as usize;
@@ -175,13 +184,15 @@ fn stitch_chunks_48k(
 
         let xf = overlap_out_frames.min(writable);
         for f in 0..xf {
+            // Equal-gain (linear) weights: the overlap sources are the same
+            // audio rendered twice (correlated), so weights must sum to 1.0
+            // in amplitude — equal-power summed them to +3 dB at mid-fade.
             let t = (f as f64 + 0.5) / xf as f64;
-            let (sin_t, cos_t) = (t * std::f64::consts::FRAC_PI_2).sin_cos();
             for c in 0..channels {
                 let dst = (pos + f) * channels + c;
                 let prev = out[dst];
                 let curr = data[f * channels + c];
-                out[dst] = prev * cos_t + curr * sin_t;
+                out[dst] = prev * (1.0 - t) + curr * t;
             }
         }
         for f in xf..writable {
@@ -909,10 +920,14 @@ fn write_upsample_flac_24bit(
 }
 
 fn tmp_path_for(path: &Path) -> PathBuf {
+    // PID in the tmp name: two concurrent invocations targeting the same
+    // output must not share (and mutually corrupt) one tmp file. The final
+    // same-directory rename stays atomic.
+    let pid = std::process::id();
     let file_name = path
         .file_name()
-        .map(|n| format!(".{}.tmp", n.to_string_lossy()))
-        .unwrap_or_else(|| ".quinlight.tmp".into());
+        .map(|n| format!(".{}.{pid}.tmp", n.to_string_lossy()))
+        .unwrap_or_else(|| format!(".quinlight.{pid}.tmp"));
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.join(file_name),
         _ => PathBuf::from(file_name),
@@ -1096,13 +1111,14 @@ mod tests {
 
     #[test]
     fn tmp_path_for_preserves_parent_and_prefixes_dot() {
+        let pid = std::process::id();
         assert_eq!(
             tmp_path_for(Path::new("/a/b/out.flac")),
-            PathBuf::from("/a/b/.out.flac.tmp"),
+            PathBuf::from(format!("/a/b/.out.flac.{pid}.tmp")),
         );
         assert_eq!(
             tmp_path_for(Path::new("out.flac")),
-            PathBuf::from(".out.flac.tmp")
+            PathBuf::from(format!(".out.flac.{pid}.tmp"))
         );
     }
 
@@ -1382,10 +1398,10 @@ mod tests {
 
     #[test]
     fn stitch_chunks_48k_overlap_preserves_constant_value() {
-        // Two chunks of constant value 1.0 with overlap — equal-power
-        // crossfade should hold the output at 1.0 throughout the overlap
-        // (cos + sin at matched phases sums to √2 * (cos+sin)/√2 = 1 when
-        // both sources carry the same signal).
+        // Two chunks of constant value 1.0 with overlap — the equal-gain
+        // crossfade weights sum to exactly 1.0 at every overlap sample, so
+        // the output must hold at 1.0 throughout the overlap when both
+        // sources carry the same signal.
         let input_rate = 22_050u32;
         // Two 20 s chunks with 1 s overlap → 39 s total input.
         let first_len = 22_050 * 20;
@@ -1420,21 +1436,21 @@ mod tests {
         ];
         let out = stitch_chunks_48k(&chunks, input_rate, total_frames, 1);
 
-        // Every sample that ends up covered should sit right near 1.0. The
-        // equal-power cross-sum of two identical signals is cos + sin ≤ √2,
-        // but critically >= 1.0 at all points, so set a tight lower bound.
+        // Regression (M5): the overlap sources are the same audio rendered
+        // twice (fully correlated here — both are unit DC). The equal-gain
+        // fade must reproduce EXACTLY 1.0 across the whole overlap; the old
+        // equal-power law bulged to √2 (+3 dB) at mid-fade, which on hot
+        // material forced a whole-file rescale in the 24-bit writer.
         let xf_out = (CHUNK_OVERLAP_SECS * 48_000.0) as usize;
         let xf_start = to_48k(second_start);
         for (i, &s) in out.iter().enumerate() {
             if i < xf_start {
                 assert!((s - 1.0).abs() < 1e-12, "pre-overlap sample {i}: {s}");
             } else if i < xf_start + xf_out {
-                // Equal-power sum of two unit sources: cos(θ) + sin(θ), peak √2 ≈ 1.414.
                 assert!(
-                    (s - 1.0).abs() <= (2.0_f64.sqrt() - 1.0) + 1e-9,
-                    "overlap sample {i}: {s}"
+                    (s - 1.0).abs() < 1e-9,
+                    "overlap sample {i} must stay at unity for correlated sources: {s}"
                 );
-                assert!(s >= 1.0 - 1e-9, "overlap sample dropped below 1.0: {s}");
             }
         }
     }

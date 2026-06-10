@@ -77,6 +77,12 @@ pub fn pearson_correlation_scalar(a: &[f64], b: &[f64]) -> f64 {
     cov / denom
 }
 
+/// NOTE on determinism: the SIMD path uses FMA with unrolled per-lane
+/// accumulators, so results differ from the scalar reference — and across
+/// ISA tiers (AVX-512 / AVX2 / scalar fallback) — by ~1e-12..1e-10. This
+/// score is compared against the 0.9 usable-score floor downstream, so a
+/// sample scoring within ~1e-10 of the floor can pass on one machine and
+/// fail on another. Within one machine, results are deterministic.
 #[inline]
 pub fn pearson_correlation(a: &[f64], b: &[f64]) -> f64 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -211,12 +217,29 @@ pub fn scale_to_i16(samples: &[f32]) -> Vec<i16> {
     scaled.into_iter().map(|sample| sample as i16).collect()
 }
 
+
+/// Quantize one sample to signed 24-bit with round-half-away and clamping.
+/// Out-of-range input must CLAMP, not wrap: taking the low 3 bytes of an
+/// unclamped i32 polarity-inverts anything past full scale (e.g. +1.5 used
+/// to decode as -0.5). Truncation is also replaced by rounding to match the
+/// FLAC writer's convention. NaN quantizes to 0.
+#[inline]
+fn quantize_i24(scaled: f64) -> [u8; 4] {
+    const MAX_24: f64 = 8_388_607.0;
+    const MIN_24: f64 = -8_388_608.0;
+    // `clamp` propagates NaN and `NaN as i32` is 0 — NaN becomes silence.
+    let v = scaled.round().clamp(MIN_24, MAX_24);
+    (v as i32).to_le_bytes()
+}
+
 #[allow(dead_code)]
 #[inline]
 pub fn scale_to_i24le_bytes_scalar(samples: &[f32]) -> Vec<u8> {
     let mut pcm_bytes = Vec::with_capacity(samples.len() * 3);
     for &sample in samples {
-        let bytes = ((sample * 8_388_607.0) as i32).to_le_bytes();
+        // f32 multiply (not f64) so the product bit-matches the dispatched
+        // path, which scales via the f32 SIMD kernel before quantizing.
+        let bytes = quantize_i24((sample * 8_388_607.0f32) as f64);
         pcm_bytes.extend_from_slice(&bytes[..3]);
     }
     pcm_bytes
@@ -230,7 +253,7 @@ pub fn scale_to_i24le_bytes(samples: &[f32]) -> Vec<u8> {
 
     let mut pcm_bytes = Vec::with_capacity(scaled.len() * 3);
     for sample in scaled {
-        let bytes = (sample as i32).to_le_bytes();
+        let bytes = quantize_i24(sample as f64);
         pcm_bytes.extend_from_slice(&bytes[..3]);
     }
     pcm_bytes
@@ -560,25 +583,34 @@ impl WithSimd for RmsF32<'_> {
 
         let (head, tail) = S::as_simd_f32s(data);
         let (head4, head1) = pulp::as_arrays::<4, _>(head);
-        let mut acc0 = simd.splat_f32s(0.0);
-        let mut acc1 = simd.splat_f32s(0.0);
-        let mut acc2 = simd.splat_f32s(0.0);
-        let mut acc3 = simd.splat_f32s(0.0);
 
-        for &[x0, x1, x2, x3] in head4 {
-            acc0 = simd.mul_add_f32s(x0, x0, acc0);
-            acc1 = simd.mul_add_f32s(x1, x1, acc1);
-            acc2 = simd.mul_add_f32s(x2, x2, acc2);
-            acc3 = simd.mul_add_f32s(x3, x3, acc3);
+        // Reduce to an f64 running sum per block so f32 accumulator error
+        // stays bounded for arbitrarily long buffers — the scalar reference
+        // accumulates squares in f64 throughout, and multi-minute buffers
+        // exceeded the parity tolerance with pure-f32 accumulation.
+        let mut sum = 0.0f64;
+        for block in head4.chunks(1024) {
+            let mut acc0 = simd.splat_f32s(0.0);
+            let mut acc1 = simd.splat_f32s(0.0);
+            let mut acc2 = simd.splat_f32s(0.0);
+            let mut acc3 = simd.splat_f32s(0.0);
+            for &[x0, x1, x2, x3] in block {
+                acc0 = simd.mul_add_f32s(x0, x0, acc0);
+                acc1 = simd.mul_add_f32s(x1, x1, acc1);
+                acc2 = simd.mul_add_f32s(x2, x2, acc2);
+                acc3 = simd.mul_add_f32s(x3, x3, acc3);
+            }
+            acc0 = simd.add_f32s(acc0, acc1);
+            acc2 = simd.add_f32s(acc2, acc3);
+            sum += simd.reduce_sum_f32s(simd.add_f32s(acc0, acc2)) as f64;
         }
-
-        for &x in head1 {
-            acc0 = simd.mul_add_f32s(x, x, acc0);
+        {
+            let mut acc = simd.splat_f32s(0.0);
+            for &x in head1 {
+                acc = simd.mul_add_f32s(x, x, acc);
+            }
+            sum += simd.reduce_sum_f32s(acc) as f64;
         }
-
-        acc0 = simd.add_f32s(acc0, acc1);
-        acc2 = simd.add_f32s(acc2, acc3);
-        let mut sum = simd.reduce_sum_f32s(simd.add_f32s(acc0, acc2)) as f64;
         for &sample in tail {
             sum += (sample as f64) * (sample as f64);
         }
@@ -1056,7 +1088,7 @@ pub fn interleave_stereo_f64(left: &[f64], right: &[f64]) -> Vec<f64> {
 pub fn scale_to_i24le_bytes_f64_scalar(samples: &[f64]) -> Vec<u8> {
     let mut pcm_bytes = Vec::with_capacity(samples.len() * 3);
     for &sample in samples {
-        let bytes = ((sample * 8_388_607.0) as i32).to_le_bytes();
+        let bytes = quantize_i24(sample * 8_388_607.0);
         pcm_bytes.extend_from_slice(&bytes[..3]);
     }
     pcm_bytes
@@ -1067,7 +1099,7 @@ pub fn scale_to_i24le_bytes_f64_scalar(samples: &[f64]) -> Vec<u8> {
 pub fn scale_to_i24le_bytes_f64(samples: &[f64]) -> Vec<u8> {
     let mut pcm_bytes = Vec::with_capacity(samples.len() * 3);
     for &sample in samples {
-        let bytes = ((sample * 8_388_607.0) as i32).to_le_bytes();
+        let bytes = quantize_i24(sample * 8_388_607.0);
         pcm_bytes.extend_from_slice(&bytes[..3]);
     }
     pcm_bytes
@@ -1409,6 +1441,105 @@ mod tests {
             Arch::V3(simd) => Some(simd),
             _ => None,
         }
+    }
+
+    fn test_signal_f64(len: usize) -> Vec<f64> {
+        (0..len)
+            .map(|i| ((i as f64 * 0.13).sin() * 0.7) + ((i as f64 * 0.031).cos() * 0.2))
+            .collect()
+    }
+
+    /// Parity for the f64 kernels production actually calls (the f32 set is
+    /// retained as reference only). Lengths chosen to exercise vector tails,
+    /// sub-vector buffers, and empty input.
+    #[test]
+    fn f64_kernels_dispatch_matches_scalar() {
+        for len in [0usize, 1, 3, 7, 64, 129, 4_111, 65_537] {
+            let data = test_signal_f64(len);
+
+            assert!(
+                (rms_f64(&data) - rms_f64_scalar(&data)).abs() <= REDUCTION_EPSILON,
+                "rms_f64 parity at len {len}"
+            );
+            assert!(
+                (peak_abs_f64(&data) - peak_abs_f64_scalar(&data)).abs() <= REDUCTION_EPSILON,
+                "peak_abs_f64 parity at len {len}"
+            );
+            assert!(
+                (sum_f64(&data) - sum_f64_dispatch_scalar(&data)).abs() <= REDUCTION_EPSILON,
+                "sum_f64 parity at len {len}"
+            );
+
+            let mut a = data.clone();
+            let mut b = data.clone();
+            scale_in_place_f64(&mut a, 0.731);
+            scale_in_place_f64_scalar(&mut b, 0.731);
+            assert_eq!(a, b, "scale_in_place_f64 parity at len {len}");
+
+            let mut a = data.clone();
+            let mut b = data.clone();
+            subtract_in_place_f64(&mut a, 0.0173);
+            subtract_in_place_f64_scalar(&mut b, 0.0173);
+            assert_eq!(a, b, "subtract_in_place_f64 parity at len {len}");
+
+            let other = test_signal_f64(len);
+            let mut a = data.clone();
+            let mut b = data.clone();
+            add_in_place_f64(&mut a, &other);
+            add_in_place_f64_scalar(&mut b, &other);
+            assert_eq!(a, b, "add_in_place_f64 parity at len {len}");
+        }
+    }
+
+    #[test]
+    fn f64_stereo_kernels_dispatch_matches_scalar() {
+        for frames in [0usize, 1, 3, 64, 129, 2_049] {
+            let interleaved = test_signal_f64(frames * 2);
+            let (l_d, r_d) = deinterleave_stereo_f64(&interleaved);
+            let (l_s, r_s) = deinterleave_stereo_f64_scalar(&interleaved);
+            assert_eq!(l_d, l_s, "deinterleave L parity at {frames} frames");
+            assert_eq!(r_d, r_s, "deinterleave R parity at {frames} frames");
+
+            assert_eq!(
+                interleave_stereo_f64(&l_d, &r_d),
+                interleave_stereo_f64_scalar(&l_s, &r_s),
+                "interleave parity at {frames} frames"
+            );
+            // Round trip is exact.
+            assert_eq!(interleave_stereo_f64(&l_d, &r_d), interleaved);
+
+            // Odd total length: both paths drop the dangling half-frame.
+            let mut odd = interleaved.clone();
+            odd.push(0.25);
+            let (l_o, r_o) = deinterleave_stereo_f64(&odd);
+            let (l_os, r_os) = deinterleave_stereo_f64_scalar(&odd);
+            assert_eq!(l_o, l_os);
+            assert_eq!(r_o, r_os);
+            assert_eq!(l_o.len(), frames);
+        }
+    }
+
+    /// Regression: out-of-range samples used to WRAP in the 24-bit packers
+    /// (+1.5 encoded as bytes that decode to -0.5 — full polarity inversion).
+    /// They must clamp, and rounding must match the FLAC writer's `.round()`.
+    #[test]
+    fn i24_quantizers_clamp_and_round() {
+        let hot = [0.0f64, 0.5, 1.0, 1.5, -1.0, -1.5, 2.0e9, -2.0e9, f64::NAN];
+        let bytes = scale_to_i24le_bytes_f64(&hot);
+        let decoded = scale_from_i24le_bytes_f64(&bytes);
+        let max_24 = 8_388_607.0 / 8_388_608.0; // +1.0 clamps to MAX_24/2^23
+        let expect = [0.0f64, 0.5, max_24, max_24, -1.0, -1.0, max_24, -1.0, 0.0];
+        for (i, (&got, &want)) in decoded.iter().zip(expect.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "i24 sample {i}: got {got}, want {want} (input {})",
+                hot[i]
+            );
+        }
+        // f32 variants share the same quantizer.
+        let hot32: Vec<f32> = hot.iter().map(|&x| x as f32).collect();
+        assert_eq!(scale_to_i24le_bytes_scalar(&hot32), bytes);
+        assert_eq!(scale_to_i24le_bytes(&hot32), bytes);
     }
 
     #[test]

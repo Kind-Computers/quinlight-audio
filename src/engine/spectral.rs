@@ -23,13 +23,40 @@ fn deinterleave_channels(data: &[f64], channels: usize) -> Vec<Vec<f64>> {
     separated
 }
 
+/// Peak threshold below which a channel counts as digitally silent for
+/// scoring purposes.
+const SILENT_CHANNEL_PEAK: f64 = 1e-9;
+
+/// True when both sides of a channel pair are digitally silent — a degenerate
+/// but perfectly *matching* pair. Correlation is undefined there (zero
+/// variance), and scoring it 0.0 would wrongly cap a stereo sample with one
+/// silent channel at 0.5 forever (it could never pass the 0.9 gate no matter
+/// how good the engines are). Such channels are neutral: skipped from the
+/// average. One-sided silence is a genuine mismatch and still scores 0.0.
+fn channel_pair_is_neutral(reference: &[f64], candidate: &[f64]) -> bool {
+    let peak = |s: &[f64]| s.iter().fold(0.0f64, |a, &x| a.max(x.abs()));
+    peak(reference) < SILENT_CHANNEL_PEAK && peak(candidate) < SILENT_CHANNEL_PEAK
+}
+
+/// Average per-channel scores, skipping neutral (both-silent) pairs. All
+/// channels neutral means a silent sample reproduced exactly: a perfect match.
+fn average_channel_scores(scores: &[Option<f64>]) -> f64 {
+    let live: Vec<f64> = scores.iter().copied().flatten().collect();
+    if live.is_empty() {
+        return 1.0;
+    }
+    live.iter().sum::<f64>() / live.len() as f64
+}
+
 /// Compute the Pearson correlation of magnitude spectra between a reference
 /// signal and a candidate, restricted to frequency bins below the original
 /// sample's Nyquist frequency.
 ///
 /// Both signals must be at 48kHz. For stereo, each channel is scored
 /// independently against the matching reference channel and the final score is
-/// the arithmetic mean of the per-channel correlations.
+/// the arithmetic mean of the per-channel correlations; channel pairs that are
+/// silent on BOTH sides are neutral and excluded from the mean (see
+/// [`channel_pair_is_neutral`]).
 ///
 /// Returns a value in [-1.0, 1.0] where higher means the candidate better
 /// preserves the original spectral content.
@@ -40,16 +67,29 @@ pub fn spectral_correlation(
     original_rate: u32,
 ) -> f64 {
     if channels <= 1 {
+        if channel_pair_is_neutral(reference, candidate) {
+            return 1.0;
+        }
         return spectral_correlation_channel(reference, candidate, original_rate);
     }
 
-    let channel_scores: Vec<f64> = deinterleave_channels(reference, channels)
+    let channel_scores: Vec<Option<f64>> = deinterleave_channels(reference, channels)
         .into_iter()
         .zip(deinterleave_channels(candidate, channels))
-        .map(|(ref_ch, cand_ch)| spectral_correlation_channel(&ref_ch, &cand_ch, original_rate))
+        .map(|(ref_ch, cand_ch)| {
+            if channel_pair_is_neutral(&ref_ch, &cand_ch) {
+                None
+            } else {
+                Some(spectral_correlation_channel(
+                    &ref_ch,
+                    &cand_ch,
+                    original_rate,
+                ))
+            }
+        })
         .collect();
 
-    channel_scores.iter().sum::<f64>() / channel_scores.len() as f64
+    average_channel_scores(&channel_scores)
 }
 
 fn spectral_correlation_channel(reference: &[f64], candidate: &[f64], original_rate: u32) -> f64 {
@@ -173,7 +213,6 @@ pub fn per_band_energy_ratio(
 
 const INTERSECTION_FFT_SIZE: usize = 2048;
 const INTERSECTION_HOP: usize = 512; // 75% overlap
-const INTERSECTION_SOFTMIN_TAU_DB: f64 = 3.0;
 const INTERSECTION_SOFTMIN_EPS: f64 = 1e-12;
 const STFT_REFERENCE_RATE_HZ: u32 = 48_000;
 
@@ -221,26 +260,6 @@ fn time_equivalent_stft_config(sample_rate_hz: u32) -> Option<StftConfig> {
         hop,
         sample_rate_hz,
     })
-}
-
-fn softmin_magnitude(magnitudes: &[f64], tau_db: f64) -> f64 {
-    if magnitudes.is_empty() {
-        return 0.0;
-    }
-    if magnitudes.len() == 1 {
-        return magnitudes[0].max(INTERSECTION_SOFTMIN_EPS);
-    }
-
-    let min_db = magnitudes
-        .iter()
-        .map(|&mag| magnitude_to_db(mag))
-        .fold(f64::INFINITY, f64::min);
-    let weight = 1.0 / magnitudes.len() as f64;
-    let weighted_exp_sum = magnitudes
-        .iter()
-        .map(|&mag| weight * (-(magnitude_to_db(mag) - min_db) / tau_db).exp())
-        .sum::<f64>();
-    db_to_magnitude(min_db - tau_db * weighted_exp_sum.max(INTERSECTION_SOFTMIN_EPS).ln())
 }
 
 fn stft(signal: &[f64], fft_size: usize, hop: usize, window: &[f64]) -> Vec<Vec<Complex<f64>>> {
@@ -304,11 +323,22 @@ fn pad_for_stft(signal: &[f64], looped: bool, pad: usize) -> Vec<f64> {
         return signal.to_vec();
     }
     let mut padded = Vec::with_capacity(signal.len() + 2 * pad);
-    if looped && signal.len() >= pad {
-        // Wrap: prepend tail, append head — STFT sees loop continuity
-        padded.extend_from_slice(&signal[signal.len() - pad..]);
+    if looped {
+        // Wrap circularly: prepend tail, append head — the STFT sees loop
+        // continuity. Index arithmetic (rem_euclid) instead of slicing so
+        // loops SHORTER than one pad/FFT frame — classic chip loops, the most
+        // audibly-looped material there is — tile around as many times as
+        // needed rather than silently falling back to reflection (which put a
+        // mirror discontinuity exactly at the loop seam).
+        let n = signal.len() as isize;
+        for i in 0..pad {
+            let idx = (i as isize - pad as isize).rem_euclid(n) as usize;
+            padded.push(signal[idx]);
+        }
         padded.extend_from_slice(signal);
-        padded.extend_from_slice(&signal[..pad]);
+        for i in 0..pad {
+            padded.push(signal[i % signal.len()]);
+        }
     } else {
         // Reflect at boundaries for non-looped or short signals
         for i in 0..pad {
@@ -446,6 +476,9 @@ pub(crate) fn spectral_correlation_across_rates(
     looped: bool,
 ) -> f64 {
     if channels <= 1 {
+        if channel_pair_is_neutral(reference, candidate) {
+            return 1.0;
+        }
         return spectral_correlation_across_rates_channel(
             reference,
             reference_rate_hz,
@@ -455,21 +488,25 @@ pub(crate) fn spectral_correlation_across_rates(
         );
     }
 
-    let channel_scores: Vec<f64> = deinterleave_channels(reference, channels)
+    let channel_scores: Vec<Option<f64>> = deinterleave_channels(reference, channels)
         .into_iter()
         .zip(deinterleave_channels(candidate, channels))
         .map(|(ref_ch, cand_ch)| {
-            spectral_correlation_across_rates_channel(
-                &ref_ch,
-                reference_rate_hz,
-                &cand_ch,
-                candidate_rate_hz,
-                looped,
-            )
+            if channel_pair_is_neutral(&ref_ch, &cand_ch) {
+                None
+            } else {
+                Some(spectral_correlation_across_rates_channel(
+                    &ref_ch,
+                    reference_rate_hz,
+                    &cand_ch,
+                    candidate_rate_hz,
+                    looped,
+                ))
+            }
         })
         .collect();
 
-    channel_scores.iter().sum::<f64>() / channel_scores.len() as f64
+    average_channel_scores(&channel_scores)
 }
 
 fn spectral_correlation_across_rates_channel(
@@ -692,7 +729,9 @@ pub fn spectral_intersection(engine_signals: &[&[f64]], looped: bool) -> Vec<f64
 
     let output_len = engine_signals.iter().map(|s| s.len()).min().unwrap_or(0);
     if output_len < 4 {
-        return vec![0.0; output_len];
+        // Too short for any spectral analysis: pass the first engine through
+        // rather than destructively forcing silence.
+        return engine_signals[0][..output_len].to_vec();
     }
 
     let pad = INTERSECTION_FFT_SIZE;
@@ -832,6 +871,83 @@ mod tests {
 
     fn rms(signal: &[f64]) -> f64 {
         (signal.iter().map(|x| x * x).sum::<f64>() / signal.len() as f64).sqrt()
+    }
+
+    /// Regression: a stereo sample with one digitally-silent channel used to
+    /// score 0.0 on that channel even when the candidate matched exactly,
+    /// capping the mean at 0.5 — below the 0.9 gate forever. Both-silent
+    /// channel pairs are neutral (skipped); one-sided silence still fails.
+    #[test]
+    fn silent_channel_pair_is_neutral_not_zero() {
+        let frames = 4096;
+        let left = tone(48_000, frames, 1000.0, 0.5, 0.0);
+        // Interleave: left = tone, right = silence, candidate identical.
+        let mut stereo = Vec::with_capacity(frames * 2);
+        for &l in &left {
+            stereo.push(l);
+            stereo.push(0.0);
+        }
+        let score = spectral_correlation(&stereo, &stereo, 2, 22_050);
+        assert!(
+            score > 0.95,
+            "identical stereo with a silent channel must score ~1.0, got {score}"
+        );
+
+        let score_xrate =
+            spectral_correlation_across_rates(&stereo, 22_050, &stereo, 22_050, 2, false);
+        assert!(
+            score_xrate > 0.95,
+            "cross-rate path must also treat both-silent channels as neutral, got {score_xrate}"
+        );
+
+        // One-sided silence is a genuine mismatch: candidate puts noise on
+        // the silent channel.
+        let mut noisy = stereo.clone();
+        for frame in 0..frames {
+            noisy[frame * 2 + 1] = if frame % 2 == 0 { 0.1 } else { -0.1 };
+        }
+        let score_mismatch = spectral_correlation(&stereo, &noisy, 2, 22_050);
+        assert!(
+            score_mismatch < 0.9,
+            "noise on a silent reference channel must drag the score down, got {score_mismatch}"
+        );
+
+        // Fully silent sample reproduced exactly: perfect match by definition.
+        let silence = vec![0.0f64; frames * 2];
+        assert_eq!(spectral_correlation(&silence, &silence, 2, 22_050), 1.0);
+    }
+
+    /// Regression: looped signals shorter than one pad length used to fall
+    /// back to reflect padding — a mirror discontinuity exactly at the loop
+    /// seam, defeating the `looped` flag for classic short chip loops.
+    #[test]
+    fn pad_for_stft_wraps_circularly_for_loops_shorter_than_pad() {
+        let signal: Vec<f64> = (0..8).map(|i| i as f64).collect();
+        let pad = 32usize;
+        let padded = pad_for_stft(&signal, true, pad);
+        assert_eq!(padded.len(), signal.len() + 2 * pad);
+        // Every padded sample must equal the circular extension of the loop.
+        for (k, &x) in padded.iter().enumerate() {
+            let idx = (k as isize - pad as isize).rem_euclid(signal.len() as isize) as usize;
+            assert_eq!(
+                x, signal[idx],
+                "padded[{k}] must wrap circularly, got {x} expected {}",
+                signal[idx]
+            );
+        }
+    }
+
+    /// The long-loop wrap behavior is unchanged by the short-loop fix.
+    #[test]
+    fn pad_for_stft_long_loop_matches_slice_wrap() {
+        let signal: Vec<f64> = (0..100).map(|i| (i as f64 * 0.3).sin()).collect();
+        let pad = 16usize;
+        let padded = pad_for_stft(&signal, true, pad);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&signal[signal.len() - pad..]);
+        expected.extend_from_slice(&signal);
+        expected.extend_from_slice(&signal[..pad]);
+        assert_eq!(padded, expected);
     }
 
     fn tone(
@@ -1116,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn intersection_softmin_lifts_conservative_engine_without_matching_strongest() {
+    fn intersection_geomean_lifts_conservative_engine_without_matching_strongest() {
         let n = 8192;
         let sr = 48000.0;
         let freq = 440.0;
@@ -1193,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn intersection_softmin_rejects_hallucinated_frequency_better_than_mean_blend() {
+    fn intersection_geomean_rejects_hallucinated_frequency_better_than_mean_blend() {
         let n = 8192;
         let sr = 48000.0;
         let shared_freq = 440.0;
