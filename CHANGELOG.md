@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All module samples normalized to ≥48 kHz (sinc) at interactive load time
 - Default stereo separation narrowed to 33% for headphone listening
 - GitHub Sponsors link in the README and a `.github/FUNDING.yml`
+- README note that the multi-engine AI consensus algorithm is U.S. Patent Pending
 
 ### Changed
 - **Upgraded audio output from SDL2 to SDL3** (the `sdl3` crate). The playback
