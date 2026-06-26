@@ -1,0 +1,84 @@
+Quinlight Audio
+Copyright (c) 2026 Kind Computers, LLC.
+
+This product is licensed under the MIT License (see LICENSE). It bundles and/or
+builds against the third-party components listed below, which are NOT covered by
+the Kind Computers MIT grant and remain under their own licenses and copyrights.
+
+================================================================================
+OpenMPT / libopenmpt  (vendored under openmpt/)
+--------------------------------------------------------------------------------
+License: BSD-3-Clause  —  full text: openmpt/LICENSE
+
+    Copyright (c) 2004-2025, OpenMPT Project Developers and Contributors
+    Copyright (c) 1997-2003, Olivier Lapicque
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the conditions of the BSD
+    3-Clause license in openmpt/LICENSE are met. THIS SOFTWARE IS PROVIDED BY
+    THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
+    WARRANTIES ARE DISCLAIMED. See openmpt/LICENSE for the complete text.
+
+Upstream: https://lib.openmpt.org/
+
+NOTE: The OpenMPT source tree also includes third-party code under openmpt/include/
+and openmpt/contrib/ (e.g. UnRAR, Crypto++, mbedTLS) carrying their own — and in
+the case of UnRAR, restrictive, non-OSI — licenses. See the license file within
+each respective subdirectory.
+
+================================================================================
+flac-codec  (vendored under flac-codec/)
+--------------------------------------------------------------------------------
+License: MIT OR Apache-2.0  —  full text: flac-codec/LICENSE-MIT, flac-codec/LICENSE-APACHE
+
+    Copyright 2025 Brian Langenberger <bjl@usa.net>
+
+Upstream: https://github.com/tuffy/flac-codec
+
+================================================================================
+SADIE II Database — HRIR/SOFA datasets  (vendored under HRTF/D1_HRIR_SOFA/)
+--------------------------------------------------------------------------------
+License: Apache-2.0  —  full text: HRTF/LICENSE-APACHE-2.0  (see HRTF/NOTICE)
+
+    AudioLab, University of York, & Kearney, G. C. (2024). SADIE II Database
+    [Data set]. https://doi.org/10.5281/zenodo.10886409
+
+================================================================================
+Optional AI remastering engines (NOT bundled; installed separately)
+--------------------------------------------------------------------------------
+AudioSR, LavaSR, FLowHigh (resemble-ai/flowhigh, arXiv:2501.04926), and AP-BWE
+are downloaded and run as external dependencies, each under its own license and
+with its own model weights. Quinlight Audio does not redistribute these engines
+or their weights. Review each engine's license before use. See README.md and
+install_prerequisites.sh.
+
+================================================================================
+Demo tracker modules  (in mods/ and the 96 kHz audio bundle)
+--------------------------------------------------------------------------------
+The demo modules, and the rendered/remastered audio derived from them, are NOT
+covered by the Kind Computers MIT grant. Each is redistributed under its own
+license — Public Domain or Creative Commons Attribution 4.0 (CC-BY) — and was
+sourced from The Mod Archive (https://modarchive.org). The CC-BY modules are
+used under the Attribution license, with credit given below and in README.md.
+
+  Title                       Artist                    License         Mod Archive ID
+  --------------------------  ------------------------  --------------  --------------
+  Wild Perspective            m0d                       Public Domain   53329
+  Silicon Dancer              Drozerix                  Public Domain   209692
+  Stars (4ch)                 cs127                     CC-BY           201917
+  Kłopoty z Czasem            JAM                       Public Domain   176492
+  Haunted Occult Mans         JAM                       Public Domain   177399
+  Digital Rendezvous          Drozerix                  Public Domain   180821
+  module76                    K. Jose                   CC-BY           176443
+  Satisfacción                K. Jose                   CC-BY           192015
+  The Drunken Monkey          christofori               Public Domain   41544
+  NUEVE                       Djego Flochs              CC-BY           210252
+
+CC-BY 4.0 license: https://creativecommons.org/licenses/by/4.0/
+Each module's source page: https://modarchive.org/index.php?request=view_by_moduleid&query=<ID>
+
+Additionally, tests/fixtures/ contains two CC-BY modules used only by the test
+suite (not shipped as demos), likewise from The Mod Archive:
+  Moving On                   cs127                     CC-BY           205769
+  In This World (feat. SYNX)  fuzion_mixer & Platonist  CC-BY           210996

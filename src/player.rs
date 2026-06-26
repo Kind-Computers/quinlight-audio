@@ -2,11 +2,10 @@
 // Copyright (c) 2026 Kind Computers, LLC.
 
 use crossbeam_channel::{Receiver, Sender};
-use sdl2::audio::{AudioCallback, AudioSpecDesired};
+use sdl3::audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream, AudioStreamWithCallback};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use crate::openmpt::{
     AgcProfile, DEFAULT_AGC_ENABLED, DEFAULT_AGC_PROFILE, DEFAULT_INTERPOLATION_FILTER_LENGTH,
@@ -15,9 +14,11 @@ use crate::openmpt::{
 
 const DEFAULT_PLAYBACK_RATE: u32 = 48_000;
 const PREFERRED_PLAYBACK_RATES: &[u32] = &[96_000, 88_200, 48_000, 44_100];
-const DEFAULT_BUFFER_FRAMES: u32 = 1024;
-/// Maximum buffer size for auto-growth (16384 frames ≈ 341ms at 48kHz).
-const MAX_BUFFER_FRAMES: u32 = 16384;
+/// Frames rendered per SDL3 callback chunk. The push-based callback loops in
+/// slices this size so each `render_audio_f64` / HRTF `process` call stays
+/// within the HRTF processor's input ceiling regardless of how large a block
+/// SDL3 requests at once.
+const CALLBACK_CHUNK_FRAMES: usize = 1024;
 const OSCILLOSCOPE_BUFFER_SAMPLES: usize = 8192;
 
 #[derive(Debug, Clone)]
@@ -605,77 +606,73 @@ struct SdlAudioCallback {
     state: Arc<Mutex<PlayerState>>,
     command_rx: Arc<Receiver<PlayerCommand>>,
     waveform: Arc<Mutex<Vec<f64>>>,
-    underrun_flag: Arc<AtomicBool>,
-    last_callback_nanos: Arc<AtomicU64>,
-    epoch: Instant,
     rate: i32,
     render_buffer: Vec<f64>,
+    scratch_f32: Vec<f32>,
 }
 
-impl AudioCallback for SdlAudioCallback {
-    type Channel = f32;
-
-    fn callback(&mut self, out: &mut [f32]) {
-        if self.render_buffer.len() != out.len() {
-            self.render_buffer.resize(out.len(), 0.0);
+impl AudioCallback<f32> for SdlAudioCallback {
+    fn callback(&mut self, stream: &mut AudioStream, requested: i32) {
+        // `requested` is the total interleaved f32 sample count SDL3 wants. Feed
+        // it in fixed CHUNK-sized slices so each render / HRTF pass stays within
+        // the HRTF input ceiling no matter how large a block SDL3 asks for.
+        const CHUNK: usize = CALLBACK_CHUNK_FRAMES * 2;
+        if self.render_buffer.len() != CHUNK {
+            self.render_buffer.resize(CHUNK, 0.0);
         }
-        check_underrun(
-            out.len(),
-            self.rate,
-            &self.epoch,
-            &self.last_callback_nanos,
-            &self.underrun_flag,
-        );
-        render_audio_f64(
-            &mut self.render_buffer,
-            &self.inner,
-            &self.state,
-            &self.command_rx,
-            &self.waveform,
-            self.rate,
-        );
-        copy_f64_to_f32_output(out, &self.render_buffer);
+        if self.scratch_f32.len() != CHUNK {
+            self.scratch_f32.resize(CHUNK, 0.0);
+        }
+        let mut remaining = requested.max(0) as usize;
+        // Keep every slice frame-aligned (even = whole stereo frames). SDL3
+        // requests are frame-aligned in practice, so `remaining` stays even and
+        // this masking is a no-op; it only guards a pathological odd request,
+        // which would otherwise split a frame and swap L/R for the rest of
+        // playback. A trailing odd sample (can't happen normally) is left
+        // undelivered rather than desyncing the stream.
+        while remaining >= 2 {
+            let n = remaining.min(CHUNK) & !1;
+            let render = &mut self.render_buffer[..n];
+            render_audio_f64(
+                render,
+                &self.inner,
+                &self.state,
+                &self.command_rx,
+                &self.waveform,
+                self.rate,
+            );
+            copy_f64_to_f32_output(&mut self.scratch_f32[..n], render);
+            let _ = stream.put_data_f32(&self.scratch_f32[..n]);
+            remaining -= n;
+        }
     }
 }
 
 struct MainThreadSdl {
-    _context: sdl2::Sdl,
-    audio: sdl2::AudioSubsystem,
+    _context: sdl3::Sdl,
+    // Held to keep the audio subsystem initialized for the Player's lifetime;
+    // not read after the stream is opened in `Player::new`.
+    _audio: sdl3::AudioSubsystem,
 }
 
-// SAFETY: `sdl2::Sdl` and `AudioSubsystem` are `!Send`/`!Sync` because SDL
+// SAFETY: `sdl3::Sdl` and `AudioSubsystem` are `!Send`/`!Sync` because SDL
 // internally requires most calls happen on the thread that called `SDL_Init`.
-// Player is constructed on the main thread (in `Player::new()`), and the only
-// method that touches `self.sdl` after construction is `check_and_grow_buffer()`
-// / `try_build_and_play()`, called exclusively from the iced `Message::Tick`
-// handler — also the main thread.  The `audio_device` field (which lives
-// outside this wrapper) is `Send`+`Sync` on its own and is safe to drop from
-// any thread.
+// Player is constructed on the main thread (in `Player::new()`), and nothing
+// touches `self.sdl` after construction — the playback stream is opened once
+// and lives for the Player's lifetime, so the subsystem is never used across
+// threads.
 unsafe impl Send for MainThreadSdl {}
 unsafe impl Sync for MainThreadSdl {}
 
-/// Check for buffer underrun by comparing the gap between consecutive callback
-/// invocations against the expected buffer duration.  Sets `underrun_flag` when
-/// the gap exceeds 2× the buffer duration (generous to avoid false positives).
-fn check_underrun(
-    sample_count: usize,
-    rate: i32,
-    epoch: &Instant,
-    last_callback_nanos: &AtomicU64,
-    underrun_flag: &AtomicBool,
-) {
-    let now_nanos = Instant::now().duration_since(*epoch).as_nanos() as u64;
-    let prev = last_callback_nanos.swap(now_nanos, Ordering::Relaxed);
-    if prev == 0 {
-        return; // first call — no previous timestamp to compare
-    }
-    let elapsed_nanos = now_nanos.saturating_sub(prev);
-    let frames = sample_count / 2; // stereo
-    let expected_nanos = (frames as u64) * 1_000_000_000 / (rate as u64);
-    if elapsed_nanos > expected_nanos * 2 {
-        underrun_flag.store(true, Ordering::Relaxed);
-    }
-}
+/// Owns the live SDL3 playback stream and its boxed callback.
+/// `AudioStreamWithCallback` holds a raw `*mut c_void` to the callback box, so
+/// it is `!Send`/`!Sync`; this newtype asserts the same invariant as
+/// `MainThreadSdl`. The stream is created only in `Player::new()` (main thread)
+/// and dropped when the Player is dropped; the audio callback runs on SDL's own
+/// audio thread and never touches this handle directly.
+struct AudioDeviceHandle(#[allow(dead_code)] AudioStreamWithCallback<SdlAudioCallback>);
+unsafe impl Send for AudioDeviceHandle {}
+unsafe impl Sync for AudioDeviceHandle {}
 
 pub struct Player {
     inner: Arc<Mutex<PlayerInner>>,
@@ -684,11 +681,14 @@ pub struct Player {
     state: Arc<Mutex<PlayerState>>,
     waveform: Arc<Mutex<Vec<f64>>>,
     sdl: Option<MainThreadSdl>,
-    audio_device: Mutex<Option<sdl2::audio::AudioDevice<SdlAudioCallback>>>,
+    // Owns the live SDL3 playback stream (and its audio callback) for the
+    // Player's lifetime. Never read after construction — held so playback keeps
+    // running until the Player is dropped. `None` for the dummy (no-audio)
+    // player. Kept behind `Mutex<Option<…>>` to preserve that shape; SDL3 no
+    // longer reopens the device, so it is never mutated post-construction.
+    #[allow(dead_code)]
+    audio_device: Mutex<Option<AudioDeviceHandle>>,
     current_playback_rate: AtomicU32,
-    buffer_frames: AtomicU32,
-    underrun_flag: Arc<AtomicBool>,
-    last_callback_nanos: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -840,69 +840,53 @@ impl Player {
         let state = Arc::new(Mutex::new(PlayerState::default()));
         let waveform = Arc::new(Mutex::new(Vec::new()));
 
-        let context = sdl2::init().map_err(|e| format!("SDL2 init failed: {e}"))?;
+        let context = sdl3::init().map_err(|e| format!("SDL3 init failed: {e}"))?;
         let audio = context
             .audio()
-            .map_err(|e| format!("SDL2 audio init failed: {e}"))?;
-
-        let underrun_flag = Arc::new(AtomicBool::new(false));
-        let last_callback_nanos = Arc::new(AtomicU64::new(0));
+            .map_err(|e| format!("SDL3 audio init failed: {e}"))?;
 
         // Prefer 96 kHz for startup, but keep trying other high and common rates
-        // so playback still comes up on devices that do not support it. When the
-        // user passes --playback-rate, try that first and only fall back to
-        // strictly lower rates so an unsupported Bluetooth-friendly rate never
-        // silently upgrades back to 96 kHz.
+        // so playback still comes up if a device rejects one. When the user
+        // passes --playback-rate, try that first and only fall back to strictly
+        // lower rates. Note: SDL3 resamples the source spec to the hardware rate
+        // internally, so opening rarely fails on an "unsupported" rate now — the
+        // fallback list mainly honors --playback-rate and guards genuine open
+        // errors (no device / device busy).
         let candidates = candidate_playback_rates(preferred_rate);
         let mut last_err = String::from("No candidate sample rates available");
         let mut initial_rate = DEFAULT_PLAYBACK_RATE;
         let mut device = None;
         for &rate in &candidates {
-            let spec = AudioSpecDesired {
+            let spec = AudioSpec {
                 freq: Some(rate as i32),
                 channels: Some(2),
-                samples: Some(DEFAULT_BUFFER_FRAMES as u16),
+                format: Some(AudioFormat::f32_sys()),
             };
-            last_callback_nanos.store(0, Ordering::Relaxed);
-            let cb_inner = inner.clone();
-            let cb_state = state.clone();
-            let cb_rx = command_rx.clone();
-            let cb_waveform = waveform.clone();
-            let cb_uf = underrun_flag.clone();
-            let cb_lcn = last_callback_nanos.clone();
-            match audio.open_playback(None, &spec, |actual| {
-                if actual.channels != 2 {
-                    eprintln!(
-                        "SDL2: requested 2 channels but got {} — audio may be broken",
-                        actual.channels
-                    );
-                }
-                if actual.freq != rate as i32 {
-                    eprintln!("SDL2: requested {}Hz but got {}Hz", rate, actual.freq);
-                }
-                SdlAudioCallback {
-                    inner: cb_inner,
-                    state: cb_state,
-                    command_rx: cb_rx,
-                    waveform: cb_waveform,
-                    underrun_flag: cb_uf,
-                    last_callback_nanos: cb_lcn,
-                    epoch: Instant::now(),
-                    rate: actual.freq,
-                    render_buffer: Vec::new(),
-                }
-            }) {
+            let callback = SdlAudioCallback {
+                inner: inner.clone(),
+                state: state.clone(),
+                command_rx: command_rx.clone(),
+                waveform: waveform.clone(),
+                rate: rate as i32,
+                render_buffer: Vec::new(),
+                scratch_f32: Vec::new(),
+            };
+            match audio.open_playback_stream::<SdlAudioCallback, f32>(&spec, callback) {
                 Ok(dev) => {
-                    dev.resume();
-                    // Store the rate SDL actually negotiated, not the request
-                    // — downstream consumers (render-rate defaults, device
-                    // reopens) act on this value.
-                    initial_rate = dev.spec().freq.max(0) as u32;
+                    if let Err(e) = dev.resume() {
+                        last_err = e.to_string();
+                        continue;
+                    }
+                    // SDL3 resamples to the device's native rate, so the source
+                    // rate we requested IS the rate the renderer runs at — which
+                    // is exactly what every downstream consumer (render-rate
+                    // defaults, HRTF rate, oscilloscope scaling) wants.
+                    initial_rate = rate;
                     device = Some(dev);
                     break;
                 }
                 Err(e) => {
-                    last_err = e;
+                    last_err = e.to_string();
                 }
             }
         }
@@ -917,13 +901,10 @@ impl Player {
             waveform,
             sdl: Some(MainThreadSdl {
                 _context: context,
-                audio,
+                _audio: audio,
             }),
-            audio_device: Mutex::new(Some(device)),
+            audio_device: Mutex::new(Some(AudioDeviceHandle(device))),
             current_playback_rate: AtomicU32::new(initial_rate),
-            buffer_frames: AtomicU32::new(DEFAULT_BUFFER_FRAMES),
-            underrun_flag,
-            last_callback_nanos,
         })
     }
 
@@ -942,9 +923,6 @@ impl Player {
             sdl: None,
             audio_device: Mutex::new(None),
             current_playback_rate: AtomicU32::new(0),
-            buffer_frames: AtomicU32::new(0),
-            underrun_flag: Arc::new(AtomicBool::new(false)),
-            last_callback_nanos: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1038,63 +1016,12 @@ impl Player {
         refresh_visual_snapshot(&self.inner, &self.state);
     }
 
-    /// Check for audio underruns and double the buffer size if one occurred.
-    /// Returns `Some(new_frames)` if the buffer was grown, `None` otherwise.
-    pub fn check_and_grow_buffer(&self) -> Option<u32> {
-        if !self.underrun_flag.swap(false, Ordering::Relaxed) {
-            return None;
-        }
-
-        self.sdl.as_ref()?;
-        let current = self.buffer_frames.load(Ordering::Relaxed);
-        let new_frames = next_buffer_frames(current);
-        let new_frames = new_frames.min(MAX_BUFFER_FRAMES);
-        if new_frames == current {
-            return None; // already at max
-        }
-
-        let rate = self.current_playback_rate.load(Ordering::Relaxed);
-        let mut dev_guard = self.audio_device.lock().unwrap();
-        // Drop the old device before opening the replacement.
-        *dev_guard = None;
-
-        // Try the larger buffer.  If the driver rejects it, fall back to the
-        // previous size so playback is restored rather than lost entirely.
-        let (device, frames) = self
-            .try_build_and_play(rate, new_frames)
-            .or_else(|e| {
-                eprintln!(
-                    "Buffer resize to {new_frames} failed ({e}), restoring {current}-frame buffer"
-                );
-                self.try_build_and_play(rate, current)
-            })
-            .or_else(|e| {
-                eprintln!("Restore at {current} also failed ({e}), trying default buffer");
-                self.try_build_and_play(rate, 0).map(|(s, _)| (s, 0))
-            })
-            .ok()?;
-
-        let negotiated = device.spec().freq.max(0) as u32;
-        self.current_playback_rate.store(negotiated, Ordering::Relaxed);
-        self.buffer_frames.store(frames, Ordering::Relaxed);
-        *dev_guard = Some(device);
-        // The reopened device may have negotiated a different rate; rebuild
-        // the HRTF processor off-thread if so.
-        spawn_hrtf_init(self.inner.clone(), self.state.clone(), negotiated);
-        if frames != current {
-            eprintln!("Audio underrun detected — buffer increased to {frames} frames");
-        }
-        Some(frames)
-    }
-
-    /// Clear a pending underrun signal and reset the callback-gap baseline.
-    /// Called after an offline render releases the player mutex: the stalled
-    /// callback's measured gap is mutex contention, not a device underrun,
-    /// and must not trigger buffer growth.
-    pub fn clear_stall_underrun(&self) {
-        self.underrun_flag.store(false, Ordering::Relaxed);
-        self.last_callback_nanos.store(0, Ordering::Relaxed);
-    }
+    /// Retained as a no-op after the SDL3 migration. SDL3's `AudioStream`
+    /// buffers internally and decouples the callback from the hardware buffer,
+    /// so the callback-gap underrun detection (and the buffer this used to
+    /// reset) no longer exists. Kept so the post-render GUI call sites need no
+    /// change.
+    pub fn clear_stall_underrun(&self) {}
 
     /// Enable or disable HRTF synchronously. This bypasses the command queue
     /// on purpose: the queue is only drained by the audio callback, so a
@@ -1119,48 +1046,6 @@ impl Player {
         spawn_hrtf_init(self.inner.clone(), self.state.clone(), rate);
     }
 
-    /// Open an SDL2 audio device and resume playback, returning the device and
-    /// the buffer size used.
-    fn try_build_and_play(
-        &self,
-        rate: u32,
-        buffer_frames: u32,
-    ) -> Result<(sdl2::audio::AudioDevice<SdlAudioCallback>, u32), String> {
-        let sdl = self.sdl.as_ref().ok_or("No SDL audio subsystem")?;
-        let samples = if buffer_frames > 0 {
-            Some(u16::try_from(buffer_frames).unwrap_or(u16::MAX))
-        } else {
-            None
-        };
-        let spec = AudioSpecDesired {
-            freq: Some(rate as i32),
-            channels: Some(2),
-            samples,
-        };
-        self.last_callback_nanos.store(0, Ordering::Relaxed);
-        let inner = self.inner.clone();
-        let state = self.state.clone();
-        let command_rx = self.command_rx.clone();
-        let waveform = self.waveform.clone();
-        let underrun_flag = self.underrun_flag.clone();
-        let last_callback_nanos = self.last_callback_nanos.clone();
-        let device = sdl
-            .audio
-            .open_playback(None, &spec, |actual| SdlAudioCallback {
-                inner,
-                state,
-                command_rx,
-                waveform,
-                underrun_flag,
-                last_callback_nanos,
-                epoch: Instant::now(),
-                rate: actual.freq,
-                render_buffer: Vec::new(),
-            })?;
-        device.resume();
-        Ok((device, buffer_frames))
-    }
-
     pub fn current_playback_rate(&self) -> u32 {
         self.current_playback_rate
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1168,14 +1053,6 @@ impl Player {
 
     pub fn output_format_label(&self) -> &'static str {
         "F32"
-    }
-}
-
-fn next_buffer_frames(current: u32) -> u32 {
-    if current == 0 {
-        DEFAULT_BUFFER_FRAMES
-    } else {
-        current.saturating_mul(2)
     }
 }
 
@@ -1252,7 +1129,7 @@ mod tests {
             error: Some("old error".into()),
             ..PlayerState::default()
         };
-        let prepared = prepare_module_load_from_bytes(std::fs::read("mods/2ND_PM.S3M").unwrap())
+        let prepared = prepare_module_load_from_bytes(std::fs::read("mods/module76.s3m").unwrap())
             .expect("module should prepare");
 
         install_prepared_load(&mut inner, &mut state, prepared);
@@ -1349,8 +1226,8 @@ mod tests {
     }
 
     #[test]
-    fn default_buffer_frames_is_1024() {
-        assert_eq!(DEFAULT_BUFFER_FRAMES, 1024);
+    fn callback_chunk_frames_is_1024() {
+        assert_eq!(CALLBACK_CHUNK_FRAMES, 1024);
     }
 
     #[test]
@@ -1377,12 +1254,5 @@ mod tests {
             candidate_playback_rates(None),
             PREFERRED_PLAYBACK_RATES.to_vec()
         );
-    }
-
-    #[test]
-    fn next_buffer_frames_grows_from_default_baseline() {
-        assert_eq!(next_buffer_frames(0), DEFAULT_BUFFER_FRAMES);
-        assert_eq!(next_buffer_frames(DEFAULT_BUFFER_FRAMES), 2048);
-        assert_eq!(next_buffer_frames(2048), 4096);
     }
 }

@@ -12,8 +12,9 @@ path is:
 ./install_prerequisites.sh
 ```
 
-That script installs the system packages (build toolchain, SDL2/GTK/FFmpeg
-headers, libopenmpt-dev, libarchive-dev), creates a Python venv at
+That script installs the system packages (build toolchain, CMake, GTK/FFmpeg
+headers, libopenmpt-dev, libarchive-dev — SDL3 is vendored and built from
+source), creates a Python venv at
 `~/.local/share/quinlight-audio/venv`, and installs the pinned PyTorch + AI
 backend packages used by the optional remastering engines.
 

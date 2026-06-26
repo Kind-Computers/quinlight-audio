@@ -184,15 +184,21 @@ mod imp {
             return;
         };
 
+        // Deliberately raising a fatal signal is a debug/test affordance for
+        // validating the native crash handler. The actual `raise` is compiled
+        // out of release builds so a production binary can never be coerced
+        // into aborting itself via an environment variable.
         match parse_test_signal(&value) {
             Ok(TestSignal::Abrt) => {
                 eprintln!("quinlight: triggering SIGABRT for native diagnostics validation");
+                #[cfg(debug_assertions)]
                 unsafe {
                     libc::raise(SIGABRT);
                 }
             }
             Ok(TestSignal::Segv) => {
                 eprintln!("quinlight: triggering SIGSEGV for native diagnostics validation");
+                #[cfg(debug_assertions)]
                 unsafe {
                     libc::raise(SIGSEGV);
                 }

@@ -313,6 +313,15 @@ impl RemasterEngine {
         }
     }
 
+    /// The engines detection confirmed active, in detection order. Lets callers
+    /// build per-engine status (e.g. the `convert` summary) from this result
+    /// instead of re-probing every engine a second time.
+    // Used only from the bin target (`batch.rs`); unused in the lib build.
+    #[allow(dead_code)]
+    pub(crate) fn detected_engines(&self) -> &[Box<dyn UpsampleEngine>] {
+        &self.engines
+    }
+
     /// Remaster samples using all selected AI engines.
     /// Raw per-engine candidates stream immediately. When `progressive` is
     /// true (GUI), a Quinlight `Final` is emitted as soon as 2 engines have
@@ -421,7 +430,7 @@ impl RemasterEngine {
             primary_counts_by_job.clone()
         };
 
-        run_engine_wave(
+        let mut engine_reports = run_engine_wave(
             &self.engines,
             &jobs,
             None,
@@ -509,7 +518,11 @@ impl RemasterEngine {
                 });
 
                 let pass2_dir = work_dir.path().join("pass2");
-                if let Err(e) = run_engine_wave(
+                // `run_engine_wave` now only returns `Err` on cancellation;
+                // per-engine output failures are reported (non-fatal) and the
+                // wave releases any stuck samples internally. Propagate
+                // cancellation; otherwise fold the reports into the summary.
+                match run_engine_wave(
                     &self.fallback_engines,
                     &jobs,
                     restrict_set.as_ref(),
@@ -526,24 +539,49 @@ impl RemasterEngine {
                     progressive,
                     full_parallel,
                 ) {
-                    if is_cancelled_error(&e) {
-                        return Err(e);
-                    }
-                    // A second-wave engine is additive: its failure must not
-                    // destroy a run whose primary wave fully succeeded.
-                    // (Primary-wave failures remain fatal.) Samples left
-                    // waiting on the failed engine's completions are flushed
-                    // below so every sample still gets its Final.
-                    let msg =
-                        format!("Quinlight Audio: second-wave engine failure (non-fatal): {e}");
-                    eprintln!("{msg}");
-                    let _ = progress_tx.send(RemasterStatus::Log(msg));
-                    flush_pending_finals(&jobs, &pending_outputs, result_tx, cancel_flag);
+                    Ok(reports) => engine_reports.extend(reports),
+                    Err(e) => return Err(e),
                 }
+                // Backstop: ensure every sample still waiting on a fallback
+                // engine gets its Final from the candidates collected so far.
+                flush_pending_finals(&jobs, &pending_outputs, result_tx, cancel_flag);
             }
         }
 
         ensure_not_cancelled(cancel_flag)?;
+
+        // End-of-run engine summary: which engines contributed, on which device,
+        // and how many samples each missed — so a degraded run (e.g. one engine
+        // OOM'd to CPU) is visible rather than silent.
+        if !engine_reports.is_empty() {
+            let parts: Vec<String> = engine_reports
+                .iter()
+                .map(|r| {
+                    if r.failed_sample_indices.is_empty() {
+                        format!("{}({}, ok)", r.engine_name, r.device)
+                    } else {
+                        format!(
+                            "{}({}, {} missed)",
+                            r.engine_name,
+                            r.device,
+                            r.failed_sample_indices.len()
+                        )
+                    }
+                })
+                .collect();
+            let contributing = engine_reports
+                .iter()
+                .filter(|r| r.produced > 0)
+                .count();
+            let summary = format!(
+                "Engines: {} — consensus draws on {} engine(s)",
+                parts.join(" "),
+                contributing
+            );
+            eprintln!("[engines] {summary}");
+            let _ = progress_tx.send(RemasterStatus::Log(summary));
+        }
+
         let _ = progress_tx.send(RemasterStatus::Complete);
         Ok(())
     }
@@ -612,6 +650,25 @@ fn max_parallel_from_memory(memory_mb: u64, budget_per_model_mb: u64, num_engine
     ((memory_mb / budget_per_model_mb) as usize).clamp(1, num_engines)
 }
 
+/// Outcome of running one engine within a wave.
+///
+/// `run_single_engine` returns `Err` **only** for cancellation; a non-cancel
+/// failure to produce output for some samples is reported here (non-fatal) so
+/// the registration consensus can still form from the other engines. Each
+/// missed sample is recorded as an empty completion (`record_engine_completion`
+/// with `candidate: None`), so its `engines_done` still reaches `engines_total`
+/// and its `Final` fires from whatever engines succeeded.
+struct EngineWaveReport {
+    engine_name: String,
+    /// Device the engine's workers were assigned (cuda/xpu/cpu). The actual
+    /// per-batch CPU fallback for an over-VRAM engine is logged separately.
+    device: &'static str,
+    /// `SampleJob::index` values this engine produced no output for.
+    failed_sample_indices: Vec<i32>,
+    /// Samples this engine successfully produced (incl. cache hits).
+    produced: usize,
+}
+
 /// Runs one batch wave of upsampling engines. Engines in `engines` run on
 /// `jobs` (or the subset allowed by `restrict_to_samples`, identified by
 /// `SampleJob::index`). Produced candidates flow through the shared
@@ -645,12 +702,12 @@ fn run_engine_wave(
     ddim_steps: u32,
     progressive: bool,
     full_parallel: bool,
-) -> Result<(), String> {
+) -> Result<Vec<EngineWaveReport>, String> {
     ensure_not_cancelled(cancel_flag)?;
 
     let num_engines = engines.len();
     if num_engines == 0 {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // Serial by default — parallel engine execution triggers PyTorch
@@ -680,6 +737,29 @@ fn run_engine_wave(
         1
     };
 
+    // One-line VRAM/sequencing banner so users on small GPUs understand why
+    // engines run one-at-a-time (and that an over-VRAM engine will fall back to
+    // CPU rather than abort). Probe VRAM for the message only, on GPU modes.
+    if mode != UpscaleMode::CpuOnly {
+        let vram_mb = crate::engine::detect_gpu_vram_mb();
+        let vram_str = if vram_mb > 0 {
+            format!("{vram_mb} MB VRAM")
+        } else {
+            "VRAM unknown".to_string()
+        };
+        let sequencing = if max_parallel_engines <= 1 {
+            "engines run one at a time".to_string()
+        } else {
+            format!("up to {max_parallel_engines} engines at once")
+        };
+        let banner = format!(
+            "{mode:?}: {num_engines} engine(s), {vram_str}; {sequencing} \
+             (an engine larger than free VRAM falls back to CPU)"
+        );
+        eprintln!("[engines] {banner}");
+        let _ = progress_tx.send(RemasterStatus::Log(banner));
+    }
+
     // With engines running in parallel, each engine gets a smaller worker
     // pool than in the old serial design. Hybrid splits each engine across
     // one GPU + one CPU worker; GpuOnly/CpuOnly use a single worker per
@@ -704,7 +784,11 @@ fn run_engine_wave(
         .max(1);
 
     // Run engines in chunks sized by the VRAM cap. Each chunk is a separate
-    // `thread::scope` so a bad engine in chunk N can short-circuit chunks N+1..
+    // `thread::scope`. `run_single_engine` returns `Err` only for cancellation
+    // (which still aborts the wave); a non-cancel error is a per-engine
+    // infrastructure failure that is logged and tolerated — the consensus forms
+    // from the engines that did produce output.
+    let reports = std::sync::Mutex::new(Vec::<EngineWaveReport>::new());
     let engine_errors = std::sync::Mutex::new(Vec::<String>::new());
     let mut chunk_start = 0usize;
     while chunk_start < num_engines {
@@ -715,6 +799,7 @@ fn run_engine_wave(
             for eng_idx in chunk_start..chunk_end {
                 let engine = engines[eng_idx].as_ref();
                 let errors_ref = &engine_errors;
+                let reports_ref = &reports;
                 outer.spawn(move || {
                     let result = run_single_engine(
                         engine,
@@ -737,20 +822,19 @@ fn run_engine_wave(
                         gpu_workers_per_engine,
                         cpu_thread_budget,
                     );
-                    if let Err(e) = result {
-                        errors_ref.lock().unwrap().push(e);
+                    match result {
+                        Ok(report) => reports_ref.lock().unwrap().push(report),
+                        Err(e) => errors_ref.lock().unwrap().push(e),
                     }
                 });
             }
         });
 
+        // Cancellation aborts the whole wave immediately.
         {
             let errs = engine_errors.lock().unwrap();
             if let Some(cancel) = errs.iter().find(|e| is_cancelled_error(e)) {
                 return Err(cancel.clone());
-            }
-            if let Some(first) = errs.first() {
-                return Err(first.clone());
             }
         }
 
@@ -758,7 +842,28 @@ fn run_engine_wave(
     }
 
     ensure_not_cancelled(cancel_flag)?;
-    Ok(())
+
+    // Defensive backstop. `run_single_engine` now returns `Err` only for
+    // cancellation (caught above) — every non-cancel failure, including input
+    // staging, is degraded internally to per-sample `None` completions, so each
+    // sample's `Final` already fires once at the right time. This branch should
+    // therefore not run; it is kept so that if a future non-cancel `Err` path is
+    // ever reintroduced, samples left waiting on that engine are still released
+    // via the consensus they can form rather than hanging. (Doing this in the
+    // primary wave can emit a `Final` before a later wave contributes, then a
+    // duplicate when it does — which is exactly why the staging path above
+    // degrades instead of erroring; consumers dedupe at equal rate regardless.)
+    let leftover_errors = engine_errors.into_inner().unwrap_or_default();
+    if !leftover_errors.is_empty() {
+        for e in &leftover_errors {
+            let msg = format!("Quinlight Audio: engine error (non-fatal): {e}");
+            eprintln!("{msg}");
+            let _ = progress_tx.send(RemasterStatus::Log(msg));
+        }
+        flush_pending_finals(jobs, pending_outputs, result_tx, cancel_flag);
+    }
+
+    Ok(reports.into_inner().unwrap_or_default())
 }
 
 /// Runs one engine against `jobs` start-to-finish. Called from inside the
@@ -787,12 +892,19 @@ fn run_single_engine(
     workers_per_engine: usize,
     gpu_workers_per_engine: usize,
     cpu_thread_budget: usize,
-) -> Result<(), String> {
+) -> Result<EngineWaveReport, String> {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     let tag = format!("[{}]", engine.name());
+    // The device this engine's workers are primarily assigned. A per-batch CPU
+    // fallback for an over-VRAM engine is a runtime event logged below; this is
+    // the intended device for the diagnostics summary.
+    let report_device: &'static str = match mode {
+        UpscaleMode::CpuOnly => "cpu",
+        _ => crate::engine::gpu_device_string(),
+    };
     let engine_label = format!("{} ({}/{})", engine.name(), eng_idx + 1, num_engines);
-    eprintln!("{tag} starting {engine_label}");
+    eprintln!("{tag} starting {engine_label} on {report_device}");
 
     // Engines that ignore ddim_steps are cached under 0 so changing the knob
     // doesn't invalidate their entries.
@@ -892,7 +1004,12 @@ fn run_single_engine(
             "{}: 0/0 succeeded",
             engine.name()
         )));
-        return Ok(());
+        return Ok(EngineWaveReport {
+            engine_name: engine.name().to_string(),
+            device: report_device,
+            failed_sample_indices: Vec::new(),
+            produced: 0,
+        });
     }
 
     let eng_dir = work_dir.join(format!("engine_{}", engine.name().to_lowercase()));
@@ -924,21 +1041,6 @@ fn run_single_engine(
     }
 
     let eng_input_dir = eng_dir.join("inputs");
-    std::fs::create_dir_all(&eng_input_dir)
-        .map_err(|e| format!("Failed to create engine input dir: {e}"))?;
-    for &job_idx in &eng_uncached {
-        ensure_not_cancelled(cancel_flag)?;
-        let job = &jobs[job_idx];
-        let conditioning_inputs = job.engine_inputs();
-        for input in conditioning_inputs.iter() {
-            let filename = input.input_path.file_name().ok_or_else(|| {
-                format!("Invalid input path (no filename): {:?}", input.input_path)
-            })?;
-            let dest = eng_input_dir.join(filename);
-            std::fs::copy(&input.input_path, &dest)
-                .map_err(|e| format!("Failed to copy WAV to engine input dir: {e}"))?;
-        }
-    }
 
     let work_queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
         eng_uncached.clone(),
@@ -959,9 +1061,74 @@ fn run_single_engine(
         })
         .collect();
 
-    for worker in &workers {
-        std::fs::create_dir_all(&worker.base_output_dir)
-            .map_err(|e| format!("Failed to create worker output dir: {e}"))?;
+    // Stage engine inputs and worker output dirs. A non-cancel infra failure
+    // here (can't create a dir, can't copy a WAV) means this engine can produce
+    // nothing for its uncached jobs. Crucially we do NOT return `Err` for that:
+    // a non-cancel `Err` lands in `run_engine_wave`'s leftover-error path, which
+    // calls `flush_pending_finals` over every job — and in the primary wave that
+    // emits a sample's consensus `Final` from primary-only candidates before the
+    // registered-mode fallback wave runs, then `record_engine_completion` emits
+    // a second `Final` once the fallback adds candidates. Instead, degrade to a
+    // per-sample "no output" (a `None` completion) exactly like a worker that
+    // produced nothing, so each sample's `Final` still fires once, at the right
+    // time, from the engines that succeeded. Cancellation remains a genuine
+    // `Err` and is propagated.
+    let staging: Result<(), String> = (|| {
+        std::fs::create_dir_all(&eng_input_dir)
+            .map_err(|e| format!("Failed to create engine input dir: {e}"))?;
+        for &job_idx in &eng_uncached {
+            ensure_not_cancelled(cancel_flag)?;
+            let job = &jobs[job_idx];
+            for input in job.engine_inputs().iter() {
+                let filename = input.input_path.file_name().ok_or_else(|| {
+                    format!("Invalid input path (no filename): {:?}", input.input_path)
+                })?;
+                let dest = eng_input_dir.join(filename);
+                std::fs::copy(&input.input_path, &dest)
+                    .map_err(|e| format!("Failed to copy WAV to engine input dir: {e}"))?;
+            }
+        }
+        for worker in &workers {
+            std::fs::create_dir_all(&worker.base_output_dir)
+                .map_err(|e| format!("Failed to create worker output dir: {e}"))?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = staging {
+        // Cancellation takes priority and must propagate as an Err.
+        ensure_not_cancelled(cancel_flag)?;
+        eprintln!(
+            "{tag} input staging failed ({e}); recording {} uncached sample(s) as no-output",
+            eng_uncached.len()
+        );
+        let _ = progress_tx.send(RemasterStatus::Log(format!(
+            "{} staging failed ({e}); continuing — consensus will use the remaining engines",
+            engine.name()
+        )));
+        let mut failed_sample_indices: Vec<i32> = Vec::with_capacity(eng_uncached.len());
+        for &job_idx in &eng_uncached {
+            let job = &jobs[job_idx];
+            record_engine_completion(
+                job,
+                None,
+                progress_counter,
+                progress_total,
+                progress_tx,
+                result_tx,
+                pending_outputs,
+                format!("{}: {} (no output)", engine_label, job.display_name()),
+                eligible_engine_counts_by_job[job_idx],
+                cancel_flag,
+                progressive,
+            );
+            failed_sample_indices.push(job.index);
+        }
+        return Ok(EngineWaveReport {
+            engine_name: engine.name().to_string(),
+            device: report_device,
+            failed_sample_indices,
+            produced: success_counter.load(Ordering::Relaxed) as usize,
+        });
     }
 
     let all_processed = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::<
@@ -1113,7 +1280,8 @@ fn run_single_engine(
                     let none_succeeded = processed.len() == pre_count;
                     if worker.device != "cpu" && (r.is_err() || none_succeeded) {
                         eprintln!(
-                            "{tag} GPU worker {} round {round} failed ({}), retrying on CPU",
+                            "{tag} GPU worker {} round {round} failed ({}); likely VRAM-limited \
+                             (model exceeds free GPU memory) — retrying this batch on CPU",
                             worker.worker_id,
                             if let Err(ref e) = r {
                                 e.as_str()
@@ -1144,28 +1312,49 @@ fn run_single_engine(
         }
     });
 
+    // Per-engine failure is NON-fatal: an engine that produced no output for
+    // some samples (e.g. OOM that the CPU retry couldn't rescue) records an
+    // empty completion for each missed sample, so the sample's `engines_done`
+    // still reaches `engines_total` and its `Final` fires from whatever other
+    // engines succeeded. Only a sample that NO engine produced output for ends
+    // up fatal (handled downstream as `no_output_indices`). Cancellation is the
+    // sole reason this function returns `Err`.
+    let mut failed_sample_indices: Vec<i32> = Vec::new();
     if !cancellation_requested(cancel_flag) {
-        let processed = all_processed.lock().unwrap();
-        let mut engine_failures: Vec<String> = Vec::new();
-        for &job_idx in &eng_uncached {
-            if !processed.contains(&job_idx) {
-                let job = &jobs[job_idx];
-                engine_failures.push(format!(
-                    "{}: no output for {}",
-                    engine.name(),
-                    job.display_name()
-                ));
-            }
-        }
-        if !engine_failures.is_empty() {
-            let msg = format!(
-                "{} failed to produce output for {} sample(s): {}",
-                engine.name(),
-                engine_failures.len(),
-                engine_failures.join(", ")
+        let failed_job_idxs: Vec<usize> = {
+            let processed = all_processed.lock().unwrap();
+            eng_uncached
+                .iter()
+                .copied()
+                .filter(|job_idx| !processed.contains(job_idx))
+                .collect()
+        };
+        for job_idx in failed_job_idxs {
+            let job = &jobs[job_idx];
+            record_engine_completion(
+                job,
+                None,
+                progress_counter,
+                progress_total,
+                progress_tx,
+                result_tx,
+                pending_outputs,
+                format!("{}: {} (no output)", engine_label, job.display_name()),
+                eligible_engine_counts_by_job[job_idx],
+                cancel_flag,
+                progressive,
             );
-            eprintln!("{tag} FATAL: {msg}");
-            return Err(msg);
+            failed_sample_indices.push(job.index);
+        }
+        if !failed_sample_indices.is_empty() {
+            let msg = format!(
+                "{} produced no output for {} sample(s); continuing — consensus will \
+                 use the remaining engines",
+                engine.name(),
+                failed_sample_indices.len(),
+            );
+            eprintln!("{tag} WARN: {msg}");
+            let _ = progress_tx.send(RemasterStatus::Log(msg));
         }
     }
     ensure_not_cancelled(cancel_flag)?;
@@ -1183,7 +1372,12 @@ fn run_single_engine(
         produced,
         eligible_job_indices.len()
     )));
-    Ok(())
+    Ok(EngineWaveReport {
+        engine_name: engine.name().to_string(),
+        device: report_device,
+        failed_sample_indices,
+        produced,
+    })
 }
 
 /// True if `candidate_data` scores below the usability floor against `job`'s
@@ -9821,7 +10015,7 @@ mod tests {
         assert_eq!(max_parallel_from_memory(65_536, 3072, 0), 0);
     }
 
-    const BASIC_FIXTURE: &str = "mods/2ND_PM.S3M";
+    const BASIC_FIXTURE: &str = "mods/module76.s3m";
     const XM_FIXTURE: &str = "openmpt/test/test.xm";
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -9991,6 +10185,57 @@ mod tests {
 
         fn find_output_wav(&self, _output_dir: &Path, _stem: &str) -> Result<PathBuf, String> {
             Err("sleep engine does not emit WAVs".into())
+        }
+    }
+
+    /// An engine that always fails to produce output: its subprocess exits
+    /// non-zero and it emits no WAV. Used to verify that a single engine's
+    /// failure is non-fatal — the consensus still forms from the others.
+    struct FailingEngine {
+        name: &'static str,
+        cache_id: &'static str,
+    }
+
+    impl UpsampleEngine for FailingEngine {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn cache_id(&self) -> &str {
+            self.cache_id
+        }
+
+        fn output_rate(&self) -> u32 {
+            48_000
+        }
+
+        fn max_batch_size(&self) -> usize {
+            1
+        }
+
+        fn min_duration_secs(&self) -> f64 {
+            0.0
+        }
+
+        fn spawn_batch(
+            &self,
+            _input_manifest: &Path,
+            _output_dir: &Path,
+            _device: &str,
+            _ddim_steps: u32,
+            _cpu_thread_budget: usize,
+        ) -> Result<Child, String> {
+            Command::new("sh")
+                .arg("-c")
+                .arg("exit 1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("Failed to spawn failing engine: {e}"))
+        }
+
+        fn find_output_wav(&self, _output_dir: &Path, _stem: &str) -> Result<PathBuf, String> {
+            Err("failing engine emits no WAV".into())
         }
     }
 
@@ -10462,6 +10707,234 @@ mod tests {
             ],
             fallback_engines: Vec::new(),
         }
+    }
+
+    /// Pillar 1 core regression: with two engines producing output (via cache)
+    /// and one that always fails, the failing engine must NOT abort the batch —
+    /// the sample still gets a 2-engine consensus Final.
+    #[test]
+    fn one_failing_engine_does_not_block_consensus_from_the_rest() {
+        let _guard = env_lock().lock().unwrap();
+        let temp_home = tempfile::tempdir().expect("temp home");
+        let _home = HomeGuard::set(temp_home.path());
+        let work_dir = tempfile::tempdir().expect("temp work");
+        let job = sample_job(work_dir.path());
+        let audio = job.reference_48k.clone();
+        let lava: Vec<f64> = audio
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| s + 0.01 * (i as f64 * 7.3).sin())
+            .collect();
+        cache_store(
+            &job.pcm_sha256,
+            "audiosr-v0.1",
+            0,
+            &variant_key_for_job(&job),
+            &SampleResult {
+                index: 0,
+                data: audio,
+                length_frames: 4096,
+                channels: 1,
+                sample_rate_hz: 48_000,
+                engine_name: "AudioSR".to_string(),
+                discovered_loops: None,
+            },
+            1.0,
+        );
+        cache_store(
+            &job.pcm_sha256,
+            "lavasr-v0.1",
+            0,
+            &variant_key_for_job(&job),
+            &SampleResult {
+                index: 0,
+                data: lava,
+                length_frames: 4096,
+                channels: 1,
+                sample_rate_hz: 48_000,
+                engine_name: "LavaSR".to_string(),
+                discovered_loops: None,
+            },
+            1.0,
+        );
+
+        let engine = RemasterEngine::from_test_engines(vec![
+            Box::new(DummyEngine {
+                name: "AudioSR",
+                cache_id: "audiosr-v0.1",
+            }),
+            Box::new(DummyEngine {
+                name: "LavaSR",
+                cache_id: "lavasr-v0.1",
+            }),
+            Box::new(FailingEngine {
+                name: "FLowHigh",
+                cache_id: "flowhigh-v0.1",
+            }),
+        ]);
+        let (progress_tx, progress_rx) = crossbeam_channel::unbounded();
+        let (result_tx, result_rx) = crossbeam_channel::unbounded();
+        let cancel_flag = AtomicBool::new(false);
+
+        engine
+            .remaster_samples(
+                vec![job],
+                tempfile::tempdir().expect("temp remaster dir"),
+                &progress_tx,
+                &result_tx,
+                UpscaleMode::CpuOnly,
+                &cancel_flag,
+                50,
+                true,
+                false,
+            )
+            .expect("a single failing engine must not make the batch fatal");
+
+        let results: Vec<RemasterOutput> = result_rx.try_iter().collect();
+        let finals: Vec<&SampleResult> = results
+            .iter()
+            .filter_map(|o| match o {
+                RemasterOutput::Final(r) => Some(r),
+                RemasterOutput::Candidate(_) => None,
+            })
+            .collect();
+        assert_eq!(finals.len(), 1, "the sample should still get a Final");
+        assert!(finals[0].engine_name.starts_with(QUINLIGHT_NAME));
+        assert!(
+            !is_no_consensus_result(&finals[0].engine_name),
+            "two surviving engines must form a real consensus, got {}",
+            finals[0].engine_name,
+        );
+
+        let statuses: Vec<RemasterStatus> = progress_rx.try_iter().collect();
+        assert!(
+            statuses.iter().any(|s| matches!(s,
+                RemasterStatus::Log(m) if m.contains("produced no output"))),
+            "the failing engine should log a non-fatal notice",
+        );
+    }
+
+    /// With only one engine producing output, consensus can't be reached
+    /// (requires 2+). That is the quality-gate path (no-consensus marker), NOT a
+    /// fatal — the run still returns Ok.
+    #[test]
+    fn only_one_usable_engine_is_quality_gate_not_fatal() {
+        let _guard = env_lock().lock().unwrap();
+        let temp_home = tempfile::tempdir().expect("temp home");
+        let _home = HomeGuard::set(temp_home.path());
+        let work_dir = tempfile::tempdir().expect("temp work");
+        let job = sample_job(work_dir.path());
+        let audio = job.reference_48k.clone();
+        cache_store(
+            &job.pcm_sha256,
+            "audiosr-v0.1",
+            0,
+            &variant_key_for_job(&job),
+            &SampleResult {
+                index: 0,
+                data: audio,
+                length_frames: 4096,
+                channels: 1,
+                sample_rate_hz: 48_000,
+                engine_name: "AudioSR".to_string(),
+                discovered_loops: None,
+            },
+            1.0,
+        );
+
+        let engine = RemasterEngine::from_test_engines(vec![
+            Box::new(DummyEngine {
+                name: "AudioSR",
+                cache_id: "audiosr-v0.1",
+            }),
+            Box::new(FailingEngine {
+                name: "LavaSR",
+                cache_id: "lavasr-v0.1",
+            }),
+        ]);
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
+        let (result_tx, result_rx) = crossbeam_channel::unbounded();
+        let cancel_flag = AtomicBool::new(false);
+
+        engine
+            .remaster_samples(
+                vec![job],
+                tempfile::tempdir().expect("temp remaster dir"),
+                &progress_tx,
+                &result_tx,
+                UpscaleMode::CpuOnly,
+                &cancel_flag,
+                50,
+                true,
+                false,
+            )
+            .expect("one usable engine is a quality-gate miss, not a fatal");
+
+        let results: Vec<RemasterOutput> = result_rx.try_iter().collect();
+        let finals: Vec<&SampleResult> = results
+            .iter()
+            .filter_map(|o| match o {
+                RemasterOutput::Final(r) => Some(r),
+                RemasterOutput::Candidate(_) => None,
+            })
+            .collect();
+        assert_eq!(finals.len(), 1);
+        assert!(
+            is_no_consensus_result(&finals[0].engine_name),
+            "one usable engine cannot reach consensus, got {}",
+            finals[0].engine_name,
+        );
+    }
+
+    /// When NO engine produces output, no consensus Final is emitted (the
+    /// sample surfaces downstream as `no_output`), but `remaster_samples` itself
+    /// still returns Ok — total failure is classified by the caller, not raised
+    /// as an error here (only cancellation is an Err).
+    #[test]
+    fn all_engines_failing_emits_no_final_but_is_not_an_error() {
+        let _guard = env_lock().lock().unwrap();
+        let temp_home = tempfile::tempdir().expect("temp home");
+        let _home = HomeGuard::set(temp_home.path());
+        let work_dir = tempfile::tempdir().expect("temp work");
+        let job = sample_job(work_dir.path());
+
+        let engine = RemasterEngine::from_test_engines(vec![
+            Box::new(FailingEngine {
+                name: "AudioSR",
+                cache_id: "audiosr-v0.1",
+            }),
+            Box::new(FailingEngine {
+                name: "LavaSR",
+                cache_id: "lavasr-v0.1",
+            }),
+        ]);
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
+        let (result_tx, result_rx) = crossbeam_channel::unbounded();
+        let cancel_flag = AtomicBool::new(false);
+
+        engine
+            .remaster_samples(
+                vec![job],
+                tempfile::tempdir().expect("temp remaster dir"),
+                &progress_tx,
+                &result_tx,
+                UpscaleMode::CpuOnly,
+                &cancel_flag,
+                50,
+                true,
+                false,
+            )
+            .expect("total engine failure is reported downstream, not as an Err here");
+
+        let results: Vec<RemasterOutput> = result_rx.try_iter().collect();
+        let finals = results
+            .iter()
+            .filter(|o| matches!(o, RemasterOutput::Final(_)))
+            .count();
+        assert_eq!(
+            finals, 0,
+            "no engine produced output, so no consensus Final should be emitted",
+        );
     }
 
     #[test]
@@ -14905,17 +15378,17 @@ mod tests {
 
     #[test]
     fn skav_starship_reference_and_extract_reduce_loop_seam() {
-        let data = std::fs::read("mods/2ND_SKAV.S3M").expect("fixture should load");
+        let data = std::fs::read("mods/module76.s3m").expect("fixture should load");
         let mut module = Module::from_memory(&data).expect("fixture module should load");
         let sample = read_raw_samples(&mut module)
             .into_iter()
-            .find(|sample| sample.index == 8)
-            .expect("2ND_SKAV sample 9 should be readable");
+            .find(|sample| sample.index == 0)
+            .expect("module76 sample 1 should be readable");
         let channels = sample.channels as usize;
         let loop_prep = LoopPrepPlan::from_sample(sample.source_length_frames, sample.loop_info);
         assert!(
             loop_prep.uses_boundary_loop(),
-            "2ND_SKAV sample 9 should use the boundary-loop path",
+            "module76 sample 1 should use the boundary-loop path",
         );
 
         let saved_original = sample_prefix(&sample.data, channels, loop_prep.saved_length_frames);
@@ -14941,7 +15414,7 @@ mod tests {
             forward_loop_seam_discontinuity(&repaired_reference, channels, scaled_loop_start);
         assert!(
             repaired_gap < original_gap,
-            "pre-AI repair should reduce the forward-loop seam for 2ND_SKAV sample 9 (original_gap={original_gap}, repaired_gap={repaired_gap})",
+            "pre-AI repair should reduce the forward-loop seam for module76 sample 1 (original_gap={original_gap}, repaired_gap={repaired_gap})",
         );
 
         let filtered_reference_parts = build_canonical_reference_parts_with_loop_prep(
@@ -15013,7 +15486,7 @@ mod tests {
         assert!(
             guided_inner_jump <= filtered_inner_jump + inner_jump_tol,
             "source-guided SINC should not noticeably increase the in-loop spike for \
-             2ND_SKAV sample 9 (filtered={filtered_inner_jump}, guided={guided_inner_jump}, \
+             module76 sample 1 (filtered={filtered_inner_jump}, guided={guided_inner_jump}, \
              tol={inner_jump_tol})",
         );
     }

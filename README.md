@@ -165,61 +165,48 @@ accumulator loops — runtime dispatch picks the widest available path.
 
 ## Listen
 
-A/B ten tracker modules straight from the repo. The **before** column is the
+A/B ten freely-licensed tracker modules. The **before** column is the
 deterministic render (original samples, no AI); the **after** column is the
-same module with samples upscaled by the AI engines. Both clips are 48 kHz
-MP3 at 320 kbps — downsampled from the engine's 96 kHz default and served
-via GitHub Pages so every browser plays them inline. Click to listen.
+same module with its samples upscaled by the AI engines and merged through the
+registration consensus. Both clips are the engine's native **96 kHz AAC**
+(`.m4a`), served via GitHub Pages — click to play inline. Some browser AAC
+decoders resample 96 kHz down to the system output rate at playback, so what
+you *hear* may be downsampled even though the bytes fetched are the full file.
 
-| Module | Format | Before | After |
-| --- | --- | --- | --- |
-| 2ND_PM | S3M | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/2ND_PM.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/2ND_PM-Quinlight-Audio-Remastered-48Khz.mp3)** |
-| 4mat_-_eternity | XM | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/4mat_-_eternity.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/4mat_-_eternity-Quinlight-Audio-Remastered-48Khz.mp3)** |
-| beyond_the_network | IT | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/beyond_the_network.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/beyond_the_network-Quinlight-Audio-Remastered-48Khz.mp3)** |
-| Caroline | XM | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/Caroline.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/Caroline-Quinlight-Audio-Remastered-48Khz.mp3)** |
-| GroovyUntightFunk | XM | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/GroovyUntightFunk.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/GroovyUntightFunk-Quinlight-Audio-Remastered-48Khz.mp3)** |
-| jt_mind | XM | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/jt_mind.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/jt_mind-Quinlight-Audio-Remastered-48Khz.mp3)** |
-| jt_pools | XM | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/jt_pools.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/jt_pools-Quinlight-Audio-Remastered-48Khz.mp3)** |
-| sweetdre | XM | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/sweetdre.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/sweetdre-Quinlight-Audio-Remastered-48Khz.mp3)** |
-| tiny_tunes | MOD | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/tiny_tunes.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/tiny_tunes-Quinlight-Audio-Remastered-48Khz.mp3)** |
-| znm-wopeace | IT | [listen](https://kind-computers.github.io/quinlight-audio/mods/rendered/znm-wopeace.mp3) | **[listen](https://kind-computers.github.io/quinlight-audio/mods/remastered/znm-wopeace-Quinlight-Audio-Remastered-48Khz.mp3)** |
+Every demo module is **Public Domain or CC-BY**; each title links to its source
+on The Mod Archive. Full per-module credits are in [NOTICE](NOTICE).
 
-### 96 kHz AAC originals
+| Module | Fmt | Artist | License | Before | After |
+| --- | --- | --- | --- | --- | --- |
+| [Wild Perspective](https://modarchive.org/index.php?request=view_by_moduleid&query=53329) | MOD | m0d | Public Domain | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/musix-wild-perspective.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/musix-wild-perspective-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| [Silicon Dancer](https://modarchive.org/index.php?request=view_by_moduleid&query=209692) | MOD | Drozerix | Public Domain | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/drozerix_-_silicon_dancer.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/drozerix_-_silicon_dancer-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| [Stars (4ch)](https://modarchive.org/index.php?request=view_by_moduleid&query=201917) | MOD | cs127 | CC-BY | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/cs127_-_stars_4ch.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/cs127_-_stars_4ch-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| [Kłopoty z Czasem](https://modarchive.org/index.php?request=view_by_moduleid&query=176492) | XM | JAM | Public Domain | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/klopotyzczasem.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/klopotyzczasem-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| [Haunted Occult Mans](https://modarchive.org/index.php?request=view_by_moduleid&query=177399) | XM | JAM | Public Domain | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/hom.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/hom-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| [Digital Rendezvous](https://modarchive.org/index.php?request=view_by_moduleid&query=180821) | XM | Drozerix | Public Domain | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/drozerix_-_digital_rendezvous.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/drozerix_-_digital_rendezvous-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| [module76](https://modarchive.org/index.php?request=view_by_moduleid&query=176443) | S3M | K. Jose | CC-BY | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/module76.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/module76-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| [Satisfacción](https://modarchive.org/index.php?request=view_by_moduleid&query=192015) | S3M | K. Jose | CC-BY | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/k_jose_-_satisfaccion.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/k_jose_-_satisfaccion-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| [The Drunken Monkey](https://modarchive.org/index.php?request=view_by_moduleid&query=41544) | IT | christofori | Public Domain | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/fb-drunkmonkey.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/fb-drunkmonkey-Quinlight-Audio-Remastered-96Khz.m4a)** |
+| [NUEVE](https://modarchive.org/index.php?request=view_by_moduleid&query=210252) | IT | Djego Flochs | CC-BY | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/djfl_-_nueve.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/djfl_-_nueve-Quinlight-Audio-Remastered-96Khz.m4a)** |
 
-Same 20 clips at the engine's native 96 kHz / AAC 256 kbps, also served via
-GitHub Pages. Many browser AAC decoders accept 96 kHz files but resample to
-the system output rate at playback time — what you hear may not be the full
-96 kHz, but the bytes your browser fetched are.
-
-| Module | Before | After |
-| --- | --- | --- |
-| 2ND_PM | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/2ND_PM.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/2ND_PM-Quinlight-Audio-Remastered-96Khz.m4a)** |
-| 4mat_-_eternity | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/4mat_-_eternity.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/4mat_-_eternity-Quinlight-Audio-Remastered-96Khz.m4a)** |
-| beyond_the_network | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/beyond_the_network.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/beyond_the_network-Quinlight-Audio-Remastered-96Khz.m4a)** |
-| Caroline | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/Caroline.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/Caroline-Quinlight-Audio-Remastered-96Khz.m4a)** |
-| GroovyUntightFunk | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/GroovyUntightFunk.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/GroovyUntightFunk-Quinlight-Audio-Remastered-96Khz.m4a)** |
-| jt_mind | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/jt_mind.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/jt_mind-Quinlight-Audio-Remastered-96Khz.m4a)** |
-| jt_pools | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/jt_pools.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/jt_pools-Quinlight-Audio-Remastered-96Khz.m4a)** |
-| sweetdre | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/sweetdre.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/sweetdre-Quinlight-Audio-Remastered-96Khz.m4a)** |
-| tiny_tunes | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/tiny_tunes.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/tiny_tunes-Quinlight-Audio-Remastered-96Khz.m4a)** |
-| znm-wopeace | [listen](https://kind-computers.github.io/quinlight-audio/96khz/rendered/znm-wopeace.m4a) | **[listen](https://kind-computers.github.io/quinlight-audio/96khz/remastered/znm-wopeace-Quinlight-Audio-Remastered-96Khz.m4a)** |
-
-Prefer the bundled download? Grab
+Prefer a single download? Grab
 [quinlight-audio-96khz-bundle.zip](https://github.com/Kind-Computers/quinlight-audio/releases/download/audio-bundle-v1/quinlight-audio-96khz-bundle.zip)
-(275 MB — same 20 clips organized as `rendered/` and `remastered/`).
+(all 10 modules as 96 kHz `.m4a`, organized into `rendered/` and `remastered/`).
 
 ## Build
 
 Quinlight Audio currently targets Linux `x86_64-unknown-linux-gnu`. The build expects
-Rust, a C++ toolchain, SDL2 headers, libarchive headers, and FFmpeg development
-libraries.
+Rust, a C++ toolchain, CMake, libarchive headers, and FFmpeg development libraries.
+SDL3 is vendored and compiled from source at build time (via the `sdl3` crate's
+`build-from-source` feature), so no system SDL package is required — only CMake and a
+C toolchain to build it.
 
 > **Disk space:** Plan for at least **30 GB free** before installing. The full
 > footprint (build artifacts + Python venv + AI model checkpoints) lands around
 > 26 GB, with headroom for caches and rendered output.
 
 ```bash
-sudo apt install build-essential clang mold libsdl2-dev libarchive-dev \
+sudo apt install build-essential clang mold cmake libarchive-dev \
   libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev
 
 cargo build --release
@@ -300,4 +287,12 @@ U.S. patent application.
 
 ## License
 
-MIT
+Quinlight Audio is licensed under the [MIT License](LICENSE).
+
+It bundles or builds against third-party components that remain under their own
+licenses and are **not** covered by the MIT grant — notably OpenMPT/libopenmpt
+(BSD-3-Clause, `openmpt/`), the `flac-codec` crate (MIT/Apache-2.0, `flac-codec/`),
+and the SADIE II HRIR/SOFA datasets (Apache-2.0, `HRTF/`). See [NOTICE](NOTICE)
+for the full attribution list. The optional AI remastering engines (AudioSR,
+LavaSR, FLowHigh, AP-BWE) are installed separately, are not redistributed here,
+and each carry their own license — review them before use.

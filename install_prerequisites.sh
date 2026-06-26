@@ -29,8 +29,8 @@ fi
 echo "Using $($PY --version), venv package: $VENV_PKG, torch 2.11.x"
 
 sudo apt install -y pipewire-alsa "$VENV_PKG" \
-  build-essential clang mold \
-  libopenmpt-dev libarchive-dev libsdl2-dev libgtk-3-dev \
+  build-essential clang mold cmake \
+  libopenmpt-dev libarchive-dev libgtk-3-dev \
   libpango1.0-dev libglib2.0-dev libgdk-pixbuf-2.0-dev libatk1.0-dev libcairo2-dev \
   libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev
 

@@ -287,6 +287,12 @@ pub(crate) fn detect_remaster_engine(
 ) -> Result<RemasterEngine, String> {
     if requested_engines.is_empty() {
         let engine = RemasterEngine::detect();
+        // One concise line on which engines are active (version + device) and
+        // why any are skipped — the per-engine detection logs above are noisier.
+        // Build the summary from the detection we just ran rather than probing
+        // every engine again.
+        let statuses = crate::engine::engine_statuses_from_detected(engine.detected_engines());
+        eprintln!("{}", crate::engine::engine_status_inline_summary(&statuses));
         if engine.is_available() {
             return Ok(engine);
         }
@@ -303,9 +309,11 @@ pub(crate) fn detect_remaster_engine(
     if engine.is_available() {
         Ok(engine)
     } else {
+        let statuses = crate::engine::engine_statuses_from_detected(detected.detected_engines());
         Err(format!(
-            "Requested Quinlight engine(s) not available: {}",
-            requested_engines.join(", ")
+            "Requested Quinlight engine(s) not available: {}\n{}",
+            requested_engines.join(", "),
+            crate::engine::engine_status_inline_summary(&statuses),
         ))
     }
 }
@@ -847,9 +855,9 @@ fn should_apply_final_result(result: &remaster::SampleResult) -> bool {
 mod tests {
     use super::*;
 
-    const BASIC_FIXTURE: &str = "mods/2ND_PM.S3M";
+    const BASIC_FIXTURE: &str = "mods/module76.s3m";
     const XM_FIXTURE: &str = "openmpt/test/test.xm";
-    const SAMPLE_INDEX: i32 = 32;
+    const SAMPLE_INDEX: i32 = 0;
     const COMMAND_NOTE: i32 = 0;
     const COMMAND_INSTRUMENT: i32 = 1;
     const COMMAND_EFFECT: i32 = 3;
@@ -1080,7 +1088,7 @@ mod tests {
         let sample_channels = edited_module.sample_channels(SAMPLE_INDEX);
         let original_data = edited_module
             .read_sample_data(SAMPLE_INDEX)
-            .expect("Should read sample 33");
+            .expect("Should read sample 1");
         let resampled = remaster::resample_audio(
             &original_data,
             original_rate as u32,
@@ -1088,7 +1096,7 @@ mod tests {
             sample_channels as usize,
             remaster::ResampleBoundaryMode::LoopAware,
         )
-        .expect("Should resample sample 33 to 48kHz");
+        .expect("Should resample sample 1 to 48kHz");
         let resampled_length = resampled.len() as i64 / sample_channels as i64;
 
         assert!(edited_module.replace_sample_data(

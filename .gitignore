@@ -1,5 +1,7 @@
 /target
 /dist
+# Generated demo audio (the 96 kHz bundle ships via GitHub releases, not the repo)
+/demo-build
 *.o
 *.a
 *.d

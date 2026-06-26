@@ -610,6 +610,10 @@ impl Module {
                 .unwrap_or_else(|| format!("Unknown error (code {error})"));
             return Err(msg);
         }
+        // libopenmpt may allocate `error_message` even on success (e.g. load
+        // warnings); the caller owns it and must free it. Route it through the
+        // helper to drop the string and avoid a leak on the success path.
+        let _ = unsafe { openmpt_string_to_rust(error_message) };
         Ok(Module { ptr })
     }
 
@@ -1110,10 +1114,21 @@ impl Module {
     pub fn read_sample_data(&self, index: i32) -> Option<Vec<f64>> {
         let length = self.sample_length_frames(index);
         let channels = self.sample_channels(index);
-        if length <= 0 || channels <= 0 {
+        if length <= 0 || !(1..=2).contains(&channels) {
             return None;
         }
-        let total = (length as usize) * (channels as usize);
+        // `length`/`channels` come from an untrusted module file, and the C call
+        // below writes up to `length * channels` doubles into `buffer`. Compute
+        // the product in u128 so a crafted oversized `length` can't wrap on the
+        // `usize` multiply and under-allocate into a heap overflow (mirrors the
+        // guards in `replace_sample_data`/`replace_sample_data_raw`).
+        let Some(total) = (length as u128)
+            .checked_mul(channels as u128)
+            .filter(|n| *n <= usize::MAX as u128)
+            .map(|n| n as usize)
+        else {
+            return None;
+        };
         let mut buffer = vec![0.0f64; total];
         let read = unsafe {
             openmpt_module_read_sample_data(self.ptr, index, buffer.as_mut_ptr(), length)

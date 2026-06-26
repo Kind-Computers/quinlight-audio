@@ -4,9 +4,9 @@ on:
   push:
     branches: [main]
     paths:
-      - 'mods/rendered/**.mp3'
-      - 'mods/remastered/**.mp3'
       - '.github/workflows/pages.yml'
+  release:
+    types: [published, edited]
   workflow_dispatch:
 
 permissions:
@@ -26,13 +26,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
-      - name: Stage MP3s under mods/{rendered,remastered}/
-        run: |
-          mkdir -p _site/mods/rendered _site/mods/remastered
-          cp mods/rendered/*.mp3 _site/mods/rendered/
-          cp mods/remastered/*.mp3 _site/mods/remastered/
       - name: Fetch and extract 96 kHz AAC bundle under 96khz/
         run: |
           curl -fsSL \

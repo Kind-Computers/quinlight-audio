@@ -28,12 +28,12 @@ mod tests {
     use super::remaster;
     use super::render;
 
-    const BASIC_FIXTURE: &str = "mods/2ND_PM.S3M";
+    const BASIC_FIXTURE: &str = "mods/module76.s3m";
     const XM_FIXTURE: &str = "openmpt/test/test.xm";
     const MOD_FIXTURE: &str = "openmpt/test/test.mod";
     const S3M_FIXTURE: &str = "openmpt/test/test.s3m";
     const MPTM_FIXTURE: &str = "openmpt/test/test.mptm";
-    const BEYOND_NETWORK_FIXTURE: &str = "mods/beyond_the_network.it";
+    const BEYOND_NETWORK_FIXTURE: &str = "mods/fb-drunkmonkey.it";
 
     const COMMAND_NOTE: i32 = 0;
     const COMMAND_INSTRUMENT: i32 = 1;
@@ -289,25 +289,34 @@ mod tests {
     where
         F: Fn(SampleLoopInfo) -> bool,
     {
-        let entries = std::fs::read_dir("mods").ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Ok(data) = std::fs::read(&path) else {
-                continue;
-            };
-            let Ok(module) = Module::from_memory(&data) else {
+        // Scan the curated demo modules first, then fall back to tests/fixtures.
+        // The fallback keeps fixture-dependent tests (e.g. sustain-loop samples,
+        // an IT/XM instrument feature) robust to demo-set curation: tests/fixtures
+        // holds real-music modules that exercise format features the small demo
+        // set may not happen to include.
+        for dir in ["mods", "tests/fixtures"] {
+            let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
             };
-            for sample in module.info().samples {
-                if sample.length_frames <= 0 || sample.channels <= 0 || sample.rate <= 0 {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
                     continue;
                 }
-                let loop_info = module.sample_loop_info(sample.index);
-                if predicate(loop_info) {
-                    return Some((path.display().to_string(), data, sample.index, loop_info));
+                let Ok(data) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(module) = Module::from_memory(&data) else {
+                    continue;
+                };
+                for sample in module.info().samples {
+                    if sample.length_frames <= 0 || sample.channels <= 0 || sample.rate <= 0 {
+                        continue;
+                    }
+                    let loop_info = module.sample_loop_info(sample.index);
+                    if predicate(loop_info) {
+                        return Some((path.display().to_string(), data, sample.index, loop_info));
+                    }
                 }
             }
         }
@@ -1112,7 +1121,8 @@ mod tests {
         let module = Module::from_memory(&data).expect("Failed to load module");
         let info = module.info();
 
-        assert!(!info.title.is_empty(), "Module should have a title");
+        // module76.s3m carries no embedded song title, so only assert the
+        // structural metadata the loader must always populate.
         assert_eq!(info.format_type, "s3m");
         assert!(info.num_channels > 0);
         assert!(info.num_orders > 0);
@@ -1235,7 +1245,7 @@ mod tests {
 
     #[test]
     fn test_active_samples_after_render() {
-        let data = std::fs::read("mods/2ND_PM.S3M").expect("Failed to read test module");
+        let data = std::fs::read("mods/module76.s3m").expect("Failed to read test module");
         let mut module = Module::from_memory(&data).expect("Failed to load module");
 
         let info = module.info();
@@ -1272,7 +1282,7 @@ mod tests {
 
     #[test]
     fn test_order_20_effects() {
-        let data = std::fs::read("mods/2ND_PM.S3M").expect("Failed to read test module");
+        let data = std::fs::read("mods/module76.s3m").expect("Failed to read test module");
         let module = Module::from_memory(&data).expect("Failed to load module");
 
         let info = module.info();
@@ -1745,23 +1755,23 @@ mod tests {
         let window = render_window(&mut module, 50.602_667, 58.096_000);
         assert!(
             !window.is_empty(),
-            "order 6 smoke regression should capture audio from beyond_the_network.it"
+            "order 6 smoke regression should capture audio from the IT fixture"
         );
         let signature = quantized_audio_signature(&window, 17, 1_000_000.0);
-        assert_eq!(signature, 0xd749_04bf_f885_31cf);
+        assert_eq!(signature, 0x86a3_e15c_18db_7939);
     }
 
     #[test]
     fn test_2nd_pm_resampled_sample_regression() {
-        let data = std::fs::read("mods/2ND_PM.S3M").expect("Failed to read test module");
+        let data = std::fs::read("mods/module76.s3m").expect("Failed to read test module");
         let mut module = Module::from_memory(&data).expect("Failed to load module");
 
-        let sample_index = 32; // Sample 33 in tracker UI / prior debugging output
+        let sample_index = 0; // module76 sample 1 (forward-looped)
         let sample_rate = module.sample_rate(sample_index);
         let sample_channels = module.sample_channels(sample_index);
         let original_data = module
             .read_sample_data(sample_index)
-            .expect("Should read sample 33");
+            .expect("Should read sample 1");
         let resampled = remaster::resample_audio(
             &original_data,
             sample_rate as u32,
@@ -1769,7 +1779,7 @@ mod tests {
             sample_channels as usize,
             remaster::ResampleBoundaryMode::LoopAware,
         )
-        .expect("Should resample sample 33 to 48kHz");
+        .expect("Should resample sample 1 to 48kHz");
         let resampled_length = resampled.len() as i64 / sample_channels as i64;
 
         assert!(module.replace_sample_data(
@@ -1789,12 +1799,11 @@ mod tests {
             }
             assert!(
                 buf[..rendered * 2].iter().all(|sample| sample.is_finite()),
-                "Rendered samples should remain finite while traversing order 20",
+                "Rendered samples should remain finite while traversing order 10",
             );
 
             let order = module.current_order();
-            let row = module.current_row();
-            if order > 20 || (order == 20 && row >= 63) {
+            if order >= 10 {
                 reached_target = true;
                 break;
             }
@@ -1802,7 +1811,7 @@ mod tests {
 
         assert!(
             reached_target,
-            "Should render through order 20 / pattern 7 after replacing sample 33 at 48kHz (ended at order {}, row {}, pattern {})",
+            "Should render through order 10 after replacing sample 1 at 48kHz (ended at order {}, row {}, pattern {})",
             module.current_order(),
             module.current_row(),
             module.current_pattern(),
@@ -1814,12 +1823,12 @@ mod tests {
         let data = std::fs::read(BASIC_FIXTURE).expect("Failed to read test module");
         let mut live_module = Module::from_memory(&data).expect("Failed to load module");
 
-        let sample_index = 32; // Sample 33 in tracker UI
+        let sample_index = 0; // module76 sample 1 (forward-looped)
         let original_rate = live_module.sample_rate(sample_index);
         let sample_channels = live_module.sample_channels(sample_index);
         let original_data = live_module
             .read_sample_data(sample_index)
-            .expect("Should read sample 33");
+            .expect("Should read sample 1");
         let resampled = remaster::resample_audio(
             &original_data,
             original_rate as u32,
@@ -1827,7 +1836,7 @@ mod tests {
             sample_channels as usize,
             remaster::ResampleBoundaryMode::LoopAware,
         )
-        .expect("Should resample sample 33 to 48kHz");
+        .expect("Should resample sample 1 to 48kHz");
         let resampled_length = resampled.len() as i64 / sample_channels as i64;
 
         assert!(live_module.replace_sample_data(
@@ -1862,12 +1871,12 @@ mod tests {
         let mut helper_module = Module::from_memory(&data).expect("Failed to load module");
         let mut manual_module = Module::from_memory(&data).expect("Failed to load module");
 
-        let sample_index = 32; // Sample 33 in tracker UI
+        let sample_index = 0; // module76 sample 1 (forward-looped)
         let sample_rate = helper_module.sample_rate(sample_index);
         let sample_channels = helper_module.sample_channels(sample_index);
         let original_data = helper_module
             .read_sample_data(sample_index)
-            .expect("Should read sample 33");
+            .expect("Should read sample 1");
         let resampled = remaster::resample_audio(
             &original_data,
             sample_rate as u32,
@@ -1875,7 +1884,7 @@ mod tests {
             sample_channels as usize,
             remaster::ResampleBoundaryMode::LoopAware,
         )
-        .expect("Should resample sample 33 to 48kHz");
+        .expect("Should resample sample 1 to 48kHz");
         let resampled_length = resampled.len() as i64 / sample_channels as i64;
 
         assert!(helper_module.replace_sample_data(
@@ -1915,12 +1924,12 @@ mod tests {
         let data = std::fs::read(BASIC_FIXTURE).expect("Failed to read test module");
         let mut module = Module::from_memory(&data).expect("Failed to load module");
 
-        let sample_index = 32; // Sample 33 in tracker UI
+        let sample_index = 0; // module76 sample 1 (forward-looped)
         let original_rate = module.sample_rate(sample_index);
         let sample_channels = module.sample_channels(sample_index);
         let original_data = module
             .read_sample_data(sample_index)
-            .expect("Should read sample 33");
+            .expect("Should read sample 1");
         let resampled = remaster::resample_audio(
             &original_data,
             original_rate as u32,
@@ -1928,7 +1937,7 @@ mod tests {
             sample_channels as usize,
             remaster::ResampleBoundaryMode::LoopAware,
         )
-        .expect("Should resample sample 33 to 48kHz");
+        .expect("Should resample sample 1 to 48kHz");
         let resampled_length = resampled.len() as i64 / sample_channels as i64;
 
         assert!(module.replace_sample_data(
@@ -1960,7 +1969,7 @@ mod tests {
     #[test]
     fn test_s3m_forward_loop_reference_truncates_to_loop_end_and_renders_through_order_20() {
         let data = std::fs::read(BASIC_FIXTURE).expect("Failed to read test module");
-        let sample_index = 32; // Sample 33 in tracker UI
+        let sample_index = 0; // module76 sample 1 (forward-looped)
 
         let probe = Module::from_memory(&data).expect("Failed to load probe module");
         let original_rate = probe.sample_rate(sample_index);
@@ -1969,11 +1978,11 @@ mod tests {
         let loop_info = probe.sample_loop_info(sample_index);
         assert!(
             loop_info.has_normal_loop() && loop_info.normal.mode == SampleLoopMode::Forward,
-            "Fixture sample 33 should expose a forward loop",
+            "Fixture sample 1 should expose a forward loop",
         );
         let original_data = probe
             .read_sample_data(sample_index)
-            .expect("Should read sample 33");
+            .expect("Should read sample 1");
 
         let reference = remaster::build_quinlight_reference_48k_with_loop_info(
             &original_data,
@@ -2039,11 +2048,11 @@ mod tests {
                 }
 
                 let order = module.current_order();
-                if order >= 20 {
+                if order >= 10 {
                     started = true;
                     captured.extend_from_slice(&buf[..rendered * 2]);
                 }
-                if started && order > 20 {
+                if started && order > 10 {
                     break;
                 }
             }
@@ -2057,11 +2066,11 @@ mod tests {
 
         assert!(
             common_len > 0,
-            "Forward-loop-aware replacement should still reach order 20 and produce audio",
+            "Forward-loop-aware replacement should still reach order 10 and produce audio",
         );
         assert!(
             replaced_capture.iter().all(|sample| sample.is_finite()),
-            "Forward-loop-aware replacement should remain finite through the order 20 section",
+            "Forward-loop-aware replacement should remain finite through the order 10 section",
         );
         assert!(
             replaced_capture
@@ -2069,12 +2078,12 @@ mod tests {
                 .map(|sample| sample.abs())
                 .fold(0.0f64, f64::max)
                 > 1.0e-3,
-            "Forward-loop-aware replacement should stay audible through the order 20 section",
+            "Forward-loop-aware replacement should stay audible through the order 10 section",
         );
         assert!(
             max_adjacent_jump(&replaced_capture[..common_len])
                 <= max_adjacent_jump(&original_capture[..common_len]) + 0.1,
-            "Forward-loop-aware replacement should not introduce a larger transient spike than the original order 20 section",
+            "Forward-loop-aware replacement should not introduce a larger transient spike than the original order 10 section",
         );
     }
 
@@ -2255,7 +2264,7 @@ mod tests {
     fn test_s3m_forward_loop_reference_restore_recovers_original_length_and_tail() {
         let data = std::fs::read(BASIC_FIXTURE).expect("Failed to read test module");
         let mut module = Module::from_memory(&data).expect("Failed to load module");
-        let sample_index = 32; // Sample 33 in tracker UI
+        let sample_index = 0; // module76 sample 1 (forward-looped)
 
         let original_rate = module.sample_rate(sample_index);
         let sample_channels = module.sample_channels(sample_index);
@@ -2263,7 +2272,7 @@ mod tests {
         let loop_info = module.sample_loop_info(sample_index);
         let original_data = module
             .read_sample_data(sample_index)
-            .expect("Should read sample 33");
+            .expect("Should read sample 1");
 
         let reference = remaster::build_quinlight_reference_48k_with_loop_info(
             &original_data,
@@ -2312,13 +2321,13 @@ mod tests {
     #[test]
     fn test_s3m_loop_aware_resample_reduces_render_spikes_in_order_20() {
         let data = std::fs::read(BASIC_FIXTURE).expect("Failed to read test module");
-        let sample_index = 32; // Sample 33 in tracker UI
+        let sample_index = 0; // module76 sample 1 (forward-looped)
         let probe = Module::from_memory(&data).expect("Failed to load probe module");
         let original_rate = probe.sample_rate(sample_index);
         let sample_channels = probe.sample_channels(sample_index);
         let original_data = probe
             .read_sample_data(sample_index)
-            .expect("Should read sample 33");
+            .expect("Should read sample 1");
         let loop_aware = remaster::resample_audio(
             &original_data,
             original_rate as u32,
@@ -2339,11 +2348,11 @@ mod tests {
                 }
 
                 let order = module.current_order();
-                if order >= 20 {
+                if order >= 10 {
                     started = true;
                     captured.extend_from_slice(&buf[..rendered * 2]);
                 }
-                if started && order > 20 {
+                if started && order > 10 {
                     break;
                 }
             }
@@ -2368,7 +2377,7 @@ mod tests {
 
         assert!(
             common_len > 0,
-            "Loop-aware fixture replacement should reach order 20 and capture audio"
+            "Loop-aware fixture replacement should reach order 10 and capture audio"
         );
         assert!(
             loop_aware_capture.iter().all(|sample| sample.is_finite()),
@@ -2380,12 +2389,12 @@ mod tests {
                 .map(|sample| sample.abs())
                 .fold(0.0f64, f64::max)
                 > 1.0e-3,
-            "Loop-aware fixture replacement should stay audible through the order 20 section",
+            "Loop-aware fixture replacement should stay audible through the order 10 section",
         );
         assert!(
             max_adjacent_jump(&loop_aware_capture[..common_len])
                 <= max_adjacent_jump(&original_capture[..common_len]) + 0.1,
-            "Loop-aware fixture replacement should not introduce a larger transient spike than the original order 20 section",
+            "Loop-aware fixture replacement should not introduce a larger transient spike than the original order 10 section",
         );
     }
 
@@ -2394,7 +2403,7 @@ mod tests {
         let data = std::fs::read(BASIC_FIXTURE).expect("Failed to read test module");
         let mut control_module = Module::from_memory(&data).expect("Failed to load module");
         let mut live_module = Module::from_memory(&data).expect("Failed to load module");
-        let sample_index = 32; // Sample 33 in tracker UI
+        let sample_index = 0; // module76 sample 1 (forward-looped)
 
         for module in [&mut control_module, &mut live_module] {
             module.set_repeat_count(0);
@@ -2407,7 +2416,7 @@ mod tests {
         let sample_channels = control_module.sample_channels(sample_index);
         let original_data = control_module
             .read_sample_data(sample_index)
-            .expect("Should read sample 33");
+            .expect("Should read sample 1");
         let resampled = remaster::resample_audio(
             &original_data,
             original_rate as u32,
@@ -2415,7 +2424,7 @@ mod tests {
             sample_channels as usize,
             remaster::ResampleBoundaryMode::LoopAware,
         )
-        .expect("Should resample sample 33 to 48kHz");
+        .expect("Should resample sample 1 to 48kHz");
         let resampled_length = resampled.len() as i64 / sample_channels as i64;
 
         assert!(
@@ -3824,7 +3833,7 @@ mod tests {
     /// the given gather knobs. Used to verify the full sheared-separable
     /// gather (per-slice shear + R footprint widening) end to end.
     fn render_aniso_gather(k_beta: f64, k_beta2: f64, k_r: f64, seconds: u32) -> Vec<f64> {
-        const VIBRATO_FIXTURE: &str = "mods/jt_pools.xm";
+        const VIBRATO_FIXTURE: &str = "mods/drozerix_-_digital_rendezvous.xm";
         let data = std::fs::read(VIBRATO_FIXTURE).expect("vibrato fixture must exist");
         let mut module = Module::from_memory(&data).expect("load module");
         configure_quinlight_render(&mut module, 75, 64, true);
@@ -5191,11 +5200,11 @@ mod tests {
 
     #[test]
     fn aniso64_beta_shear_affects_output() {
-        // jt_pools.xm has deep vibrato (Hxx) effects that cause inter-tick pitch
-        // changes, which is what triggers β-shear.  The basic S3M fixture plays
-        // at constant pitch so dInc is always 0 and β-shear has no effect.
-        // 10 seconds is enough to capture vibrato activity.
-        const VIBRATO_FIXTURE: &str = "mods/jt_pools.xm";
+        // drozerix_-_digital_rendezvous.xm has vibrato/pitch-modulation effects
+        // that cause inter-tick pitch changes, which is what triggers β-shear.
+        // The basic S3M fixture plays at constant pitch so dInc is always 0 and
+        // β-shear has no effect. 10 seconds is enough to capture vibrato activity.
+        const VIBRATO_FIXTURE: &str = "mods/drozerix_-_digital_rendezvous.xm";
         let data = std::fs::read(VIBRATO_FIXTURE).expect("vibrato fixture must exist");
 
         // Render 10s with zero beta-shear (0.0, 0.0) — β-shear disabled
@@ -5352,17 +5361,17 @@ mod tests {
         );
     }
 
-    /// Diagnostic: dump pattern data at order 22 to see what notes are written.
+    /// Diagnostic: dump pattern data at order 20 to see what notes are written.
     #[test]
     fn test_s3m_order_22_pattern_dump() {
         let data = std::fs::read(BASIC_FIXTURE).expect("Failed to read test module");
         let module = Module::from_memory(&data).expect("Failed to load module");
 
-        let pattern = module.get_order_pattern(22);
+        let pattern = module.get_order_pattern(20);
         let num_rows = module.pattern_num_rows(pattern);
         let num_channels = module.num_channels();
         eprintln!(
-            "Order 22 → Pattern {}, {} rows, {} channels",
+            "Order 20 → Pattern {}, {} rows, {} channels",
             pattern, num_rows, num_channels
         );
 
@@ -5444,9 +5453,9 @@ mod tests {
         }
     }
 
-    /// Diagnostic: render 2ND_PM.S3M through orders 21–23, polling VU meters
-    /// and per-channel frequency every ~256 frames to detect per-channel
-    /// activity and pitch at row granularity.
+    /// Diagnostic: render module76.s3m through its final orders (19–20),
+    /// polling VU meters and per-channel frequency every ~256 frames to detect
+    /// per-channel activity and pitch at row granularity.
     #[test]
     fn test_s3m_order_22_bass_note_present() {
         let data = std::fs::read(BASIC_FIXTURE).expect("Failed to read test module");
@@ -5473,8 +5482,8 @@ mod tests {
             let order = module.current_order();
             let row = module.current_row();
 
-            if order >= 21 && order <= 23 {
-                if order == 22 {
+            if order >= 19 && order <= 20 {
+                if order == 20 {
                     reached_order_22 = true;
                 }
                 let vu = module.channel_vu();
@@ -5495,25 +5504,25 @@ mod tests {
                     }
                 }
             }
-            if order > 23 {
+            if order > 20 {
                 break;
             }
         }
 
         assert!(
             reached_order_22,
-            "Should reach order 22 during rendering (stopped at order {}, row {})",
+            "Should reach order 20 during rendering (stopped at order {}, row {})",
             module.current_order(),
             module.current_row(),
         );
 
-        // Print compact activity map with frequencies for active channels in order 22 only
-        eprintln!("=== Order 22: per-row channel VU + freq (Hz) ===");
+        // Print compact activity map with frequencies for active channels in order 20 only
+        eprintln!("=== Order 20: per-row channel VU + freq (Hz) ===");
         eprintln!(
             "Row | Ch0           Ch1           Ch2           Ch3           Ch4           Ch5           Ch6           Ch7"
         );
         for (&(order, row), vus) in &row_vu {
-            if order != 22 {
+            if order != 20 {
                 continue;
             }
             let freqs = row_freq.get(&(order, row)).unwrap();
@@ -5531,10 +5540,10 @@ mod tests {
             eprintln!(" {:2} | {}", row, cols.join(" "));
         }
 
-        // Aggregate: peak VU per channel across all rows in order 22 only
+        // Aggregate: peak VU per channel across all rows in order 20 only
         let mut order_22_peak = vec![0.0f64; num_channels as usize];
         for (&(order, _), vus) in &row_vu {
-            if order == 22 {
+            if order == 20 {
                 for (ch, &v) in vus.iter().enumerate() {
                     if v > order_22_peak[ch] {
                         order_22_peak[ch] = v;
@@ -5542,7 +5551,7 @@ mod tests {
                 }
             }
         }
-        eprintln!("\n=== Order 22 peak VU per channel ===");
+        eprintln!("\n=== Order 20 peak VU per channel ===");
         for (ch, &peak) in order_22_peak.iter().enumerate() {
             eprintln!(
                 "  Ch {:2}: {:.4}{}",

@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use super::{
-    UpsampleEngine, venv_can_import, venv_package_version, venv_python, write_venv_script,
+    UpsampleEngine, venv_can_import, venv_import_check, venv_package_version, venv_python,
+    write_venv_script,
 };
 
 const WRAPPER_SCRIPT: &str = r#"
@@ -93,6 +94,14 @@ impl LavaSrEngine {
             script_path,
             cache_id: format!("lavasr-{version}"),
         }))
+    }
+
+    /// Best-effort explanation of why LavaSR is unavailable.
+    pub(crate) fn unavailable_reason() -> String {
+        match venv_import_check("LavaSR") {
+            Ok(()) => "LavaSR imports but the engine failed to initialise".to_string(),
+            Err(reason) => format!("{reason} — run install_prerequisites.sh"),
+        }
     }
 }
 

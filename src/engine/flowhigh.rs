@@ -228,6 +228,36 @@ impl FlowHighEngine {
             cache_id: format!("flowhigh-{version}"),
         }))
     }
+
+    /// Best-effort explanation of why FLowHigh is unavailable. Mirrors the
+    /// beartype-neutralised import probe used by `detect`.
+    pub(crate) fn unavailable_reason() -> String {
+        let python = venv_python();
+        if !python.exists() {
+            return format!("venv python not found at {}", python.display());
+        }
+        match std::process::Command::new(&python)
+            .arg("-c")
+            .arg("import beartype; beartype.beartype = lambda f: f; import flowhigh")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                "flowhigh imports but the engine failed to initialise".to_string()
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let reason = stderr
+                    .lines()
+                    .rfind(|l| !l.trim().is_empty())
+                    .unwrap_or("(no stderr)")
+                    .trim();
+                format!("import flowhigh failed: {reason} — run install_prerequisites.sh")
+            }
+            Err(e) => format!("probe failed: {e}"),
+        }
+    }
 }
 
 impl UpsampleEngine for FlowHighEngine {

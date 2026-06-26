@@ -2350,26 +2350,8 @@ impl Quinlight {
     fn drain_remaster_updates(&mut self) {
         let mut updated_preview = false;
         let results = self.take_remaster_results();
-        // Uncomment for debugging remaster result delivery:
-        // if !results.is_empty() {
-        //     eprintln!(
-        //         "[drain] received {} remaster result(s), {} sample slots",
-        //         results.len(),
-        //         self.sample_slots.len()
-        //     );
-        // }
         for result in results {
-            // let (idx, engine, len, is_final) = match &result {
-            //     RemasterOutput::Candidate(r) => (r.index, &r.engine_name, r.data.len(), false),
-            //     RemasterOutput::Final(r) => (r.index, &r.engine_name, r.data.len(), true),
-            // };
-            // eprintln!(
-            //     "[drain] sample #{} engine={} data_len={} final={} slot_match={}",
-            //     idx + 1, engine, len, is_final,
-            //     self.sample_slots.iter().any(|s| s.index == idx)
-            // );
             let applied = self.apply_sample_result(result);
-            // eprintln!("[drain]   → applied={applied}");
             updated_preview |= applied;
         }
         for status in self.take_remaster_statuses() {
@@ -2444,19 +2426,6 @@ impl Quinlight {
                 let now = std::time::Instant::now();
                 let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
                 self.last_tick = now;
-
-                // Auto-grow audio buffer on underrun — but never while a
-                // render export holds the player mutex: the stalled callback's
-                // gap is lock contention, not a device underrun, and growing
-                // here falsely ratcheted the buffer (and bounced the device)
-                // after every export.
-                if self.render_progress_rx.is_none()
-                    && let Some(new_frames) = self.player.check_and_grow_buffer()
-                {
-                    self.remaster_notice = Some(format!(
-                        "Audio buffer underrun — increased to {new_frames} frames"
-                    ));
-                }
 
                 // Check Ctrl-C shutdown flag
                 if self.shutdown_flag.load(Ordering::Relaxed)
@@ -5466,7 +5435,7 @@ mod tests {
         app: &Quinlight,
         loaded_path: PathBuf,
     ) -> (PreparedModuleLoadHandle, Vec<u8>) {
-        let file_data = std::fs::read("mods/2ND_PM.S3M").expect("fixture should exist");
+        let file_data = std::fs::read("mods/module76.s3m").expect("fixture should exist");
         let prepared = crate::player::prepare_module_load_from_bytes(file_data.clone())
             .expect("fixture should prepare");
         let handle = PreparedModuleLoadHandle::new(PreparedModuleLoadPackage {

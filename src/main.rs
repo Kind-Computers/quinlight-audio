@@ -440,6 +440,58 @@ enum Commands {
         /// Input module file
         input: PathBuf,
     },
+    /// Report detected AI engines, the GPU/VRAM seen, and why any engine is
+    /// unavailable. Use this to answer "why didn't engine X run?".
+    Doctor,
+}
+
+/// Print a human-readable engine/GPU diagnostic report (the `doctor` command).
+fn print_doctor_report() {
+    println!("Quinlight Audio — engine doctor\n");
+
+    let device = engine::gpu_device_string();
+    if device == "cpu" {
+        println!("GPU:          none detected — AI engines will run on CPU (slow)");
+        println!("Default mode: CpuOnly");
+    } else {
+        let vram = engine::detect_gpu_vram_mb();
+        let vram_str = if vram > 0 {
+            format!("{vram} MB VRAM")
+        } else {
+            "VRAM unknown".to_string()
+        };
+        println!("GPU:          {device} ({vram_str})");
+        println!("Default mode: GpuOnly (engines run one at a time; an engine larger");
+        println!("              than free VRAM falls back to CPU rather than aborting)");
+    }
+
+    println!("\nEngines:");
+    let statuses = engine::detect_engine_statuses();
+    for s in &statuses {
+        match s {
+            engine::EngineStatus::Active {
+                name,
+                version,
+                device,
+            } => {
+                let v = version.as_deref().unwrap_or("version n/a");
+                println!("  [ok]   {name:<8} active      — {v}, device {device}");
+            }
+            engine::EngineStatus::Unavailable { name, reason } => {
+                println!("  [--]   {name:<8} unavailable — {reason}");
+            }
+        }
+    }
+
+    let active = statuses.iter().filter(|s| s.is_active()).count();
+    println!("\n{active}/{} engines active.", statuses.len());
+    if active < 2 {
+        println!(
+            "\nThe registration consensus needs at least 2 engines; with fewer, samples \
+             keep their original audio.\n\n{}",
+            remaster::install_instructions()
+        );
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -660,6 +712,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::ProbeMetadata { input }) => {
             probe_metadata(&input)?;
+        }
+        Some(Commands::Doctor) => {
+            print_doctor_report();
         }
         None => {
             let upscale_mode = resolve_upscale_mode(cli.upscale);

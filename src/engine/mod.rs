@@ -811,9 +811,290 @@ pub fn detect_engines() -> Vec<Box<dyn UpsampleEngine>> {
     engines
 }
 
+/// Detection status of one engine, for the runtime summary and `doctor`.
+pub enum EngineStatus {
+    Active {
+        name: &'static str,
+        version: Option<String>,
+        device: &'static str,
+    },
+    Unavailable {
+        name: &'static str,
+        reason: String,
+    },
+}
+
+impl EngineStatus {
+    pub fn is_active(&self) -> bool {
+        matches!(self, EngineStatus::Active { .. })
+    }
+}
+
+/// An engine's cache_id is `"<prefix>-<version>"`; recover the version for
+/// display (engines that don't carry one, e.g. AP-BWE, return None).
+fn version_from_cache_id(name: &str, cache_id: &str) -> Option<String> {
+    let prefix = match name {
+        "LavaSR" => "lavasr-",
+        "FLowHigh" => "flowhigh-",
+        "AudioSR" => "audiosr-",
+        // AP-BWE's cache_id suffix is an internal cache-busting tag (a commit
+        // hash + weight marker), not a user-facing version, so don't surface it.
+        "AP-BWE" => return None,
+        _ => return None,
+    };
+    cache_id
+        .strip_prefix(prefix)
+        .map(|s| s.to_string())
+        .filter(|s| s != "unknown")
+}
+
+fn status_from(
+    name: &'static str,
+    detected: Option<Box<dyn UpsampleEngine>>,
+    reason: impl FnOnce() -> String,
+) -> EngineStatus {
+    match detected {
+        Some(e) => EngineStatus::Active {
+            name,
+            version: version_from_cache_id(name, e.cache_id()),
+            device: gpu_device_string(),
+        },
+        None => EngineStatus::Unavailable {
+            name,
+            reason: reason(),
+        },
+    }
+}
+
+/// Per-engine detection status for every known engine, active or not. The
+/// Active/Unavailable decision uses the same `detect()` the pipeline relies on,
+/// so this never disagrees with what `convert` will actually use; the reason
+/// strings are best-effort explanations for the inactive ones.
+pub fn detect_engine_statuses() -> Vec<EngineStatus> {
+    std::thread::scope(|s| {
+        let h_lava = s.spawn(|| {
+            status_from(
+                "LavaSR",
+                LavaSrEngine::detect(),
+                LavaSrEngine::unavailable_reason,
+            )
+        });
+        let h_flow = s.spawn(|| {
+            status_from(
+                "FLowHigh",
+                FlowHighEngine::detect(),
+                FlowHighEngine::unavailable_reason,
+            )
+        });
+        let h_apbwe = s.spawn(|| {
+            status_from(
+                "AP-BWE",
+                ApBweEngine::detect(),
+                ApBweEngine::unavailable_reason,
+            )
+        });
+        let h_audio = s.spawn(|| {
+            status_from(
+                "AudioSR",
+                AudioSrEngine::detect(),
+                AudioSrEngine::unavailable_reason,
+            )
+        });
+        let fallback = |name: &'static str| EngineStatus::Unavailable {
+            name,
+            reason: "detection probe panicked".to_string(),
+        };
+        vec![
+            h_lava.join().unwrap_or_else(|_| fallback("LavaSR")),
+            h_flow.join().unwrap_or_else(|_| fallback("FLowHigh")),
+            h_apbwe.join().unwrap_or_else(|_| fallback("AP-BWE")),
+            h_audio.join().unwrap_or_else(|_| fallback("AudioSR")),
+        ]
+    })
+}
+
+/// Build per-engine statuses from an already-detected engine set, without
+/// re-probing the engines detection has already confirmed active. Active
+/// engines are read straight from `detected` (their import succeeded once,
+/// during `RemasterEngine::detect()`); only the missing ones pay the cost of an
+/// `unavailable_reason()` probe. Callers that have already run `detect()` (e.g.
+/// `convert`) should use this instead of `detect_engine_statuses()` to avoid a
+/// redundant probe storm — each `detect()` re-runs four Python imports, several
+/// of which can block to the probe timeout.
+pub fn engine_statuses_from_detected(detected: &[Box<dyn UpsampleEngine>]) -> Vec<EngineStatus> {
+    let device = gpu_device_string();
+    let known: [(&'static str, fn() -> String); 4] = [
+        ("LavaSR", LavaSrEngine::unavailable_reason),
+        ("FLowHigh", FlowHighEngine::unavailable_reason),
+        ("AP-BWE", ApBweEngine::unavailable_reason),
+        ("AudioSR", AudioSrEngine::unavailable_reason),
+    ];
+    std::thread::scope(|s| {
+        let handles: Vec<_> = known
+            .into_iter()
+            .map(|(name, reason)| {
+                // Resolve active engines from the already-detected set here on
+                // the main thread (no probe); only the inactive ones spawn a
+                // reason probe, mirroring detect_engine_statuses' parallelism.
+                let active = detected
+                    .iter()
+                    .find(|e| name.eq_ignore_ascii_case(e.name()))
+                    .map(|e| EngineStatus::Active {
+                        name,
+                        version: version_from_cache_id(name, e.cache_id()),
+                        device,
+                    });
+                let h = s.spawn(move || {
+                    active.unwrap_or_else(|| EngineStatus::Unavailable {
+                        name,
+                        reason: reason(),
+                    })
+                });
+                (name, h)
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|(name, h)| {
+                h.join().unwrap_or_else(|_| EngineStatus::Unavailable {
+                    name,
+                    reason: "detection probe panicked".to_string(),
+                })
+            })
+            .collect()
+    })
+}
+
+/// One-line summary: active engines (with version + device) and, if any, the
+/// skipped ones with the reason. Used at the top of a `convert` run.
+pub fn engine_status_inline_summary(statuses: &[EngineStatus]) -> String {
+    let active: Vec<String> = statuses
+        .iter()
+        .filter_map(|s| match s {
+            EngineStatus::Active {
+                name,
+                version,
+                device,
+            } => Some(match version {
+                Some(v) => format!("{name} {v} ({device})"),
+                None => format!("{name} ({device})"),
+            }),
+            EngineStatus::Unavailable { .. } => None,
+        })
+        .collect();
+    let skipped: Vec<String> = statuses
+        .iter()
+        .filter_map(|s| match s {
+            EngineStatus::Unavailable { name, reason } => Some(format!("{name} ({reason})")),
+            EngineStatus::Active { .. } => None,
+        })
+        .collect();
+    let mut out = if active.is_empty() {
+        "Engines: none active".to_string()
+    } else {
+        format!("Engines: {}", active.join(", "))
+    };
+    if !skipped.is_empty() {
+        out.push_str(&format!("; skipped: {}", skipped.join(", ")));
+    }
+    out
+}
+
+/// Probe whether `package` imports in the shared venv, returning the failure
+/// reason (last stderr line) instead of logging. Used to build the diagnostic
+/// status reports without the side-effect logging of [`venv_can_import`].
+pub(crate) fn venv_import_check(package: &str) -> Result<(), String> {
+    let python = venv_python();
+    if !python.exists() {
+        return Err(format!("venv python not found at {}", python.display()));
+    }
+    let output = output_with_timeout(
+        Command::new(&python)
+            .arg("-c")
+            .arg(format!("import {package}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+        PYTHON_PROBE_TIMEOUT,
+    )
+    .map_err(|e| format!("probe failed: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = stderr
+        .lines()
+        .rfind(|l| !l.trim().is_empty())
+        .unwrap_or("(no stderr output)")
+        .trim();
+    Err(format!("import {package} failed: {reason}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_status_inline_summary_lists_active_and_skipped() {
+        let statuses = vec![
+            EngineStatus::Active {
+                name: "AudioSR",
+                version: Some("0.0.7".to_string()),
+                device: "cuda",
+            },
+            EngineStatus::Active {
+                name: "AP-BWE",
+                version: None,
+                device: "cuda",
+            },
+            EngineStatus::Unavailable {
+                name: "LavaSR",
+                reason: "import LavaSR failed: ModuleNotFoundError".to_string(),
+            },
+        ];
+        // Sanity on the accessor while we have a mixed set.
+        assert!(statuses[0].is_active());
+        assert!(!statuses[2].is_active());
+
+        let summary = engine_status_inline_summary(&statuses);
+        assert!(summary.contains("AudioSR 0.0.7 (cuda)"), "{summary}");
+        // No version → name + device only, no stray version text.
+        assert!(summary.contains("AP-BWE (cuda)"), "{summary}");
+        assert!(
+            summary.contains("skipped: LavaSR (import LavaSR failed: ModuleNotFoundError)"),
+            "{summary}",
+        );
+    }
+
+    #[test]
+    fn version_from_cache_id_extracts_or_suppresses() {
+        // Real cache_id shapes parse to their version.
+        assert_eq!(
+            version_from_cache_id("AudioSR", "audiosr-0.0.7"),
+            Some("0.0.7".to_string())
+        );
+        assert_eq!(
+            version_from_cache_id("LavaSR", "lavasr-1.2.3"),
+            Some("1.2.3".to_string())
+        );
+        // "unknown" is suppressed.
+        assert_eq!(version_from_cache_id("FLowHigh", "flowhigh-unknown"), None);
+        // AP-BWE's suffix is an internal cache-busting tag (commit hash + weight
+        // marker), not a user-facing version — it must NOT surface as one. Feed
+        // the engine's real cache_id rather than fabricating None.
+        let apbwe_cache_id = format!("apbwe-{}", crate::engine::apbwe::APBWE_CACHE_TAG);
+        assert_eq!(version_from_cache_id("AP-BWE", &apbwe_cache_id), None);
+    }
+
+    #[test]
+    fn engine_status_inline_summary_handles_none_active() {
+        let statuses = vec![EngineStatus::Unavailable {
+            name: "AudioSR",
+            reason: "not installed".to_string(),
+        }];
+        let summary = engine_status_inline_summary(&statuses);
+        assert!(summary.starts_with("Engines: none active"), "{summary}");
+        assert!(summary.contains("skipped: AudioSR (not installed)"), "{summary}");
+    }
 
     #[test]
     fn detect_cpu_isa_returns_valid_values() {

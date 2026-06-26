@@ -161,6 +161,29 @@ impl ApBweEngine {
             cache_id: format!("apbwe-{APBWE_CACHE_TAG}"),
         }))
     }
+
+    /// Best-effort explanation of why AP-BWE is unavailable. Mirrors `detect`'s
+    /// checks: repo files, then a 48 kHz checkpoint, then torch.
+    pub(crate) fn unavailable_reason() -> String {
+        let apbwe_dir = apbwe_repo_dir();
+        if !apbwe_dir.join("models").join("model.py").is_file()
+            || !apbwe_dir.join("env.py").is_file()
+            || !apbwe_dir.join("datasets").join("dataset.py").is_file()
+        {
+            return format!(
+                "repo not installed at {} — run install_prerequisites.sh",
+                apbwe_dir.display()
+            );
+        }
+        if !has_any_48k_checkpoint(&apbwe_dir.join("checkpoints")) {
+            return "no g_*to48k checkpoint under checkpoints/ — download the AP-BWE weights"
+                .to_string();
+        }
+        if !venv_has_package("torch") {
+            return "torch not importable in the venv".to_string();
+        }
+        "AP-BWE present but the engine failed to initialise".to_string()
+    }
 }
 
 impl UpsampleEngine for ApBweEngine {

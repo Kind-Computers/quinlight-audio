@@ -20,7 +20,10 @@ use sofar::render::Renderer;
 /// 256 samples ≈ 2.7ms at 96kHz, 5.3ms at 48kHz.
 const PARTITION_LEN: usize = 256;
 
-/// Maximum SDL2 callback size in frames (matches player::MAX_BUFFER_FRAMES).
+/// Maximum frames fed to the HRTF processor per `process()` call. The audio
+/// callback loops in `player::CALLBACK_CHUNK_FRAMES` slices, so this is a safe
+/// ceiling (≥ the chunk size); inputs larger than this are clamped (see
+/// `process`).
 const MAX_CALLBACK_FRAMES: usize = 16384;
 
 /// Gain compensation for two-source binaural summation.

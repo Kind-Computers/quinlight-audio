@@ -35,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README note that the multi-engine AI consensus algorithm is U.S. Patent Pending
 
 ### Changed
+- **Upgraded audio output from SDL2 to SDL3** (the `sdl3` crate). The playback
+  path was reworked for SDL3's push-based `AudioStream` callback: the callback
+  now feeds SDL in fixed `CALLBACK_CHUNK_FRAMES` (1024) slices, keeping every
+  render/HRTF pass within the HRTF input ceiling regardless of SDL's request
+  size. SDL3 is vendored and compiled from source (`build-from-source` feature),
+  so the build now needs CMake instead of `libsdl2-dev`. The underrun-driven
+  buffer-growth machinery was removed — SDL3's `AudioStream` buffers internally
+  and its source spec no longer carries a hardware buffer size; SDL3 also
+  resamples the source rate to the device, so the renderer runs at the requested
+  rate (96 kHz preferred) regardless of hardware support.
 - Renamed the project from Filament Audio to Quinlight Audio
 - **Sample-cache key format**: cache filenames now include loop metadata
   (normal and sustain), source rate/bit depth, and the pipeline version.
@@ -135,9 +145,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device bounce; a failed export no longer clobbers an in-flight remaster's
   state machine
 - Installer smoke check now detects LavaSR — it was probing the module name `lavasr`, but the package imports as `LavaSR`, so an installed LavaSR was never reported
-- Full audit fix pass (2026-06-09): see `docs/AUDIT-2026-06-09.md` for the
-  complete findings list; all Critical/High/Medium items addressed, Low items
-  addressed or documented as known limitations in-code
+- Full audit fix pass (2026-06-09): all Critical/High/Medium findings addressed,
+  Low items addressed or documented as known limitations in-code
 
 ## [0.1.0] - 2026-05-10
 

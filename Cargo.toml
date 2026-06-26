@@ -13,7 +13,7 @@ categories = ["multimedia::audio"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 iced = { version = "0.13", features = ["tokio", "canvas"] }
-sdl2 = "0.37"
+sdl3 = { version = "0.17", features = ["build-from-source"] }
 libc = "0.2"
 # gtk3 backend: WSLg lacks xdg-desktop-portal, so the default xdg-portal backend silently no-ops.
 rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
