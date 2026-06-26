@@ -273,18 +273,6 @@ like to help fund continued development, you can sponsor the project on GitHub:
 
 [**❤ Sponsor Quinlight Audio on GitHub**](https://github.com/sponsors/Kind-Computers)
 
-## Legal / Backend Note
-
-AI backend redistribution and branded promotion should still be reviewed
-engine-by-engine before any bundled or company-branded release. This
-repository documents a supported external-install flow for those backends;
-it does not claim that backend weights are bundled or cleared for redistribution.
-
-**Patent pending.** Quinlight Audio's multi-engine AI consensus algorithm — the
-per-bin Karcher-mean spectral consensus on the rotor manifold described under
-[Multi-engine consensus](#multi-engine-consensus) — is the subject of a pending
-U.S. patent application.
-
 ## License
 
 Quinlight Audio is licensed under the [MIT License](LICENSE).
