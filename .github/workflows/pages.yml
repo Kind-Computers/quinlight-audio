@@ -32,6 +32,7 @@ jobs:
             "https://github.com/${{ github.repository }}/releases/download/audio-bundle-v1/quinlight-audio-96khz-bundle.zip" \
             -o /tmp/bundle.zip
           unzip -q /tmp/bundle.zip -d /tmp/bundle-extract
+          mkdir -p _site
           mv /tmp/bundle-extract/quinlight-audio-96khz _site/96khz
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
